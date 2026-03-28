@@ -41,20 +41,23 @@ def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return rsi
 
 
-def load_qqq_tqqq_data(
+def load_market_data(
     start: str = "1900-01-01",
     end: Optional[str] = None,
     auto_adjust: bool = True,
 ) -> pd.DataFrame:
     """
-    Downloads QQQ and TQQQ daily data and returns a merged DataFrame.
+    Downloads QQQ, TQQQ, SMH, SPY, and SOXL daily data and returns a merged DataFrame.
 
     Output columns:
         QQQ_Open, QQQ_High, QQQ_Low, QQQ_Close, QQQ_Volume,
-        TQQQ_Open, TQQQ_High, TQQQ_Low, TQQQ_Close, TQQQ_Volume
+        TQQQ_Open, TQQQ_High, TQQQ_Low, TQQQ_Close, TQQQ_Volume,
+        SMH_Open, SMH_High, SMH_Low, SMH_Close, SMH_Volume,
+        SPY_Open, SPY_High, SPY_Low, SPY_Close, SPY_Volume,
+        SOXL_Open, SOXL_High, SOXL_Low, SOXL_Close, SOXL_Volume
     """
     raw = yf.download(
-        tickers=["QQQ", "TQQQ"],
+        tickers=["QQQ", "TQQQ", "SMH", "SPY", "SOXL"],
         start=start,
         end=end,
         interval="1d",
@@ -68,7 +71,7 @@ def load_qqq_tqqq_data(
         raise ValueError("No data downloaded.")
 
     frames = []
-    for symbol in ["QQQ", "TQQQ"]:
+    for symbol in ["QQQ", "TQQQ", "SMH", "SPY", "SOXL"]:
         if symbol not in raw:
             raise ValueError(f"Missing downloaded data for {symbol}")
 
@@ -314,7 +317,7 @@ if __name__ == "__main__":
         auto_adjust=True,
     )
 
-    data = load_qqq_tqqq_data(
+    data = load_market_data(
         start="1900-01-01",
         end=None,
         auto_adjust=base_cfg.auto_adjust,
@@ -332,17 +335,30 @@ if __name__ == "__main__":
         profit_target_values=profit_target_values,
     )
 
-    qqq_sweep_results, qqq_best_cfg, qqq_strategy = run_parameter_sweep(
-        data,
-        base_cfg,
-        asset_symbol="QQQ",
-        buy_rsi_values=buy_rsi_values,
-        profit_target_values=profit_target_values,
-    )
-
     tqqq_benchmark = backtest_buy_and_hold(
         data,
         asset_symbol="TQQQ",
+        initial_capital=best_cfg.initial_capital,
+        fee_bps=best_cfg.fee_bps,
+        slippage_bps=best_cfg.slippage_bps,
+    )
+    smh_benchmark = backtest_buy_and_hold(
+        data,
+        asset_symbol="SMH",
+        initial_capital=best_cfg.initial_capital,
+        fee_bps=best_cfg.fee_bps,
+        slippage_bps=best_cfg.slippage_bps,
+    )
+    spy_benchmark = backtest_buy_and_hold(
+        data,
+        asset_symbol="SPY",
+        initial_capital=best_cfg.initial_capital,
+        fee_bps=best_cfg.fee_bps,
+        slippage_bps=best_cfg.slippage_bps,
+    )
+    soxl_benchmark = backtest_buy_and_hold(
+        data,
+        asset_symbol="SOXL",
         initial_capital=best_cfg.initial_capital,
         fee_bps=best_cfg.fee_bps,
         slippage_bps=best_cfg.slippage_bps,
@@ -358,8 +374,10 @@ if __name__ == "__main__":
     curves = pd.concat(
         [
             strategy["Equity"].rename("TQQQ_RSI_Strategy"),
-            qqq_strategy["Equity"].rename("QQQ_RSI_Strategy"),
             tqqq_benchmark["Equity"].rename("TQQQ_BuyHold"),
+            smh_benchmark["Equity"].rename("SMH_BuyHold"),
+            spy_benchmark["Equity"].rename("SPY_BuyHold"),
+            soxl_benchmark["Equity"].rename("SOXL_BuyHold"),
             qqq_benchmark["Equity"].rename("QQQ_BuyHold"),
         ],
         axis=1,
@@ -371,8 +389,10 @@ if __name__ == "__main__":
     best_summary = pd.DataFrame(
         {
             "TQQQ_RSI_Strategy": performance_summary(curves["TQQQ_RSI_Strategy"]),
-            "QQQ_RSI_Strategy": performance_summary(curves["QQQ_RSI_Strategy"]),
             "TQQQ_BuyHold": performance_summary(curves["TQQQ_BuyHold"]),
+            "SMH_BuyHold": performance_summary(curves["SMH_BuyHold"]),
+            "SPY_BuyHold": performance_summary(curves["SPY_BuyHold"]),
+            "SOXL_BuyHold": performance_summary(curves["SOXL_BuyHold"]),
             "QQQ_BuyHold": performance_summary(curves["QQQ_BuyHold"]),
         }
     ).T
@@ -386,15 +406,6 @@ if __name__ == "__main__":
         "\nBest TQQQ strategy parameters:"
         f" buy_rsi={best_cfg.buy_rsi},"
         f" sell_return_multiple={best_cfg.profit_target_multiple}"
-    )
-
-    print("\nQQQ parameter sweep results (top 10 by Total Return):")
-    print(qqq_sweep_results.head(10))
-
-    print(
-        "\nBest QQQ strategy parameters:"
-        f" buy_rsi={qqq_best_cfg.buy_rsi},"
-        f" sell_return_multiple={qqq_best_cfg.profit_target_multiple}"
     )
 
     print("\nNormalized equity curves (tail):")
@@ -417,22 +428,8 @@ if __name__ == "__main__":
         ].tail(20)
     )
 
-    print("\nRecent QQQ strategy rows using the same best parameter set:")
-    print(
-        qqq_strategy[
-            [
-                "QQQ_RSI",
-                "Equity",
-                "PositionReturnMultiple",
-                "InPosition",
-                "ActionExecutedToday",
-                "PendingActionForNextOpen",
-            ]
-        ].tail(20)
-    )
-
     # Optional plot:
     # import matplotlib.pyplot as plt
-    # normalized.plot(figsize=(12, 7), title="QQQ RSI -> TQQQ Strategy vs TQQQ Buy & Hold")
+    # normalized.plot(figsize=(12, 7), title="QQQ RSI -> TQQQ Strategy vs TQQQ/SMH/SPY Buy & Hold")
     # plt.ylabel("Growth of $1")
     # plt.savefig("qqq_rsi_tqqq_strategy.png", dpi=150, bbox_inches="tight")
