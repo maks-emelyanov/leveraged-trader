@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import numpy as np
@@ -8,288 +8,93 @@ import pandas as pd
 import yfinance as yf
 
 
-# =========================
-# Configuration
-# =========================
-
 @dataclass
 class BacktestConfig:
     initial_capital: float = 100_000.0
-    vol_target: float = 0.12          # 12% annualized target vol
-    max_weight: float = 0.35          # cap TQQQ allocation at 35%
-    rv_window: int = 20               # realized vol lookback
-    sma_fast: int = 50
-    sma_slow: int = 200
-    ret_window: int = 20
-    rv_exit_threshold: float = 0.35   # exit if QQQ rv20 > 35%
-    daily_drop_exit: float = -0.03    # exit if QQQ daily return <= -3%
-    fee_bps: float = 1.0              # per trade notional fee
-    slippage_bps: float = 2.0         # per trade notional slippage
-    cash_rate_annual: float = 0.0     # optional interest on cash
+    rsi_period: int = 14
+    buy_rsi: float = 30.0
+    profit_target_multiple: float = 10.0
+    fee_bps: float = 1.0        # commission-like cost per trade notional
+    slippage_bps: float = 2.0   # slippage per trade notional
+    auto_adjust: bool = True
 
 
-# =========================
-# Data loading
-# =========================
-
-def load_from_yfinance(
-    symbols: list[str] = ["QQQ", "TQQQ"],
-    start: str = "2011-01-01",
-    end: str | None = None,
-    auto_adjust: bool = True,
-) -> dict[str, pd.DataFrame]:
+def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     """
-    Download daily OHLCV data from yfinance.
+    Wilder-style RSI using exponentially smoothed average gains/losses.
+    """
+    delta = close.diff()
 
-    Returns:
-        {
-            "QQQ":  DataFrame[Open, High, Low, Close, Volume],
-            "TQQQ": DataFrame[Open, High, Low, Close, Volume],
-        }
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+
+    # Handle edge cases more gracefully
+    rsi = rsi.where(avg_loss != 0, 100.0)
+    rsi = rsi.where(avg_gain != 0, 0.0)
+
+    return rsi
+
+
+def load_qqq_tqqq_data(
+    start: str = "1900-01-01",
+    end: Optional[str] = None,
+    auto_adjust: bool = True,
+) -> pd.DataFrame:
+    """
+    Downloads QQQ and TQQQ daily data and returns a merged DataFrame.
+
+    Output columns:
+        QQQ_Open, QQQ_High, QQQ_Low, QQQ_Close, QQQ_Volume,
+        TQQQ_Open, TQQQ_High, TQQQ_Low, TQQQ_Close, TQQQ_Volume
     """
     raw = yf.download(
-        tickers=symbols,
+        tickers=["QQQ", "TQQQ"],
         start=start,
         end=end,
         interval="1d",
         auto_adjust=auto_adjust,
-        progress=False,
         group_by="ticker",
+        progress=False,
         threads=True,
     )
 
-    out: dict[str, pd.DataFrame] = {}
+    if raw.empty:
+        raise ValueError("No data downloaded.")
 
-    for symbol in symbols:
+    frames = []
+    for symbol in ["QQQ", "TQQQ"]:
         if symbol not in raw:
-            raise ValueError(f"No data returned for {symbol}")
+            raise ValueError(f"Missing downloaded data for {symbol}")
 
         df = raw[symbol].copy()
-
         keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-        df = df[keep].dropna().sort_index()
+        df = df[keep].copy()
+        df.columns = [f"{symbol}_{c}" for c in df.columns]
+        frames.append(df)
 
-        if df.empty:
-            raise ValueError(f"Empty dataframe for {symbol}")
-
-        df.index = pd.to_datetime(df.index).tz_localize(None)
-        out[symbol] = df
-
-    return out
-
-
-# =========================
-# Strategy prep
-# =========================
-
-def prepare_data(qqq: pd.DataFrame, tqqq: pd.DataFrame) -> pd.DataFrame:
-    """
-    Requires:
-      qqq columns:  Open, Close
-      tqqq columns: Open, Close
-
-    Returns merged frame indexed by date.
-    """
-    q = qqq.copy()
-    t = tqqq.copy()
-
-    q.columns = [f"QQQ_{c}" for c in q.columns]
-    t.columns = [f"TQQQ_{c}" for c in t.columns]
-
-    df = q.join(t, how="inner").sort_index()
-
-    required = ["QQQ_Open", "QQQ_Close", "TQQQ_Open", "TQQQ_Close"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
-
-    return df
-
-
-def build_signals(df: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame:
-    out = df.copy()
-
-    q_close = out["QQQ_Close"]
-    q_ret = q_close.pct_change()
-
-    out["qqq_ret_1d"] = q_ret
-    out["sma_fast"] = q_close.rolling(cfg.sma_fast).mean()
-    out["sma_slow"] = q_close.rolling(cfg.sma_slow).mean()
-    out["ret_n"] = q_close / q_close.shift(cfg.ret_window) - 1.0
-    out["rv20"] = q_ret.rolling(cfg.rv_window).std() * np.sqrt(252)
-
-    long_filter = (
-        (q_close > out["sma_slow"]) &
-        (out["sma_fast"] > out["sma_slow"]) &
-        (out["ret_n"] > 0)
-    )
-
-    exit_trigger = (
-        (q_close < out["sma_fast"]) |
-        (out["rv20"] > cfg.rv_exit_threshold) |
-        (out["qqq_ret_1d"] <= cfg.daily_drop_exit)
-    )
-
-    # Re-entry only after the long filter is true for 2 consecutive closes.
-    long_filter_2day = long_filter & long_filter.shift(1).fillna(False)
-
-    raw_weight = cfg.vol_target / (3.0 * out["rv20"])
-    target_weight = raw_weight.clip(upper=cfg.max_weight)
-
-    # No position unless the 2-day confirmation is satisfied.
-    target_weight = target_weight.where(long_filter_2day, 0.0)
-
-    # Exit overrides everything.
-    target_weight = target_weight.where(~exit_trigger, 0.0)
-
-    out["long_filter"] = long_filter
-    out["long_filter_2day"] = long_filter_2day
-    out["exit_trigger"] = exit_trigger
-    out["target_weight"] = target_weight.fillna(0.0)
+    out = pd.concat(frames, axis=1, join="inner").dropna().sort_index()
+    out.index = pd.to_datetime(out.index).tz_localize(None)
 
     return out
 
-
-# =========================
-# Core backtests
-# =========================
-
-def backtest_tqqq_strategy(
-    qqq: pd.DataFrame,
-    tqqq: pd.DataFrame,
-    cfg: Optional[BacktestConfig] = None,
-) -> pd.DataFrame:
-    """
-    Backtest logic:
-    - Signal computed on day t close using QQQ
-    - Trade executed at day t+1 open in TQQQ
-    - Position held until next rebalance/open
-    - Portfolio marked daily using TQQQ close
-    """
-    if cfg is None:
-        cfg = BacktestConfig()
-
-    df = prepare_data(qqq, tqqq)
-    df = build_signals(df, cfg)
-
-    cash_rate_daily = (1.0 + cfg.cash_rate_annual) ** (1 / 252) - 1.0
-    trading_cost_rate = (cfg.fee_bps + cfg.slippage_bps) / 10_000.0
-
-    dates = df.index.to_list()
-    n = len(df)
-
-    cash = cfg.initial_capital
-    shares = 0.0
-
-    records = []
-    prev_close_equity = cfg.initial_capital
-
-    for i in range(n):
-        date = dates[i]
-        row = df.loc[date]
-
-        open_px = float(row["TQQQ_Open"])
-        close_px = float(row["TQQQ_Close"])
-
-        equity_at_open = cash + shares * open_px
-
-        # Rebalance at today's open using yesterday's target weight
-        if i > 0:
-            prev_signal_weight = float(df.iloc[i - 1]["target_weight"])
-            target_dollar = equity_at_open * prev_signal_weight
-            target_shares = 0.0 if open_px <= 0 else target_dollar / open_px
-
-            share_change = target_shares - shares
-            turnover_notional = abs(share_change) * open_px
-            trading_cost = turnover_notional * trading_cost_rate
-
-            cash -= share_change * open_px
-            cash -= trading_cost
-            shares = target_shares
-        else:
-            trading_cost = 0.0
-            turnover_notional = 0.0
-
-        cash *= (1.0 + cash_rate_daily)
-
-        equity = cash + shares * close_px
-        daily_return = equity / prev_close_equity - 1.0 if i > 0 else 0.0
-
-        records.append(
-            {
-                "Date": date,
-                "QQQ_Close": row["QQQ_Close"],
-                "TQQQ_Open": open_px,
-                "TQQQ_Close": close_px,
-                "signal_weight_for_next_open": row["target_weight"],
-                "shares_held_eod": shares,
-                "cash_eod": cash,
-                "turnover_notional": turnover_notional,
-                "trading_cost": trading_cost,
-                "equity": equity,
-                "daily_return": daily_return,
-                "sma_fast": row["sma_fast"],
-                "sma_slow": row["sma_slow"],
-                "ret_n": row["ret_n"],
-                "rv20": row["rv20"],
-                "long_filter": row["long_filter"],
-                "long_filter_2day": row["long_filter_2day"],
-                "exit_trigger": row["exit_trigger"],
-            }
-        )
-
-        prev_close_equity = equity
-
-    return pd.DataFrame(records).set_index("Date")
-
-
-def backtest_buy_and_hold(
-    asset: pd.DataFrame,
-    initial_capital: float = 100_000.0,
-    fee_bps: float = 1.0,
-    slippage_bps: float = 2.0,
-    label: str = "asset",
-) -> pd.DataFrame:
-    """
-    Buy at the first available open and hold forever.
-    Mark daily equity to the close.
-
-    asset must have:
-      Open, Close
-    """
-    df = asset[["Open", "Close"]].dropna().sort_index().copy()
-    if df.empty:
-        raise ValueError(f"{label}: empty dataframe")
-
-    trading_cost_rate = (fee_bps + slippage_bps) / 10_000.0
-
-    first_open = float(df["Open"].iloc[0])
-    initial_trade_cost = initial_capital * trading_cost_rate
-    investable_capital = initial_capital - initial_trade_cost
-    shares = investable_capital / first_open
-
-    out = pd.DataFrame(index=df.index)
-    out["equity"] = shares * df["Close"]
-    out["daily_return"] = out["equity"].pct_change().fillna(0.0)
-    out["shares"] = shares
-    out["initial_trade_cost"] = initial_trade_cost
-
-    return out
-
-
-# =========================
-# Performance
-# =========================
 
 def performance_summary(equity_curve: pd.Series) -> pd.Series:
     rets = equity_curve.pct_change().dropna()
-    if len(rets) == 0:
+    if rets.empty:
         return pd.Series(dtype=float)
 
     total_return = equity_curve.iloc[-1] / equity_curve.iloc[0] - 1.0
     cagr = (equity_curve.iloc[-1] / equity_curve.iloc[0]) ** (252 / len(rets)) - 1.0
     vol = rets.std() * np.sqrt(252)
-    sharpe = rets.mean() / rets.std() * np.sqrt(252) if rets.std() > 0 else np.nan
+    sharpe = np.sqrt(252) * rets.mean() / rets.std() if rets.std() > 0 else np.nan
+    # Kelly fraction for a single risky asset under simple-return assumptions.
+    kelly_fraction = rets.mean() / rets.var() if rets.var() > 0 else np.nan
 
     running_max = equity_curve.cummax()
     drawdown = equity_curve / running_max - 1.0
@@ -303,111 +108,331 @@ def performance_summary(equity_curve: pd.Series) -> pd.Series:
             "CAGR": cagr,
             "Annualized Vol": vol,
             "Sharpe": sharpe,
+            "Kelly Fraction": kelly_fraction,
             "Max Drawdown": max_drawdown,
             "Hit Rate": hit_rate,
         }
     )
 
 
-# =========================
-# Benchmarks runner
-# =========================
-
-def run_backtest_with_benchmarks(
-    start: str = "2011-01-01",
-    end: str | None = None,
-    cfg: Optional[BacktestConfig] = None,
-    auto_adjust: bool = True,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+def backtest_rsi_asset_strategy(
+    data: pd.DataFrame,
+    cfg: BacktestConfig,
+    asset_symbol: str,
+) -> pd.DataFrame:
     """
-    Returns:
-      equity_curves: DataFrame with equity curves for strategy and benchmarks
-      summary:       DataFrame with performance metrics
+    Strategy:
+      - Compute RSI on QQQ close.
+      - If flat and QQQ RSI <= buy_rsi at today's close, buy the selected asset at next open.
+      - If long and the selected asset reaches profit_target_multiple times its entry price
+        at today's close, sell it at next open.
+      - Long-only, 100% allocation when in position, otherwise cash.
     """
-    if cfg is None:
-        cfg = BacktestConfig()
+    df = data.copy()
+    df["QQQ_RSI"] = compute_rsi(df["QQQ_Close"], cfg.rsi_period)
+    open_col = f"{asset_symbol}_Open"
+    close_col = f"{asset_symbol}_Close"
 
-    data = load_from_yfinance(
-        symbols=["QQQ", "TQQQ"],
-        start=start,
-        end=end,
-        auto_adjust=auto_adjust,
+    trading_cost_rate = (cfg.fee_bps + cfg.slippage_bps) / 10_000.0
+
+    cash = cfg.initial_capital
+    shares = 0.0
+    in_position = False
+    entry_price = np.nan
+    pending_action: Optional[str] = None
+
+    records = []
+    prev_equity = cfg.initial_capital
+
+    dates = list(df.index)
+
+    for i, date in enumerate(dates):
+        row = df.loc[date]
+        asset_open = float(row[open_col])
+        asset_close = float(row[close_col])
+        rsi = float(row["QQQ_RSI"]) if pd.notna(row["QQQ_RSI"]) else np.nan
+
+        turnover_notional = 0.0
+        trading_cost = 0.0
+        action_executed = pending_action or "none"
+
+        # Execute yesterday's signal at today's open
+        if pending_action == "buy" and not in_position:
+            equity_at_open = cash
+            shares = equity_at_open / asset_open if asset_open > 0 else 0.0
+            turnover_notional = shares * asset_open
+            trading_cost = turnover_notional * trading_cost_rate
+
+            cash -= turnover_notional
+            cash -= trading_cost
+            in_position = shares > 0
+            entry_price = asset_open if in_position else np.nan
+
+        elif pending_action == "sell" and in_position:
+            turnover_notional = shares * asset_open
+            trading_cost = turnover_notional * trading_cost_rate
+
+            cash += turnover_notional
+            cash -= trading_cost
+            shares = 0.0
+            in_position = False
+            entry_price = np.nan
+
+        pending_action = None
+
+        # Mark to close
+        equity = cash + shares * asset_close
+        daily_return = equity / prev_equity - 1.0 if i > 0 else 0.0
+        position_return_multiple = (
+            asset_close / entry_price if in_position and pd.notna(entry_price) and entry_price > 0 else np.nan
+        )
+
+        # Generate signal at today's close for next open
+        next_action: Optional[str] = None
+        if pd.notna(rsi):
+            if (not in_position) and (rsi <= cfg.buy_rsi):
+                next_action = "buy"
+            elif in_position and pd.notna(position_return_multiple) and (
+                position_return_multiple >= cfg.profit_target_multiple
+            ):
+                next_action = "sell"
+
+        pending_action = next_action
+
+        records.append(
+            {
+                "Date": date,
+                "QQQ_Close": row["QQQ_Close"],
+                "QQQ_RSI": rsi,
+                f"{asset_symbol}_Open": asset_open,
+                f"{asset_symbol}_Close": asset_close,
+                "Equity": equity,
+                "DailyReturn": daily_return,
+                "Cash": cash,
+                "Shares": shares,
+                "EntryPrice": entry_price,
+                "PositionReturnMultiple": position_return_multiple,
+                "InPosition": in_position,
+                "ActionExecutedToday": action_executed,
+                "PendingActionForNextOpen": pending_action or "none",
+                "TurnoverNotional": turnover_notional,
+                "TradingCost": trading_cost,
+            }
+        )
+
+        prev_equity = equity
+
+    return pd.DataFrame(records).set_index("Date")
+
+
+def backtest_buy_and_hold(
+    data: pd.DataFrame,
+    asset_symbol: str,
+    initial_capital: float = 100_000.0,
+    fee_bps: float = 1.0,
+    slippage_bps: float = 2.0,
+) -> pd.DataFrame:
+    """
+    Buy the selected asset at the first open and hold.
+    """
+    open_col = f"{asset_symbol}_Open"
+    close_col = f"{asset_symbol}_Close"
+    df = data[[open_col, close_col]].dropna().copy()
+    if df.empty:
+        raise ValueError(f"No {asset_symbol} data available for benchmark.")
+
+    cost_rate = (fee_bps + slippage_bps) / 10_000.0
+    first_open = float(df[open_col].iloc[0])
+
+    initial_trade_cost = initial_capital * cost_rate
+    investable_capital = initial_capital - initial_trade_cost
+    shares = investable_capital / first_open
+
+    out = pd.DataFrame(index=df.index)
+    out["Equity"] = shares * df[close_col]
+    out["DailyReturn"] = out["Equity"].pct_change().fillna(0.0)
+
+    return out
+
+
+def run_parameter_sweep(
+    data: pd.DataFrame,
+    base_cfg: BacktestConfig,
+    asset_symbol: str,
+    buy_rsi_values: list[float],
+    profit_target_values: list[float],
+) -> tuple[pd.DataFrame, BacktestConfig, pd.DataFrame]:
+    rows = []
+    best_cfg: Optional[BacktestConfig] = None
+    best_strategy: Optional[pd.DataFrame] = None
+    best_total_return = -np.inf
+
+    for buy_rsi in buy_rsi_values:
+        for profit_target_multiple in profit_target_values:
+            cfg = replace(
+                base_cfg,
+                buy_rsi=buy_rsi,
+                profit_target_multiple=profit_target_multiple,
+            )
+            strategy = backtest_rsi_asset_strategy(data, cfg, asset_symbol=asset_symbol)
+            summary = performance_summary(strategy["Equity"])
+            trades_executed = int((strategy["ActionExecutedToday"] != "none").sum())
+
+            row = {
+                "Buy RSI": buy_rsi,
+                "Sell Return Multiple": profit_target_multiple,
+                "Trades Executed": trades_executed,
+                **summary.to_dict(),
+            }
+            rows.append(row)
+
+            total_return = float(summary["Total Return"])
+            if total_return > best_total_return:
+                best_total_return = total_return
+                best_cfg = cfg
+                best_strategy = strategy
+
+    results = pd.DataFrame(rows).sort_values(
+        by=["Total Return", "Sharpe", "CAGR"],
+        ascending=False,
+    ).reset_index(drop=True)
+
+    if best_cfg is None or best_strategy is None:
+        raise ValueError("Parameter sweep did not produce any results.")
+
+    return results, best_cfg, best_strategy
+
+
+if __name__ == "__main__":
+    base_cfg = BacktestConfig(
+        initial_capital=100_000,
+        rsi_period=14,
+        buy_rsi=30,
+        profit_target_multiple=10.0,
+        fee_bps=1.0,
+        slippage_bps=2.0,
+        auto_adjust=True,
     )
 
-    qqq = data["QQQ"]
-    tqqq = data["TQQQ"]
-
-    strategy_bt = backtest_tqqq_strategy(qqq, tqqq, cfg)
-    qqq_bh = backtest_buy_and_hold(
-        qqq,
-        initial_capital=cfg.initial_capital,
-        fee_bps=cfg.fee_bps,
-        slippage_bps=cfg.slippage_bps,
-        label="QQQ",
-    )
-    tqqq_bh = backtest_buy_and_hold(
-        tqqq,
-        initial_capital=cfg.initial_capital,
-        fee_bps=cfg.fee_bps,
-        slippage_bps=cfg.slippage_bps,
-        label="TQQQ",
+    data = load_qqq_tqqq_data(
+        start="1900-01-01",
+        end=None,
+        auto_adjust=base_cfg.auto_adjust,
     )
 
-    equity_curves = pd.concat(
+    # Refined around the latest standout near buy_rsi=40 and sell targets around 1.8.
+    buy_rsi_values = [39, 40, 41, 42]
+    profit_target_values = [1.72, 1.75, 1.78, 1.8, 1.82, 1.85, 1.88, 1.9, 1.95, 2.0]
+
+    sweep_results, best_cfg, strategy = run_parameter_sweep(
+        data,
+        base_cfg,
+        asset_symbol="TQQQ",
+        buy_rsi_values=buy_rsi_values,
+        profit_target_values=profit_target_values,
+    )
+
+    qqq_sweep_results, qqq_best_cfg, qqq_strategy = run_parameter_sweep(
+        data,
+        base_cfg,
+        asset_symbol="QQQ",
+        buy_rsi_values=buy_rsi_values,
+        profit_target_values=profit_target_values,
+    )
+
+    tqqq_benchmark = backtest_buy_and_hold(
+        data,
+        asset_symbol="TQQQ",
+        initial_capital=best_cfg.initial_capital,
+        fee_bps=best_cfg.fee_bps,
+        slippage_bps=best_cfg.slippage_bps,
+    )
+    qqq_benchmark = backtest_buy_and_hold(
+        data,
+        asset_symbol="QQQ",
+        initial_capital=best_cfg.initial_capital,
+        fee_bps=best_cfg.fee_bps,
+        slippage_bps=best_cfg.slippage_bps,
+    )
+
+    curves = pd.concat(
         [
-            strategy_bt["equity"].rename("Strategy"),
-            qqq_bh["equity"].rename("QQQ_BuyHold"),
-            tqqq_bh["equity"].rename("TQQQ_BuyHold"),
+            strategy["Equity"].rename("TQQQ_RSI_Strategy"),
+            qqq_strategy["Equity"].rename("QQQ_RSI_Strategy"),
+            tqqq_benchmark["Equity"].rename("TQQQ_BuyHold"),
+            qqq_benchmark["Equity"].rename("QQQ_BuyHold"),
         ],
         axis=1,
         join="inner",
     ).dropna()
 
-    # Normalize to 1.0 for easier comparison
-    normalized = equity_curves.div(equity_curves.iloc[0])
+    normalized = curves / curves.iloc[0]
 
-    summary = pd.DataFrame(
+    best_summary = pd.DataFrame(
         {
-            "Strategy": performance_summary(equity_curves["Strategy"]),
-            "QQQ_BuyHold": performance_summary(equity_curves["QQQ_BuyHold"]),
-            "TQQQ_BuyHold": performance_summary(equity_curves["TQQQ_BuyHold"]),
+            "TQQQ_RSI_Strategy": performance_summary(curves["TQQQ_RSI_Strategy"]),
+            "QQQ_RSI_Strategy": performance_summary(curves["QQQ_RSI_Strategy"]),
+            "TQQQ_BuyHold": performance_summary(curves["TQQQ_BuyHold"]),
+            "QQQ_BuyHold": performance_summary(curves["QQQ_BuyHold"]),
         }
     ).T
 
-    return normalized, summary
-
-
-# =========================
-# Example usage
-# =========================
-
-if __name__ == "__main__":
-    cfg = BacktestConfig(
-        initial_capital=100_000,
-        vol_target=0.12,
-        max_weight=0.35,
-        fee_bps=1.0,
-        slippage_bps=2.0,
-        cash_rate_annual=0.0,
-    )
-
-    curves, summary = run_backtest_with_benchmarks(
-        start="2011-01-01",
-        end=None,
-        cfg=cfg,
-        auto_adjust=True,
-    )
-
     pd.set_option("display.float_format", "{:.4f}".format)
 
+    print("\nParameter sweep results (top 10 by Total Return):")
+    print(sweep_results.head(10))
+
+    print(
+        "\nBest TQQQ strategy parameters:"
+        f" buy_rsi={best_cfg.buy_rsi},"
+        f" sell_return_multiple={best_cfg.profit_target_multiple}"
+    )
+
+    print("\nQQQ parameter sweep results (top 10 by Total Return):")
+    print(qqq_sweep_results.head(10))
+
+    print(
+        "\nBest QQQ strategy parameters:"
+        f" buy_rsi={qqq_best_cfg.buy_rsi},"
+        f" sell_return_multiple={qqq_best_cfg.profit_target_multiple}"
+    )
+
     print("\nNormalized equity curves (tail):")
-    print(curves.tail())
+    print(normalized.tail())
 
-    print("\nPerformance summary:")
-    print(summary)
+    print("\nPerformance summary for best strategy and comparison portfolios:")
+    print(best_summary)
 
-    # Visualization:
-    import matplotlib.pyplot as plt
-    curves.plot(figsize=(12, 7), title="Strategy vs Buy-and-Hold Benchmarks")
-    plt.ylabel("Growth of $1")
-    plt.show()
+    print("\nRecent TQQQ strategy rows for best parameter set:")
+    print(
+        strategy[
+            [
+                "QQQ_RSI",
+                "Equity",
+                "PositionReturnMultiple",
+                "InPosition",
+                "ActionExecutedToday",
+                "PendingActionForNextOpen",
+            ]
+        ].tail(20)
+    )
+
+    print("\nRecent QQQ strategy rows using the same best parameter set:")
+    print(
+        qqq_strategy[
+            [
+                "QQQ_RSI",
+                "Equity",
+                "PositionReturnMultiple",
+                "InPosition",
+                "ActionExecutedToday",
+                "PendingActionForNextOpen",
+            ]
+        ].tail(20)
+    )
+
+    # Optional plot:
+    # import matplotlib.pyplot as plt
+    # normalized.plot(figsize=(12, 7), title="QQQ RSI -> TQQQ Strategy vs TQQQ Buy & Hold")
+    # plt.ylabel("Growth of $1")
+    # plt.savefig("qqq_rsi_tqqq_strategy.png", dpi=150, bbox_inches="tight")
