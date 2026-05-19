@@ -1,10 +1,55 @@
 # Python-generated files
 __pycache__/
 *.py[oc]
+*.pyd
+*.so
 build/
 dist/
 wheels/
 *.egg-info
+.eggs/
+pip-wheel-metadata/
 
 # Virtual environments
 .venv
+.venv*/
+venv/
+env/
+.codex
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Type checker and linter caches
+.mypy_cache/
+.ruff_cache/
+.pyre/
+
+# Notebook and local runtime files
+.ipynb_checkpoints/
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Generated strategy state and reports
+*.sqlite
+*.sqlite-*
+best_equity_curves.csv
+buy_signals.csv
+sell_signals.csv
+optimization_summary.csv
+alpaca_order_results.csv
+alpaca_sell_order_results.csv
+outputs/

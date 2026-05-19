@@ -1,12 +1,32 @@
 [project]
-name = "tqqq"
+name = "leveraged-trader"
 version = "0.1.0"
-description = "Add your description here"
+description = "Research and paper-trading workflow for leveraged ETF RSI strategies."
 readme = "README.md"
 requires-python = ">=3.12"
+license = { text = "MIT" }
+keywords = ["alpaca", "leveraged-etfs", "paper-trading", "rsi", "trading", "yfinance"]
 dependencies = [
+    "lxml>=6.0.2",
     "matplotlib>=3.10.8",
     "numpy>=2.4.3",
     "pandas>=3.0.1",
+    "requests>=2.32.5",
     "yfinance>=1.2.0",
 ]
+
+[project.scripts]
+leveraged-trader = "leveraged_trader.cli:main"
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
