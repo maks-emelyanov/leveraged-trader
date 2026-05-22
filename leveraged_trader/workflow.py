@@ -7,11 +7,19 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from .alpaca import submit_alpaca_paper_buy_orders, submit_alpaca_paper_sell_orders
+from .alpaca import reconcile_alpaca_managed_positions, submit_alpaca_paper_buy_orders
 from .config import AlpacaOrderConfig, BacktestConfig, RISK_FREE_SYMBOL, UniverseConfig
 from .market_data import load_strategy_data
 from .reports import build_buy_signal_report, build_sell_signal_report, summarize_saved_results
-from .storage import expected_state_count, earliest_state_date, init_state_db, process_asset_grid, save_workflow_assets
+from .storage import (
+    active_alpaca_managed_symbols,
+    earliest_state_date,
+    expected_state_count,
+    init_state_db,
+    load_alpaca_managed_positions,
+    process_asset_grid,
+    save_workflow_assets,
+)
 from .universe import determine_workflow_assets
 
 
@@ -36,6 +44,7 @@ def run_resumable_optimizations(
 ) -> None:
     with sqlite3.connect(db_path) as conn:
         init_state_db(conn)
+        reconciliation_results = reconcile_alpaca_managed_positions(conn, alpaca_cfg)
         workflow_assets = load_or_refresh_workflow_assets(conn, universe_cfg)
         expected_combinations = len(buy_rsi_values) * len(profit_target_values)
         total_workflows = len(workflow_assets)
@@ -94,6 +103,16 @@ def run_resumable_optimizations(
             optimization_summary,
             rsi_period=base_cfg.rsi_period,
         )
+        active_managed_symbols = active_alpaca_managed_symbols(conn)
+        if buy_signals.empty or not active_managed_symbols:
+            eligible_buy_signals = buy_signals.copy()
+        else:
+            eligible_buy_signals = buy_signals[
+                ~buy_signals["Asset"].astype(str).str.upper().isin(active_managed_symbols)
+            ].copy()
+        order_results = submit_alpaca_paper_buy_orders(buy_signals, alpaca_cfg, conn=conn)
+        managed_positions = load_alpaca_managed_positions(conn)
+        sell_reconciliation_results = reconciliation_results[reconciliation_results["Action"].eq("sell")]
 
     pd.set_option("display.float_format", "{:.4f}".format)
     pd.set_option("display.max_columns", None)
@@ -136,9 +155,10 @@ def run_resumable_optimizations(
     curves.to_csv(output_path / "best_equity_curves.csv")
     optimization_summary.to_csv(output_path / "optimization_summary.csv", index=False)
     buy_signals.to_csv(output_path / "buy_signals.csv", index=False)
+    eligible_buy_signals.to_csv(output_path / "eligible_buy_signals.csv", index=False)
     sell_signals.to_csv(output_path / "sell_signals.csv", index=False)
-
-    order_results = submit_alpaca_paper_buy_orders(buy_signals, alpaca_cfg)
+    managed_positions.to_csv(output_path / "managed_positions.csv", index=False)
+    reconciliation_results.to_csv(output_path / "alpaca_reconciliation_results.csv", index=False)
     if alpaca_cfg.enabled:
         print("\nAlpaca paper order results:")
         if order_results.empty:
@@ -147,11 +167,10 @@ def run_resumable_optimizations(
             print(order_results.set_index("Asset"))
     order_results.to_csv(output_path / "alpaca_order_results.csv", index=False)
 
-    sell_order_results = submit_alpaca_paper_sell_orders(sell_signals, alpaca_cfg)
     if alpaca_cfg.sell_enabled:
-        print("\nAlpaca paper sell order results:")
-        if sell_order_results.empty:
-            print("No sell signals to submit.")
+        print("\nAlpaca managed position reconciliation:")
+        if reconciliation_results.empty:
+            print("No managed Alpaca positions to reconcile.")
         else:
-            print(sell_order_results.set_index("Asset"))
-    sell_order_results.to_csv(output_path / "alpaca_sell_order_results.csv", index=False)
+            print(reconciliation_results.set_index("Asset"))
+    sell_reconciliation_results.to_csv(output_path / "alpaca_sell_order_results.csv", index=False)

@@ -42,8 +42,8 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Submit Alpaca paper market sell orders for current sell recommendations. "
-            "Each order sells the full held quantity. Enabled by default; use "
+            "Submit Alpaca paper managed limit sell orders for filled managed buys. "
+            "Each order sells the original filled buy quantity at the frozen target price. Enabled by default; use "
             "--no-alpaca-submit-sell-orders to skip."
         ),
     )

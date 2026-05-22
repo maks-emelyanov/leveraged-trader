@@ -1,6 +1,6 @@
 # Leveraged Trader
 
-Leveraged Trader is a research and paper-trading workflow for RSI-based leveraged ETF strategies. It builds a current leveraged ETF universe, optimizes simple buy/sell rules against daily market data, writes recommendation reports, and queues guarded Alpaca paper-trading market orders by default.
+Leveraged Trader is a research and paper-trading workflow for RSI-based leveraged ETF strategies. It builds a current leveraged ETF universe, optimizes simple buy/sell rules against daily market data, writes recommendation reports, and queues guarded Alpaca paper-trading buy orders by default.
 
 This project is intended for research and paper trading. It is not financial advice, and it should not be connected to live trading without additional review, testing, and risk controls.
 
@@ -12,9 +12,10 @@ This project is intended for research and paper trading. It is not financial adv
 - Optimizes RSI buy thresholds and profit-target sell multiples.
 - Persists strategy state in SQLite for resumable updates.
 - Writes buy and sell recommendation reports.
-- Submits Alpaca paper buy and sell market orders by default.
-- Guards Alpaca buys against already-held symbols and open buy orders.
-- Guards Alpaca sells against missing positions and open sell orders.
+- Submits guarded Alpaca paper buy market orders by default.
+- Tracks submitted Alpaca buys as managed live positions in SQLite.
+- Submits managed Alpaca limit sells from actual fill price times the original sell multiple.
+- Guards Alpaca buys against already-held symbols, active managed positions, and open buy or sell orders.
 
 ## Quickstart
 
@@ -46,7 +47,7 @@ Rebuild all cached state:
 uv run leveraged-trader --mode rebuild
 ```
 
-Submit paper orders for the current run's recommendations:
+Submit paper buys for the current run's recommendations and reconcile managed limit sells:
 
 ```bash
 uv run leveraged-trader
@@ -72,7 +73,7 @@ Common options:
 - `--db PATH`: SQLite state file path (default: `strategy_state.sqlite`).
 - `--output-dir DIR`: output directory for generated CSV files (default: `outputs`).
 - `--alpaca-submit-buy-orders / --no-alpaca-submit-buy-orders`: enable or skip buy order submission (default: enabled).
-- `--alpaca-submit-sell-orders / --no-alpaca-submit-sell-orders`: enable or skip sell order submission (default: enabled).
+- `--alpaca-submit-sell-orders / --no-alpaca-submit-sell-orders`: enable or skip managed limit sell reconciliation/submission (default: enabled).
 - `--alpaca-api-key-id VALUE`: override `ALPACA_API_KEY_ID`.
 - `--alpaca-api-secret-key VALUE`: override `ALPACA_API_SECRET_KEY`.
 - `--alpaca-base-url URL`: override `ALPACA_BASE_URL` (defaults to Alpaca paper endpoint).
@@ -85,7 +86,10 @@ CSV reports are written to `outputs/` by default:
 - `best_equity_curves.csv`
 - `optimization_summary.csv`
 - `buy_signals.csv`
+- `eligible_buy_signals.csv`
 - `sell_signals.csv`
+- `managed_positions.csv`
+- `alpaca_reconciliation_results.csv`
 - `alpaca_order_results.csv`
 - `alpaca_sell_order_results.csv`
 
@@ -120,15 +124,28 @@ Buy orders:
 - Use 10% of current Alpaca paper account cash.
 - Use notional orders for Alpaca-fractionable symbols and whole-share `qty` orders otherwise.
 - Are skipped if the symbol is already held.
-- Are skipped if an open buy order already exists for the symbol.
+- Are skipped if the symbol already has an active managed position.
+- Are skipped if an open buy or sell order already exists for the symbol.
+- Use `extended_hours=false` and `time_in_force=day`.
+- Are persisted with the buy RSI and sell multiple that were selected when the buy was submitted.
+
+Managed sell orders:
+
+- Are reconciled from persisted managed buy records, not from the latest optimized sell signal.
+- Use the actual Alpaca filled average buy price times the original sell multiple.
+- Sell the exact filled buy quantity with a limit order.
+- Are resubmitted on a later run if a day limit order expires.
+- Keep the managed position active, blocking new buys, if a sell is canceled or rejected.
 - Use `extended_hours=false` and `time_in_force=day`.
 
-Sell orders:
+The raw `sell_signals.csv` report remains a strategy recommendation report. Live Alpaca exits for positions opened by this workflow are governed by `managed_positions.csv` and the reconciliation step.
 
-- Sell the full currently held Alpaca paper position.
-- Are skipped if the symbol is not held.
-- Are skipped if an open sell order already exists for the symbol.
-- Use `extended_hours=false` and `time_in_force=day`.
+Managed position lifecycle:
+
+- Active rows have `closed_at` unset and block new buys for the same symbol.
+- Filled managed sells set `sell_status="filled"` and populate `closed_at`; rows are retained as trade history.
+- Existing Alpaca positions that predate this table are not managed automatically unless imported into `alpaca_managed_positions`.
+- Existing unmanaged Alpaca sell orders still protect against repeat buys while they remain open, but they are not linked to `managed_positions.csv`.
 
 ## Development
 

@@ -15,9 +15,9 @@ Leveraged Trader is organized as a small package with IO-heavy boundaries kept s
 - `leveraged_trader.market_data`: Yahoo Finance daily OHLCV loading.
 - `leveraged_trader.indicators`: indicator calculations such as RSI.
 - `leveraged_trader.backtest`: strategy stepping, backtests, and performance summaries.
-- `leveraged_trader.storage`: SQLite schema, persisted strategy state, market data, RSI values, and summaries.
+- `leveraged_trader.storage`: SQLite schema, persisted strategy state, market data, RSI values, summaries, and Alpaca managed-position records.
 - `leveraged_trader.reports`: best-strategy summaries and pending buy/sell recommendation reports.
-- `leveraged_trader.alpaca`: Alpaca paper account, position, open-order, and order submission integration.
+- `leveraged_trader.alpaca`: Alpaca paper account, position, open-order, managed-position reconciliation, and order submission integration.
 - `leveraged_trader.workflow`: orchestration for update/rebuild runs, report writing, and default Alpaca submission.
 - `leveraged_trader.cli`: command-line argument parsing and top-level configuration.
 
@@ -30,7 +30,8 @@ Leveraged Trader is organized as a small package with IO-heavy boundaries kept s
 5. Summarize the best strategy per asset.
 6. Build buy and sell recommendation reports.
 7. Write CSV outputs to `outputs/` or the configured output directory.
-8. Submit guarded Alpaca paper orders for the current recommendations unless disabled by CLI flags.
+8. Reconcile Alpaca managed positions and submit anchored limit sells for filled buys unless disabled by CLI flags.
+9. Submit guarded Alpaca paper buy orders for the current recommendations unless disabled by CLI flags.
 
 `update` mode resumes from persisted SQLite strategy state, while `rebuild` mode recomputes strategy state from scratch.
 
@@ -40,9 +41,15 @@ Alpaca submission is isolated in `alpaca.py`. The workflow passes in-memory reco
 
 The order guards intentionally check the live Alpaca paper account before submission:
 
-- buys skip already-held symbols and symbols with open buy orders;
-- sells skip missing positions and symbols with open sell orders;
-- all orders use regular-session day market orders.
+- buys skip already-held symbols, active managed-position symbols, and symbols with open buy or sell orders;
+- submitted buys are persisted with the strategy parameters selected at entry time;
+- filled managed buys submit a limit sell at the actual average fill price multiplied by the original sell multiple;
+- canceled or rejected managed sells keep the managed position active so later optimizations cannot rebuy the symbol automatically;
+- filled managed sells mark the row closed by setting `closed_at` while retaining the row as history;
+- unmanaged Alpaca positions or sell orders are not backfilled automatically, though open sell orders still block new buys for that symbol;
+- buy orders and managed limit sell orders use regular-session day orders.
+
+Strategy sell signals remain report outputs. Live exits for positions opened by the workflow are driven by managed-position reconciliation instead of the latest optimized parameter row.
 
 ## Runtime Configuration
 

@@ -97,6 +97,31 @@ def init_state_db(conn: sqlite3.Connection) -> None:
             volume REAL,
             PRIMARY KEY (symbol, date)
         );
+
+        CREATE TABLE IF NOT EXISTS alpaca_managed_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            signal_symbol TEXT NOT NULL,
+            buy_rsi REAL NOT NULL,
+            profit_target_multiple REAL NOT NULL,
+            buy_signal_date TEXT NOT NULL,
+            buy_client_order_id TEXT NOT NULL UNIQUE,
+            buy_alpaca_order_id TEXT,
+            buy_submitted_at TEXT,
+            buy_status TEXT NOT NULL,
+            filled_qty REAL,
+            filled_avg_price REAL,
+            filled_at TEXT,
+            target_sell_price REAL,
+            sell_client_order_id TEXT UNIQUE,
+            sell_alpaca_order_id TEXT,
+            sell_submitted_at TEXT,
+            sell_status TEXT,
+            closed_at TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         """
     )
     conn.commit()
@@ -350,6 +375,214 @@ def save_strategy_state(
             state["trades_executed"],
         ),
     )
+
+
+def save_alpaca_managed_buy_order(
+    conn: sqlite3.Connection,
+    *,
+    symbol: str,
+    signal_symbol: str,
+    buy_rsi: float,
+    profit_target_multiple: float,
+    buy_signal_date: str,
+    buy_client_order_id: str,
+    buy_alpaca_order_id: Optional[str],
+    buy_submitted_at: Optional[str],
+    buy_status: str,
+    notes: Optional[str] = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO alpaca_managed_positions
+        (symbol, signal_symbol, buy_rsi, profit_target_multiple, buy_signal_date,
+         buy_client_order_id, buy_alpaca_order_id, buy_submitted_at, buy_status, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(buy_client_order_id) DO UPDATE SET
+            buy_alpaca_order_id = COALESCE(excluded.buy_alpaca_order_id, buy_alpaca_order_id),
+            buy_submitted_at = COALESCE(excluded.buy_submitted_at, buy_submitted_at),
+            buy_status = excluded.buy_status,
+            notes = COALESCE(excluded.notes, notes),
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            symbol,
+            signal_symbol,
+            buy_rsi,
+            profit_target_multiple,
+            buy_signal_date,
+            buy_client_order_id,
+            buy_alpaca_order_id,
+            buy_submitted_at,
+            buy_status,
+            notes,
+        ),
+    )
+    conn.commit()
+
+
+def load_alpaca_managed_positions(conn: sqlite3.Connection, *, active_only: bool = False) -> pd.DataFrame:
+    where = "WHERE closed_at IS NULL" if active_only else ""
+    return pd.read_sql_query(
+        f"""
+        SELECT id, symbol, signal_symbol, buy_rsi, profit_target_multiple,
+               buy_signal_date, buy_client_order_id, buy_alpaca_order_id,
+               buy_submitted_at, buy_status, filled_qty, filled_avg_price,
+               filled_at, target_sell_price, sell_client_order_id,
+               sell_alpaca_order_id, sell_submitted_at, sell_status,
+               closed_at, notes, created_at, updated_at
+        FROM alpaca_managed_positions
+        {where}
+        ORDER BY id
+        """,
+        conn,
+    )
+
+
+def active_alpaca_managed_symbols(conn: sqlite3.Connection) -> set[str]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT UPPER(symbol)
+        FROM alpaca_managed_positions
+        WHERE closed_at IS NULL
+        """
+    ).fetchall()
+    return {str(row[0]) for row in rows}
+
+
+def update_alpaca_managed_buy_status(
+    conn: sqlite3.Connection,
+    position_id: int,
+    *,
+    buy_status: str,
+    buy_alpaca_order_id: Optional[str] = None,
+    buy_submitted_at: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE alpaca_managed_positions
+        SET buy_status = ?,
+            buy_alpaca_order_id = COALESCE(?, buy_alpaca_order_id),
+            buy_submitted_at = COALESCE(?, buy_submitted_at),
+            notes = COALESCE(?, notes),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (buy_status, buy_alpaca_order_id, buy_submitted_at, notes, position_id),
+    )
+    conn.commit()
+
+
+def mark_alpaca_managed_buy_filled(
+    conn: sqlite3.Connection,
+    position_id: int,
+    *,
+    buy_status: str,
+    filled_qty: float,
+    filled_avg_price: float,
+    filled_at: Optional[str],
+    target_sell_price: float,
+    buy_alpaca_order_id: Optional[str] = None,
+    buy_submitted_at: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE alpaca_managed_positions
+        SET buy_status = ?,
+            buy_alpaca_order_id = COALESCE(?, buy_alpaca_order_id),
+            buy_submitted_at = COALESCE(?, buy_submitted_at),
+            filled_qty = ?,
+            filled_avg_price = ?,
+            filled_at = COALESCE(?, filled_at),
+            target_sell_price = ?,
+            notes = COALESCE(?, notes),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            buy_status,
+            buy_alpaca_order_id,
+            buy_submitted_at,
+            filled_qty,
+            filled_avg_price,
+            filled_at,
+            target_sell_price,
+            notes,
+            position_id,
+        ),
+    )
+    conn.commit()
+
+
+def record_alpaca_managed_sell_order(
+    conn: sqlite3.Connection,
+    position_id: int,
+    *,
+    sell_client_order_id: str,
+    sell_alpaca_order_id: Optional[str],
+    sell_submitted_at: Optional[str],
+    sell_status: str,
+    notes: Optional[str] = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE alpaca_managed_positions
+        SET sell_client_order_id = ?,
+            sell_alpaca_order_id = ?,
+            sell_submitted_at = ?,
+            sell_status = ?,
+            notes = COALESCE(?, notes),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (sell_client_order_id, sell_alpaca_order_id, sell_submitted_at, sell_status, notes, position_id),
+    )
+    conn.commit()
+
+
+def update_alpaca_managed_sell_status(
+    conn: sqlite3.Connection,
+    position_id: int,
+    *,
+    sell_status: str,
+    sell_alpaca_order_id: Optional[str] = None,
+    sell_submitted_at: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE alpaca_managed_positions
+        SET sell_status = ?,
+            sell_alpaca_order_id = COALESCE(?, sell_alpaca_order_id),
+            sell_submitted_at = COALESCE(?, sell_submitted_at),
+            notes = COALESCE(?, notes),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (sell_status, sell_alpaca_order_id, sell_submitted_at, notes, position_id),
+    )
+    conn.commit()
+
+
+def close_alpaca_managed_position(
+    conn: sqlite3.Connection,
+    position_id: int,
+    *,
+    closed_at: Optional[str],
+    notes: Optional[str] = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE alpaca_managed_positions
+        SET closed_at = COALESCE(?, CURRENT_TIMESTAMP),
+            notes = COALESCE(?, notes),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (closed_at, notes, position_id),
+    )
+    conn.commit()
 
 
 def save_equity_records(conn: sqlite3.Connection, records: list[dict]) -> None:
