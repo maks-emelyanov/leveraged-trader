@@ -49,9 +49,15 @@ class AlpacaTests(unittest.TestCase):
             api_secret_key="secret",
         )
 
+    @patch("leveraged_trader.alpaca._latest_market_price")
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
-    def test_buy_order_uses_10_percent_cash_notional(self, mock_get: Mock, mock_post: Mock) -> None:
+    def test_buy_order_uses_10_percent_cash_whole_share_qty(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+        mock_latest_market_price: Mock,
+    ) -> None:
         mock_get.side_effect = [
             response(404, {}),
             response(200, []),
@@ -59,6 +65,7 @@ class AlpacaTests(unittest.TestCase):
             response(200, {"symbol": "TQQQ", "status": "active", "tradable": True, "fractionable": True}),
             response(200, {"cash": "12345.67"}),
         ]
+        mock_latest_market_price.return_value = 100.0
         mock_post.return_value = response(200, {"id": "order-1", "status": "accepted"})
 
         result = submit_alpaca_paper_buy_orders(
@@ -68,28 +75,19 @@ class AlpacaTests(unittest.TestCase):
 
         self.assertEqual(result.loc[0, "Status"], "submitted")
         self.assertEqual(result.loc[0, "Notional"], 1234.57)
-        self.assertEqual(mock_post.call_args.kwargs["json"]["notional"], "1234.57")
+        self.assertEqual(result.loc[0, "Qty"], 12)
+        self.assertEqual(mock_post.call_args.kwargs["json"]["qty"], "12")
+        self.assertNotIn("notional", mock_post.call_args.kwargs["json"])
         self.assertFalse(mock_post.call_args.kwargs["json"]["extended_hours"])
 
-    @patch("leveraged_trader.alpaca.requests.post")
-    @patch("leveraged_trader.alpaca.requests.get")
-    def test_sell_order_sells_full_position_qty(self, mock_get: Mock, mock_post: Mock) -> None:
-        mock_get.side_effect = [
-            response(404, {}),
-            response(200, []),
-            response(200, {"qty": "12.5"}),
-        ]
-        mock_post.return_value = response(200, {"id": "order-2", "status": "accepted"})
-
+    def test_direct_sell_signal_submission_is_disabled(self) -> None:
         result = submit_alpaca_paper_sell_orders(
             pd.DataFrame([{"Asset": "TQQQ", "Date": "2026-01-02"}]),
             self.cfg(sell=True),
         )
 
-        self.assertEqual(result.loc[0, "Status"], "submitted")
-        self.assertEqual(result.loc[0, "Qty"], 12.5)
-        self.assertEqual(mock_post.call_args.kwargs["json"]["qty"], "12.5")
-        self.assertFalse(mock_post.call_args.kwargs["json"]["extended_hours"])
+        self.assertEqual(result.loc[0, "Status"], "managed_only")
+        self.assertIn("managed reconciliation", result.loc[0, "Message"])
 
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
@@ -129,7 +127,7 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca._latest_market_price")
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
-    def test_buy_uses_whole_share_qty_when_symbol_does_not_support_notional_orders(
+    def test_buy_uses_whole_share_qty_for_all_symbols(
         self,
         mock_get: Mock,
         mock_post: Mock,
@@ -159,7 +157,7 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca._latest_market_price")
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
-    def test_buy_skips_non_fractionable_when_allocation_is_less_than_one_share(
+    def test_buy_skips_when_allocation_is_less_than_one_share(
         self,
         mock_get: Mock,
         mock_post: Mock,
@@ -183,9 +181,15 @@ class AlpacaTests(unittest.TestCase):
         self.assertIn("below one whole share", result.loc[0, "Message"])
         mock_post.assert_not_called()
 
+    @patch("leveraged_trader.alpaca._latest_market_price")
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
-    def test_buy_error_includes_alpaca_response_message(self, mock_get: Mock, mock_post: Mock) -> None:
+    def test_buy_error_includes_alpaca_response_message(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+        mock_latest_market_price: Mock,
+    ) -> None:
         mock_get.side_effect = [
             response(404, {}),
             response(200, []),
@@ -193,6 +197,7 @@ class AlpacaTests(unittest.TestCase):
             response(200, {"symbol": "TQQQ", "status": "active", "tradable": True, "fractionable": True}),
             response(200, {"cash": "12345.67"}),
         ]
+        mock_latest_market_price.return_value = 100.0
         mock_post.return_value = error_response(403, {"message": "account is not allowed to trade this asset"})
 
         result = submit_alpaca_paper_buy_orders(
@@ -232,7 +237,7 @@ class AlpacaTests(unittest.TestCase):
                         "status": "filled",
                         "submitted_at": "2026-01-02T14:30:00Z",
                         "filled_at": "2026-01-02T14:31:00Z",
-                        "filled_qty": "2.5",
+                        "filled_qty": "2",
                         "filled_avg_price": "100.00",
                     },
                 ),
@@ -247,8 +252,52 @@ class AlpacaTests(unittest.TestCase):
         self.assertEqual(result.iloc[-1]["Status"], "accepted")
         self.assertEqual(managed.loc[0, "target_sell_price"], 150.0)
         self.assertEqual(mock_post.call_args.kwargs["json"]["type"], "limit")
-        self.assertEqual(mock_post.call_args.kwargs["json"]["qty"], "2.5")
+        self.assertEqual(mock_post.call_args.kwargs["json"]["time_in_force"], "gtc")
+        self.assertEqual(mock_post.call_args.kwargs["json"]["qty"], "2")
         self.assertEqual(mock_post.call_args.kwargs["json"]["limit_price"], "150")
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_fractional_managed_buy_does_not_create_gtc_sell(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="accepted",
+            )
+            mock_get.side_effect = [
+                response(
+                    200,
+                    {
+                        "id": "buy-1",
+                        "status": "filled",
+                        "submitted_at": "2026-01-02T14:30:00Z",
+                        "filled_at": "2026-01-02T14:31:00Z",
+                        "filled_qty": "2.5",
+                        "filled_avg_price": "100.00",
+                    },
+                ),
+                response(200, []),
+            ]
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.iloc[-1]["Status"], "fractional_qty")
+        self.assertEqual(managed.loc[0, "sell_status"], "fractional_qty")
+        mock_post.assert_not_called()
 
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
@@ -419,6 +468,57 @@ class AlpacaTests(unittest.TestCase):
 
         self.assertEqual(result.loc[0, "Status"], "rejected")
         self.assertIn("TQQQ", active_symbols)
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_expired_managed_sell_is_not_resubmitted(self, mock_get: Mock, mock_post: Mock) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100.0,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150.0,
+            )
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="accepted",
+            )
+            mock_get.return_value = response(
+                200,
+                {
+                    "id": "sell-1",
+                    "status": "expired",
+                    "submitted_at": "2026-01-02T14:32:00Z",
+                },
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            active_symbols = active_alpaca_managed_symbols(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "expired")
+        self.assertIn("no automatic resubmission", result.loc[0, "Message"])
+        self.assertIn("TQQQ", active_symbols)
+        mock_post.assert_not_called()
 
 
 if __name__ == "__main__":

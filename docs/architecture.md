@@ -18,7 +18,7 @@ Leveraged Trader is organized as a small package with IO-heavy boundaries kept s
 - `leveraged_trader.storage`: SQLite schema, persisted strategy state, market data, RSI values, summaries, and Alpaca managed-position records.
 - `leveraged_trader.reports`: best-strategy summaries and pending buy/sell recommendation reports.
 - `leveraged_trader.alpaca`: Alpaca paper account, position, open-order, managed-position reconciliation, and order submission integration.
-- `leveraged_trader.workflow`: orchestration for update/rebuild runs, report writing, and default Alpaca submission.
+- `leveraged_trader.workflow`: async orchestration for update/rebuild runs, report writing, and default Alpaca submission.
 - `leveraged_trader.cli`: command-line argument parsing and top-level configuration.
 
 ## Data Flow
@@ -30,10 +30,11 @@ Leveraged Trader is organized as a small package with IO-heavy boundaries kept s
 5. Summarize the best strategy per asset.
 6. Build buy and sell recommendation reports.
 7. Write CSV outputs to `outputs/` or the configured output directory.
-8. Reconcile Alpaca managed positions and submit anchored limit sells for filled buys unless disabled by CLI flags.
-9. Submit guarded Alpaca paper buy orders for the current recommendations unless disabled by CLI flags.
+8. Reconcile Alpaca managed positions and submit one-time anchored GTC limit sells for whole-share filled buys unless disabled by CLI flags.
+9. Submit guarded whole-share Alpaca paper buy orders for the current recommendations unless disabled by CLI flags.
 
 `update` mode resumes from persisted SQLite strategy state, while `rebuild` mode recomputes strategy state from scratch.
+Asset-level work is scheduled through `asyncio` with blocking Yahoo Finance, Alpaca, and SQLite calls isolated in worker threads. Each asset task uses its own SQLite connection with a busy timeout; tasks that share the same RSI signal symbol serialize their SQLite update step to avoid racing shared RSI rows. `--workflow-concurrency` controls the maximum number of assets in flight.
 
 ## Alpaca Boundary
 
@@ -43,13 +44,15 @@ The order guards intentionally check the live Alpaca paper account before submis
 
 - buys skip already-held symbols, active managed-position symbols, and symbols with open buy or sell orders;
 - submitted buys are persisted with the strategy parameters selected at entry time;
-- filled managed buys submit a limit sell at the actual average fill price multiplied by the original sell multiple;
-- canceled or rejected managed sells keep the managed position active so later optimizations cannot rebuy the symbol automatically;
+- submitted buys use integer whole-share quantities sized from the configured cash allocation;
+- filled managed buys submit a one-time GTC limit sell at the actual average fill price multiplied by the original sell multiple;
+- canceled, rejected, expired, or otherwise inactive managed sells keep the managed position active so later optimizations cannot rebuy the symbol automatically;
+- legacy fractional managed quantities do not submit GTC sells automatically and remain active for review;
 - filled managed sells mark the row closed by setting `closed_at` while retaining the row as history;
 - unmanaged Alpaca positions or sell orders are not backfilled automatically, though open sell orders still block new buys for that symbol;
-- buy orders and managed limit sell orders use regular-session day orders.
+- buy orders use regular-session day orders, and managed limit sell orders use regular-session GTC orders.
 
-Strategy sell signals remain report outputs. Live exits for positions opened by the workflow are driven by managed-position reconciliation instead of the latest optimized parameter row.
+Strategy sell signals remain report outputs, and direct Alpaca submissions from raw sell signals are disabled. Live exits for positions opened by the workflow are driven by managed-position reconciliation instead of the latest optimized parameter row.
 
 ## Runtime Configuration
 

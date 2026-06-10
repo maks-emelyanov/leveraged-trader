@@ -5,8 +5,15 @@ import os
 
 import numpy as np
 
-from .config import ALPACA_PAPER_BASE_URL, AlpacaOrderConfig, BacktestConfig, SQLITE_DB_PATH, UniverseConfig, load_dotenv
-from .workflow import run_resumable_optimizations
+from .config import (
+    ALPACA_PAPER_BASE_URL,
+    SQLITE_DB_PATH,
+    AlpacaOrderConfig,
+    BacktestConfig,
+    UniverseConfig,
+    load_dotenv,
+)
+from .workflow import DEFAULT_WORKFLOW_CONCURRENCY, run_resumable_optimizations
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,7 +40,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help=(
             "Submit Alpaca paper market buy orders for current buy recommendations. "
-            "Each order uses 10%% of account cash. Enabled by default; use "
+            "Each order uses 10%% of account cash to size a whole-share quantity. Enabled by default; use "
             "--no-alpaca-submit-buy-orders to skip."
         ),
     )
@@ -42,8 +49,9 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Submit Alpaca paper managed limit sell orders for filled managed buys. "
-            "Each order sells the original filled buy quantity at the frozen target price. Enabled by default; use "
+            "Submit one-time Alpaca paper managed GTC limit sell orders for filled managed buys. "
+            "Each order sells the original whole-share filled buy quantity at the frozen target price. "
+            "Enabled by default; use "
             "--no-alpaca-submit-sell-orders to skip."
         ),
     )
@@ -67,6 +75,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=30,
         help="Timeout for Alpaca API requests.",
+    )
+    parser.add_argument(
+        "--workflow-concurrency",
+        type=int,
+        default=DEFAULT_WORKFLOW_CONCURRENCY,
+        help=(
+            "Maximum number of assets to process concurrently during data loading and optimization. "
+            "Use 1 for fully serial behavior."
+        ),
     )
     return parser.parse_args()
 
@@ -106,4 +123,5 @@ def main() -> None:
         profit_target_values=profit_target_values,
         alpaca_cfg=alpaca_cfg,
         output_dir=args.output_dir,
+        workflow_concurrency=args.workflow_concurrency,
     )

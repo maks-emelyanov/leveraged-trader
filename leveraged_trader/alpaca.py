@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from math import floor
 from typing import Optional
 
@@ -25,8 +25,7 @@ from .storage import (
 
 
 BUY_TERMINAL_STATUSES = {"canceled", "done_for_day", "expired", "rejected"}
-SELL_RETRYABLE_STATUSES = {"done_for_day", "expired"}
-SELL_REVIEW_STATUSES = {"canceled", "rejected", "stopped", "suspended"}
+SELL_INACTIVE_STATUSES = {"canceled", "done_for_day", "expired", "rejected", "stopped", "suspended"}
 
 
 def _alpaca_headers(cfg: AlpacaOrderConfig) -> dict[str, str]:
@@ -55,13 +54,20 @@ def _alpaca_client_order_id(side: str, symbol: str, signal_date: str) -> str:
 
 def _alpaca_exit_client_order_id(symbol: str, position_id: int) -> str:
     safe_symbol = re.sub(r"[^A-Za-z0-9-]", "-", symbol.upper())
-    suffix = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-    return f"rsi-exit-{safe_symbol}-{position_id}-{suffix}"
+    return f"rsi-exit-{safe_symbol}-{position_id}"
 
 
 def _format_order_number(value: float, places: int) -> str:
     formatted = f"{value:.{places}f}".rstrip("0").rstrip(".")
     return formatted or "0"
+
+
+def _is_whole_share_qty(value: float) -> bool:
+    try:
+        qty = Decimal(str(value))
+    except InvalidOperation:
+        return False
+    return qty == qty.to_integral_value()
 
 
 def _alpaca_cash_notional(cfg: AlpacaOrderConfig, headers: dict[str, str]) -> float:
@@ -232,7 +238,7 @@ class AlpacaClient:
                 "symbol": symbol,
                 "side": "sell",
                 "type": "limit",
-                "time_in_force": "day",
+                "time_in_force": "gtc",
                 "extended_hours": False,
                 "client_order_id": client_order_id,
                 "qty": _format_order_number(qty, 8),
@@ -504,7 +510,7 @@ def reconcile_alpaca_managed_positions(
                         message="managed target sell filled; position closed",
                     )
                     continue
-                if sell_status in SELL_REVIEW_STATUSES:
+                if sell_status in SELL_INACTIVE_STATUSES:
                     _append_reconciliation_result(
                         rows,
                         position_id=position_id,
@@ -516,24 +522,23 @@ def reconcile_alpaca_managed_positions(
                         qty=filled_qty,
                         limit_price=target_sell_price,
                         alpaca_order_id=sell_alpaca_order_id,
-                        message="managed sell needs review before new buys are allowed",
+                        message="managed GTC sell is no longer active; no automatic resubmission",
                     )
                     continue
-                if sell_status not in SELL_RETRYABLE_STATUSES:
-                    _append_reconciliation_result(
-                        rows,
-                        position_id=position_id,
-                        symbol=symbol,
-                        action="sell",
-                        status=sell_status,
-                        buy_client_order_id=buy_client_order_id,
-                        sell_client_order_id=sell_client_order_id,
-                        qty=filled_qty,
-                        limit_price=target_sell_price,
-                        alpaca_order_id=sell_alpaca_order_id,
-                        message="managed target sell order is still active",
-                    )
-                    continue
+                _append_reconciliation_result(
+                    rows,
+                    position_id=position_id,
+                    symbol=symbol,
+                    action="sell",
+                    status=sell_status,
+                    buy_client_order_id=buy_client_order_id,
+                    sell_client_order_id=sell_client_order_id,
+                    qty=filled_qty,
+                    limit_price=target_sell_price,
+                    alpaca_order_id=sell_alpaca_order_id,
+                    message="managed GTC sell order already submitted",
+                )
+                continue
 
             if client.has_open_order(symbol, "sell"):
                 _append_reconciliation_result(
@@ -548,6 +553,28 @@ def reconcile_alpaca_managed_positions(
                     limit_price=target_sell_price,
                     alpaca_order_id=None,
                     message="open sell order already exists for symbol in Alpaca account",
+                )
+                continue
+
+            if not _is_whole_share_qty(float(filled_qty)):
+                update_alpaca_managed_sell_status(
+                    conn,
+                    position_id,
+                    sell_status="fractional_qty",
+                    notes="filled quantity is fractional; no GTC limit sell submitted",
+                )
+                _append_reconciliation_result(
+                    rows,
+                    position_id=position_id,
+                    symbol=symbol,
+                    action="sell",
+                    status="fractional_qty",
+                    buy_client_order_id=buy_client_order_id,
+                    sell_client_order_id=None,
+                    qty=filled_qty,
+                    limit_price=target_sell_price,
+                    alpaca_order_id=None,
+                    message="filled quantity is fractional; no GTC limit sell submitted",
                 )
                 continue
 
@@ -591,7 +618,7 @@ def reconcile_alpaca_managed_positions(
                 message=(
                     "managed target sell filled; position closed"
                     if sell_status == "filled"
-                    else "submitted managed limit sell at frozen target price"
+                    else "submitted one-time GTC limit sell at frozen target price"
                 ),
             )
         except HTTPError as exc:
@@ -776,47 +803,34 @@ def submit_alpaca_paper_buy_orders(
                     message=f"symbol is not active through Alpaca: status={asset.get('status')}",
                 )
                 continue
-            if not asset.get("fractionable", False):
-                order_notional = client.cash_notional()
-                latest_price = _latest_market_price(symbol)
-                order_qty = floor(order_notional / latest_price)
-                if order_qty < 1:
-                    _append_result(
-                        rows,
-                        symbol=symbol,
-                        signal_date=signal_date,
-                        client_order_id=client_order_id,
-                        amount_key="Notional",
-                        amount=order_notional,
-                        status="insufficient_notional",
-                        alpaca_order_id=None,
-                        message=(
-                            "10% cash allocation is below one whole share "
-                            f"at latest price {latest_price:.4f}; buy order skipped"
-                        ),
-                    )
-                    continue
-                order = {
-                    "symbol": symbol,
-                    "side": "buy",
-                    "type": "market",
-                    "time_in_force": "day",
-                    "extended_hours": False,
-                    "client_order_id": client_order_id,
-                    "qty": str(order_qty),
-                }
-            else:
-                order_notional = client.cash_notional()
-                order_qty = None
-                order = {
-                    "symbol": symbol,
-                    "side": "buy",
-                    "type": "market",
-                    "time_in_force": "day",
-                    "extended_hours": False,
-                    "client_order_id": client_order_id,
-                    "notional": str(order_notional),
-                }
+            order_notional = client.cash_notional()
+            latest_price = _latest_market_price(symbol)
+            order_qty = floor(order_notional / latest_price)
+            if order_qty < 1:
+                _append_result(
+                    rows,
+                    symbol=symbol,
+                    signal_date=signal_date,
+                    client_order_id=client_order_id,
+                    amount_key="Notional",
+                    amount=order_notional,
+                    status="insufficient_notional",
+                    alpaca_order_id=None,
+                    message=(
+                        "10% cash allocation is below one whole share "
+                        f"at latest price {latest_price:.4f}; buy order skipped"
+                    ),
+                )
+                continue
+            order = {
+                "symbol": symbol,
+                "side": "buy",
+                "type": "market",
+                "time_in_force": "day",
+                "extended_hours": False,
+                "client_order_id": client_order_id,
+                "qty": str(order_qty),
+            }
 
             submit_resp = client.submit_market_order(order)
             submit_resp.raise_for_status()
@@ -896,109 +910,21 @@ def submit_alpaca_paper_sell_orders(
     if sell_signals.empty:
         return pd.DataFrame(columns=columns)
 
-    client = AlpacaClient(cfg)
     rows = []
     for signal in sell_signals.itertuples(index=False):
         symbol = str(getattr(signal, "Asset"))
         signal_date = str(getattr(signal, "Date"))
         client_order_id = _alpaca_client_order_id("sell", symbol, signal_date)
-        position_qty: Optional[float] = None
-
-        try:
-            existing_resp = client.get_order_by_client_order_id(client_order_id)
-            if existing_resp.status_code == 200:
-                existing = existing_resp.json()
-                rows.append(
-                    {
-                        "Asset": symbol,
-                        "Date": signal_date,
-                        "Client Order ID": client_order_id,
-                        "Qty": None,
-                        "Status": "existing",
-                        "Alpaca Order ID": existing.get("id"),
-                        "Message": existing.get("status", "order already exists"),
-                    }
-                )
-                continue
-            if existing_resp.status_code != 404:
-                existing_resp.raise_for_status()
-
-            if client.has_open_order(symbol, "sell"):
-                rows.append(
-                    {
-                        "Asset": symbol,
-                        "Date": signal_date,
-                        "Client Order ID": client_order_id,
-                        "Qty": None,
-                        "Status": "open_order",
-                        "Alpaca Order ID": None,
-                        "Message": "open sell order already exists for symbol in Alpaca account",
-                    }
-                )
-                continue
-
-            position_qty = client.position_qty(symbol)
-            if position_qty <= 0:
-                rows.append(
-                    {
-                        "Asset": symbol,
-                        "Date": signal_date,
-                        "Client Order ID": client_order_id,
-                        "Qty": position_qty,
-                        "Status": "not_held",
-                        "Alpaca Order ID": None,
-                        "Message": "symbol is not currently held in Alpaca account",
-                    }
-                )
-                continue
-
-            order = {
-                "symbol": symbol,
-                "side": "sell",
-                "type": "market",
-                "time_in_force": "day",
-                "extended_hours": False,
-                "client_order_id": client_order_id,
-                "qty": str(position_qty),
-            }
-
-            submit_resp = client.submit_market_order(order)
-            submit_resp.raise_for_status()
-            submitted = submit_resp.json()
-            _append_result(
-                rows,
-                symbol=symbol,
-                signal_date=signal_date,
-                client_order_id=client_order_id,
-                amount_key="Qty",
-                amount=position_qty,
-                status="submitted",
-                alpaca_order_id=submitted.get("id"),
-                message=submitted.get("status", "submitted"),
-            )
-        except HTTPError as exc:
-            _append_result(
-                rows,
-                symbol=symbol,
-                signal_date=signal_date,
-                client_order_id=client_order_id,
-                amount_key="Qty",
-                amount=position_qty,
-                status="error",
-                alpaca_order_id=None,
-                message=_http_error_message(exc),
-            )
-        except Exception as exc:
-            _append_result(
-                rows,
-                symbol=symbol,
-                signal_date=signal_date,
-                client_order_id=client_order_id,
-                amount_key="Qty",
-                amount=position_qty,
-                status="error",
-                alpaca_order_id=None,
-                message=str(exc),
-            )
+        _append_result(
+            rows,
+            symbol=symbol,
+            signal_date=signal_date,
+            client_order_id=client_order_id,
+            amount_key="Qty",
+            amount=None,
+            status="managed_only",
+            alpaca_order_id=None,
+            message="direct sell-signal submissions are disabled; managed reconciliation submits one-time GTC limit sells",
+        )
 
     return pd.DataFrame(rows, columns=columns)

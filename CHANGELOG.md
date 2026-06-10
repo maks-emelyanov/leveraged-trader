@@ -4,6 +4,9 @@
 
 - Added SQLite-backed Alpaca managed-position tracking with fill reconciliation.
 - Changed live Alpaca exits to managed limit sells anchored to actual fill price and the original sell multiple.
+- Changed Alpaca buy submissions to whole-share quantity orders and managed exits to one-time GTC limit sells.
+- Disabled direct Alpaca submissions from raw sell-signal reports.
+- Added async workflow orchestration with configurable asset-level concurrency.
 - Added active managed-position and open sell order guardrails for buy submissions.
 - Added managed-position, eligible-buy, and reconciliation CSV outputs.
 - Expanded README usage docs with a CLI reference and environment variable section.

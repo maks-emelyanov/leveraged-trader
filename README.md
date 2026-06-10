@@ -10,11 +10,12 @@ This project is intended for research and paper trading. It is not financial adv
 - Infers an RSI signal symbol from each leveraged ETF name.
 - Downloads daily Yahoo Finance OHLCV data.
 - Optimizes RSI buy thresholds and profit-target sell multiples.
+- Processes asset workflows concurrently with async orchestration.
 - Persists strategy state in SQLite for resumable updates.
 - Writes buy and sell recommendation reports.
-- Submits guarded Alpaca paper buy market orders by default.
+- Submits guarded whole-share Alpaca paper buy market orders by default.
 - Tracks submitted Alpaca buys as managed live positions in SQLite.
-- Submits managed Alpaca limit sells from actual fill price times the original sell multiple.
+- Submits one-time managed Alpaca GTC limit sells from actual fill price times the original sell multiple.
 - Guards Alpaca buys against already-held symbols, active managed positions, and open buy or sell orders.
 
 ## Quickstart
@@ -33,7 +34,8 @@ ALPACA_API_SECRET_KEY=your_alpaca_paper_api_secret_key
 ALPACA_BASE_URL=https://paper-api.alpaca.markets
 ```
 
-The CLI also supports `--alpaca-timeout-seconds` for request timeout tuning (default: `30`).
+The CLI also supports `--alpaca-timeout-seconds` for request timeout tuning (default: `30`) and
+`--workflow-concurrency` for asset-level concurrency tuning (default: `4`).
 
 Run an update:
 
@@ -47,7 +49,7 @@ Rebuild all cached state:
 uv run leveraged-trader --mode rebuild
 ```
 
-Submit paper buys for the current run's recommendations and reconcile managed limit sells:
+Submit paper buys for the current run's recommendations and reconcile managed GTC limit sells:
 
 ```bash
 uv run leveraged-trader
@@ -78,6 +80,7 @@ Common options:
 - `--alpaca-api-secret-key VALUE`: override `ALPACA_API_SECRET_KEY`.
 - `--alpaca-base-url URL`: override `ALPACA_BASE_URL` (defaults to Alpaca paper endpoint).
 - `--alpaca-timeout-seconds INT`: Alpaca request timeout in seconds (default: `30`).
+- `--workflow-concurrency INT`: maximum number of assets processed concurrently (default: `4`; use `1` for serial behavior).
 
 ## Outputs
 
@@ -121,8 +124,8 @@ Alpaca submission is enabled by default. Use `--no-alpaca-submit-buy-orders` or 
 
 Buy orders:
 
-- Use 10% of current Alpaca paper account cash.
-- Use notional orders for Alpaca-fractionable symbols and whole-share `qty` orders otherwise.
+- Use 10% of current Alpaca paper account cash to size an integer whole-share `qty`.
+- Are skipped if the 10% cash allocation is below one whole share at the latest price estimate.
 - Are skipped if the symbol is already held.
 - Are skipped if the symbol already has an active managed position.
 - Are skipped if an open buy or sell order already exists for the symbol.
@@ -133,12 +136,13 @@ Managed sell orders:
 
 - Are reconciled from persisted managed buy records, not from the latest optimized sell signal.
 - Use the actual Alpaca filled average buy price times the original sell multiple.
-- Sell the exact filled buy quantity with a limit order.
-- Are resubmitted on a later run if a day limit order expires.
-- Keep the managed position active, blocking new buys, if a sell is canceled or rejected.
-- Use `extended_hours=false` and `time_in_force=day`.
+- Sell the exact filled buy quantity with a one-time GTC limit order.
+- Are not resubmitted automatically after a sell order is canceled, rejected, expired, or otherwise inactive.
+- Skip GTC sell submission for legacy fractional managed quantities and keep the managed position active for review.
+- Keep the managed position active, blocking new buys, until the managed sell is filled.
+- Use `extended_hours=false` and `time_in_force=gtc`.
 
-The raw `sell_signals.csv` report remains a strategy recommendation report. Live Alpaca exits for positions opened by this workflow are governed by `managed_positions.csv` and the reconciliation step.
+The raw `sell_signals.csv` report remains a strategy recommendation report. Direct Alpaca submissions from raw sell signals are disabled; live Alpaca exits for positions opened by this workflow are governed by `managed_positions.csv` and the reconciliation step.
 
 Managed position lifecycle:
 
