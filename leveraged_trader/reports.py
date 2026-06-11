@@ -8,19 +8,26 @@ import pandas as pd
 from .storage import load_strategy_state, refresh_strategy_summaries_for_asset
 
 
+REALIZED_PNL_COLUMNS = [
+    "Closed Positions",
+    "Complete Closed Positions",
+    "Incomplete Closed Positions",
+    "Total Buy Cost",
+    "Total Sell Value",
+    "Realized P/L",
+    "Realized P/L %",
+]
+
+
 def summarize_saved_results(
     conn: sqlite3.Connection,
     workflow_assets: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     summary_rows = []
     best_curves = []
-    total_workflows = len(workflow_assets)
-
-    for workflow_idx, workflow_asset in enumerate(workflow_assets.itertuples(index=False), start=1):
+    for workflow_asset in workflow_assets.itertuples(index=False):
         asset_symbol = workflow_asset.symbol
         signal_symbol = workflow_asset.rsi_symbol
-        progress = f"[{workflow_idx}/{total_workflows}]"
-        print(f"{progress} Summarizing {asset_symbol} using {signal_symbol} RSI...", flush=True)
         summaries = pd.read_sql_query(
             """
             SELECT *
@@ -43,7 +50,6 @@ def summarize_saved_results(
             )
 
         if summaries.empty:
-            print(f"{progress} Finished summary for {asset_symbol}: no cached usable summaries.", flush=True)
             continue
 
         best_row = summaries.sort_values(
@@ -71,7 +77,6 @@ def summarize_saved_results(
             parse_dates=["date"],
         )
         if equity_df.empty:
-            print(f"{progress} Finished summary for {asset_symbol}: no best equity curve.", flush=True)
             continue
 
         best_equity = equity_df.set_index("date")["equity"]
@@ -95,7 +100,6 @@ def summarize_saved_results(
             }
         )
         best_curves.append(best_equity.rename(f"{asset_symbol}_RSI_Strategy"))
-        print(f"{progress} Finished summary for {asset_symbol}.", flush=True)
 
     optimization_summary = pd.DataFrame(summary_rows)
     if not optimization_summary.empty:
@@ -140,6 +144,71 @@ def build_sell_signal_report(
         pending_action_filter="sell",
         require_multiple_trades=False,
         min_sharpe=None,
+    )
+
+
+def build_alpaca_realized_pnl_summary(conn: sqlite3.Connection) -> pd.DataFrame:
+    positions = pd.read_sql_query(
+        """
+        SELECT filled_qty, filled_avg_price, sell_filled_qty,
+               sell_filled_avg_price, closed_at
+        FROM alpaca_managed_positions
+        WHERE closed_at IS NOT NULL
+          AND sell_status = 'filled'
+        """,
+        conn,
+    )
+    if positions.empty:
+        return pd.DataFrame(
+            [
+                {
+                    "Closed Positions": 0,
+                    "Complete Closed Positions": 0,
+                    "Incomplete Closed Positions": 0,
+                    "Total Buy Cost": 0.0,
+                    "Total Sell Value": 0.0,
+                    "Realized P/L": 0.0,
+                    "Realized P/L %": 0.0,
+                }
+            ],
+            columns=REALIZED_PNL_COLUMNS,
+        )
+
+    numeric_columns = [
+        "filled_qty",
+        "filled_avg_price",
+        "sell_filled_qty",
+        "sell_filled_avg_price",
+    ]
+    for column in numeric_columns:
+        positions[column] = pd.to_numeric(positions[column], errors="coerce")
+
+    complete = positions.dropna(subset=numeric_columns).copy()
+    complete = complete[
+        complete["filled_qty"].gt(0)
+        & complete["filled_avg_price"].gt(0)
+        & complete["sell_filled_qty"].gt(0)
+        & complete["sell_filled_avg_price"].gt(0)
+    ]
+
+    total_buy_cost = float((complete["filled_qty"] * complete["filled_avg_price"]).sum())
+    total_sell_value = float((complete["sell_filled_qty"] * complete["sell_filled_avg_price"]).sum())
+    realized_pl = total_sell_value - total_buy_cost
+    realized_pl_pct = (realized_pl / total_buy_cost * 100.0) if total_buy_cost > 0 else 0.0
+
+    return pd.DataFrame(
+        [
+            {
+                "Closed Positions": len(positions),
+                "Complete Closed Positions": len(complete),
+                "Incomplete Closed Positions": len(positions) - len(complete),
+                "Total Buy Cost": total_buy_cost,
+                "Total Sell Value": total_sell_value,
+                "Realized P/L": realized_pl,
+                "Realized P/L %": realized_pl_pct,
+            }
+        ],
+        columns=REALIZED_PNL_COLUMNS,
     )
 
 

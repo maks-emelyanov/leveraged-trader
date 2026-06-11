@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
+from rich.console import Console
 
 from leveraged_trader.config import AlpacaOrderConfig, BacktestConfig, UniverseConfig
-from leveraged_trader.workflow import run_resumable_optimizations_async
+from leveraged_trader.output import WorkflowReporter
+from leveraged_trader.workflow import AssetRunResult, run_resumable_optimizations_async
 
 
 class WorkflowAsyncTests(unittest.TestCase):
@@ -25,12 +28,24 @@ class WorkflowAsyncTests(unittest.TestCase):
         active_tasks = 0
         max_active_tasks = 0
 
-        async def fake_process_asset(**_: object) -> None:
+        async def fake_process_asset(**kwargs: object) -> AssetRunResult:
             nonlocal active_tasks, max_active_tasks
             active_tasks += 1
             max_active_tasks = max(max_active_tasks, active_tasks)
             await asyncio.sleep(0.01)
             active_tasks -= 1
+            asset_progress = kwargs.get("asset_progress")
+            if asset_progress is not None:
+                asset_progress.finish_asset()
+            return AssetRunResult(
+                workflow_idx=int(kwargs["workflow_idx"]),
+                asset_symbol=str(kwargs["asset_symbol"]),
+                signal_symbol=str(kwargs["signal_symbol"]),
+                action="Updating",
+                rows_processed=10,
+                status="done",
+                message="Processed 10 rows",
+            )
 
         async def immediate_to_thread(func: object, /, *args: object, **kwargs: object) -> object:
             return func(*args, **kwargs)
@@ -38,6 +53,9 @@ class WorkflowAsyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "state.sqlite")
             output_dir = str(Path(tmp) / "outputs")
+            reporter = WorkflowReporter(
+                console=Console(file=io.StringIO(), width=100, color_system=None, no_color=True)
+            )
             with (
                 patch("leveraged_trader.workflow.asyncio.to_thread", new=immediate_to_thread),
                 patch("leveraged_trader.workflow._initialize_state_db"),
@@ -53,6 +71,7 @@ class WorkflowAsyncTests(unittest.TestCase):
                 patch(
                     "leveraged_trader.workflow._build_reports_for_db",
                     return_value=(
+                        pd.DataFrame(),
                         pd.DataFrame(),
                         pd.DataFrame(),
                         pd.DataFrame(),
@@ -81,11 +100,14 @@ class WorkflowAsyncTests(unittest.TestCase):
                         alpaca_cfg=AlpacaOrderConfig(),
                         output_dir=output_dir,
                         workflow_concurrency=2,
+                        reporter=reporter,
                     )
                 )
 
         self.assertEqual(max_active_tasks, 2)
         mock_write_outputs.assert_called_once()
+        asset_run_results = mock_write_outputs.call_args.kwargs["asset_run_results"]
+        self.assertEqual([result.workflow_idx for result in asset_run_results], [1, 2, 3])
 
 
 if __name__ == "__main__":

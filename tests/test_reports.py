@@ -5,7 +5,11 @@ import unittest
 
 import pandas as pd
 
-from leveraged_trader.reports import build_buy_signal_report, build_sell_signal_report
+from leveraged_trader.reports import (
+    build_alpaca_realized_pnl_summary,
+    build_buy_signal_report,
+    build_sell_signal_report,
+)
 from leveraged_trader.storage import init_state_db, save_rsi_values, save_strategy_state
 
 
@@ -102,6 +106,59 @@ class ReportTests(unittest.TestCase):
         report = build_sell_signal_report(self.conn, summary, 14)
 
         self.assertEqual(report["Asset"].tolist(), ["TQQQ"])
+
+    def test_realized_pnl_summary_uses_complete_closed_managed_positions(self) -> None:
+        self.conn.executemany(
+            """
+            INSERT INTO alpaca_managed_positions
+            (symbol, signal_symbol, buy_rsi, profit_target_multiple, buy_signal_date,
+             buy_client_order_id, buy_status, filled_qty, filled_avg_price,
+             sell_status, sell_filled_qty, sell_filled_avg_price, closed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "TQQQ",
+                    "QQQ",
+                    30.0,
+                    1.5,
+                    "2026-01-02",
+                    "rsi-buy-TQQQ-20260102",
+                    "filled",
+                    2.0,
+                    100.0,
+                    "filled",
+                    2.0,
+                    125.0,
+                    "2026-01-03T15:00:00Z",
+                ),
+                (
+                    "UPRO",
+                    "SPY",
+                    30.0,
+                    1.5,
+                    "2026-01-02",
+                    "rsi-buy-UPRO-20260102",
+                    "filled",
+                    1.0,
+                    50.0,
+                    "filled",
+                    None,
+                    None,
+                    "2026-01-03T15:00:00Z",
+                ),
+            ],
+        )
+
+        summary = build_alpaca_realized_pnl_summary(self.conn)
+
+        self.assertEqual(summary.loc[0, "Closed Positions"], 2)
+        self.assertEqual(summary.loc[0, "Complete Closed Positions"], 1)
+        self.assertEqual(summary.loc[0, "Incomplete Closed Positions"], 1)
+        self.assertEqual(summary.loc[0, "Total Buy Cost"], 200.0)
+        self.assertEqual(summary.loc[0, "Total Sell Value"], 250.0)
+        self.assertEqual(summary.loc[0, "Realized P/L"], 50.0)
+        self.assertEqual(summary.loc[0, "Realized P/L %"], 25.0)
 
 
 if __name__ == "__main__":

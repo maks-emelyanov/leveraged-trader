@@ -1,15 +1,66 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import replace
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
-from .backtest import initial_strategy_state, performance_summary, step_strategy_state
-from .config import BacktestConfig, RISK_FREE_SYMBOL, UniverseConfig
+from .backtest import initial_strategy_state
+from .config import BacktestConfig, RISK_FREE_SYMBOL
 from .indicators import compute_rsi_details
+from .optimized_backtest import (
+    ACTION_BUY,
+    ACTION_NONE,
+    ACTION_SELL,
+    run_grid_summary,
+    run_single_equity_curve,
+)
+
+
+SUMMARY_ROLLUP_COLUMNS = {
+    "first_equity": "REAL",
+    "last_equity": "REAL",
+    "running_max_equity": "REAL",
+    "return_count": "INTEGER",
+    "return_sum": "REAL",
+    "return_sum_squares": "REAL",
+    "excess_return_count": "INTEGER",
+    "excess_return_sum": "REAL",
+    "excess_return_sum_squares": "REAL",
+    "positive_return_count": "INTEGER",
+}
+
+ALPACA_MANAGED_POSITION_COLUMNS = {
+    "sell_expires_at": "TEXT",
+    "sell_renewal_count": "INTEGER NOT NULL DEFAULT 0",
+    "sell_renewal_requested_at": "TEXT",
+    "sell_filled_qty": "REAL",
+    "sell_filled_avg_price": "REAL",
+    "sell_filled_at": "TEXT",
+    "realized_pl": "REAL",
+    "realized_pl_pct": "REAL",
+}
+
+
+@dataclass
+class SummaryRollup:
+    first_equity: Optional[float] = None
+    last_equity: Optional[float] = None
+    running_max_equity: Optional[float] = None
+    return_count: int = 0
+    return_sum: float = 0.0
+    return_sum_squares: float = 0.0
+    excess_return_count: int = 0
+    excess_return_sum: float = 0.0
+    excess_return_sum_squares: float = 0.0
+    positive_return_count: int = 0
+    max_drawdown: Optional[float] = None
+
+    @property
+    def trading_days(self) -> int:
+        return self.return_count + 1 if self.first_equity is not None else 0
 
 
 def save_table_to_sqlite(df: pd.DataFrame, db_path: str, table_name: str) -> None:
@@ -73,6 +124,16 @@ def init_state_db(conn: sqlite3.Connection) -> None:
             kelly_fraction REAL,
             max_drawdown REAL,
             hit_rate REAL,
+            first_equity REAL,
+            last_equity REAL,
+            running_max_equity REAL,
+            return_count INTEGER,
+            return_sum REAL,
+            return_sum_squares REAL,
+            excess_return_count INTEGER,
+            excess_return_sum REAL,
+            excess_return_sum_squares REAL,
+            positive_return_count INTEGER,
             PRIMARY KEY (asset_symbol, signal_symbol, buy_rsi, profit_target_multiple)
         );
 
@@ -117,6 +178,14 @@ def init_state_db(conn: sqlite3.Connection) -> None:
             sell_alpaca_order_id TEXT,
             sell_submitted_at TEXT,
             sell_status TEXT,
+            sell_expires_at TEXT,
+            sell_renewal_count INTEGER NOT NULL DEFAULT 0,
+            sell_renewal_requested_at TEXT,
+            sell_filled_qty REAL,
+            sell_filled_avg_price REAL,
+            sell_filled_at TEXT,
+            realized_pl REAL,
+            realized_pl_pct REAL,
             closed_at TEXT,
             notes TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -124,7 +193,29 @@ def init_state_db(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    _ensure_strategy_summary_rollup_columns(conn)
+    _ensure_alpaca_managed_position_columns(conn)
     conn.commit()
+
+
+def _ensure_strategy_summary_rollup_columns(conn: sqlite3.Connection) -> None:
+    existing_columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(strategy_summary)").fetchall()
+    }
+    for column_name, column_type in SUMMARY_ROLLUP_COLUMNS.items():
+        if column_name not in existing_columns:
+            conn.execute(f"ALTER TABLE strategy_summary ADD COLUMN {column_name} {column_type}")
+
+
+def _ensure_alpaca_managed_position_columns(conn: sqlite3.Connection) -> None:
+    existing_columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(alpaca_managed_positions)").fetchall()
+    }
+    for column_name, column_type in ALPACA_MANAGED_POSITION_COLUMNS.items():
+        if column_name not in existing_columns:
+            conn.execute(f"ALTER TABLE alpaca_managed_positions ADD COLUMN {column_name} {column_type}")
 
 
 def _date_str(value: object) -> str:
@@ -429,6 +520,9 @@ def load_alpaca_managed_positions(conn: sqlite3.Connection, *, active_only: bool
                buy_submitted_at, buy_status, filled_qty, filled_avg_price,
                filled_at, target_sell_price, sell_client_order_id,
                sell_alpaca_order_id, sell_submitted_at, sell_status,
+               sell_expires_at, sell_renewal_count, sell_renewal_requested_at,
+               sell_filled_qty, sell_filled_avg_price, sell_filled_at,
+               realized_pl, realized_pl_pct,
                closed_at, notes, created_at, updated_at
         FROM alpaca_managed_positions
         {where}
@@ -523,6 +617,8 @@ def record_alpaca_managed_sell_order(
     sell_alpaca_order_id: Optional[str],
     sell_submitted_at: Optional[str],
     sell_status: str,
+    sell_expires_at: Optional[str] = None,
+    increment_renewal_count: bool = False,
     notes: Optional[str] = None,
 ) -> None:
     conn.execute(
@@ -532,11 +628,23 @@ def record_alpaca_managed_sell_order(
             sell_alpaca_order_id = ?,
             sell_submitted_at = ?,
             sell_status = ?,
+            sell_expires_at = ?,
+            sell_renewal_count = sell_renewal_count + ?,
+            sell_renewal_requested_at = NULL,
             notes = COALESCE(?, notes),
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
-        (sell_client_order_id, sell_alpaca_order_id, sell_submitted_at, sell_status, notes, position_id),
+        (
+            sell_client_order_id,
+            sell_alpaca_order_id,
+            sell_submitted_at,
+            sell_status,
+            sell_expires_at,
+            1 if increment_renewal_count else 0,
+            notes,
+            position_id,
+        ),
     )
     conn.commit()
 
@@ -548,6 +656,8 @@ def update_alpaca_managed_sell_status(
     sell_status: str,
     sell_alpaca_order_id: Optional[str] = None,
     sell_submitted_at: Optional[str] = None,
+    sell_expires_at: Optional[str] = None,
+    sell_renewal_requested_at: Optional[str] = None,
     notes: Optional[str] = None,
 ) -> None:
     conn.execute(
@@ -556,11 +666,88 @@ def update_alpaca_managed_sell_status(
         SET sell_status = ?,
             sell_alpaca_order_id = COALESCE(?, sell_alpaca_order_id),
             sell_submitted_at = COALESCE(?, sell_submitted_at),
+            sell_expires_at = COALESCE(?, sell_expires_at),
+            sell_renewal_requested_at = COALESCE(?, sell_renewal_requested_at),
             notes = COALESCE(?, notes),
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
-        (sell_status, sell_alpaca_order_id, sell_submitted_at, notes, position_id),
+        (
+            sell_status,
+            sell_alpaca_order_id,
+            sell_submitted_at,
+            sell_expires_at,
+            sell_renewal_requested_at,
+            notes,
+            position_id,
+        ),
+    )
+    conn.commit()
+
+
+def mark_alpaca_managed_sell_filled(
+    conn: sqlite3.Connection,
+    position_id: int,
+    *,
+    sell_status: str,
+    sell_filled_qty: float,
+    sell_filled_avg_price: float,
+    sell_filled_at: Optional[str],
+    sell_alpaca_order_id: Optional[str] = None,
+    sell_submitted_at: Optional[str] = None,
+    sell_expires_at: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> None:
+    row = conn.execute(
+        """
+        SELECT filled_qty, filled_avg_price
+        FROM alpaca_managed_positions
+        WHERE id = ?
+        """,
+        (position_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"Managed Alpaca position {position_id} does not exist.")
+
+    buy_qty = None if row[0] is None else float(row[0])
+    buy_avg_price = None if row[1] is None else float(row[1])
+    realized_pl = None
+    realized_pl_pct = None
+    if buy_qty is not None and buy_avg_price is not None and buy_qty > 0 and buy_avg_price > 0:
+        buy_cost = buy_qty * buy_avg_price
+        sell_value = float(sell_filled_qty) * float(sell_filled_avg_price)
+        realized_pl = sell_value - buy_cost
+        realized_pl_pct = realized_pl / buy_cost * 100.0
+
+    conn.execute(
+        """
+        UPDATE alpaca_managed_positions
+        SET sell_status = ?,
+            sell_alpaca_order_id = COALESCE(?, sell_alpaca_order_id),
+            sell_submitted_at = COALESCE(?, sell_submitted_at),
+            sell_expires_at = COALESCE(?, sell_expires_at),
+            sell_filled_qty = ?,
+            sell_filled_avg_price = ?,
+            sell_filled_at = COALESCE(?, sell_filled_at),
+            realized_pl = ?,
+            realized_pl_pct = ?,
+            notes = COALESCE(?, notes),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            sell_status,
+            sell_alpaca_order_id,
+            sell_submitted_at,
+            sell_expires_at,
+            sell_filled_qty,
+            sell_filled_avg_price,
+            sell_filled_at,
+            realized_pl,
+            realized_pl_pct,
+            notes,
+            position_id,
+        ),
     )
     conn.commit()
 
@@ -613,6 +800,302 @@ def save_equity_records(conn: sqlite3.Connection, records: list[dict]) -> None:
             )
             for r in records
         ],
+    )
+
+
+def clear_equity_records(
+    conn: sqlite3.Connection,
+    asset_symbol: str,
+    signal_symbol: str,
+    buy_rsi: float,
+    profit_target_multiple: float,
+) -> None:
+    conn.execute(
+        """
+        DELETE FROM strategy_equity
+        WHERE asset_symbol = ?
+          AND signal_symbol = ?
+          AND buy_rsi = ?
+          AND profit_target_multiple = ?
+        """,
+        (asset_symbol, signal_symbol, buy_rsi, profit_target_multiple),
+    )
+
+
+def prune_non_best_equity_records(
+    conn: sqlite3.Connection,
+    asset_symbol: str,
+    signal_symbol: str,
+    buy_rsi: float,
+    profit_target_multiple: float,
+) -> None:
+    conn.execute(
+        """
+        DELETE FROM strategy_equity
+        WHERE asset_symbol = ?
+          AND signal_symbol = ?
+          AND NOT (buy_rsi = ? AND profit_target_multiple = ?)
+        """,
+        (asset_symbol, signal_symbol, buy_rsi, profit_target_multiple),
+    )
+
+
+def _sample_variance(count: int, total: float, total_squares: float) -> float:
+    if count <= 1:
+        return np.nan
+    variance = (total_squares - (total * total / count)) / (count - 1)
+    return max(variance, 0.0)
+
+
+def _rollup_metrics(rollup: SummaryRollup) -> dict[str, Optional[float]]:
+    if rollup.first_equity is None or rollup.last_equity is None or rollup.return_count <= 0:
+        return {
+            "total_return": None,
+            "cagr": None,
+            "annualized_vol": None,
+            "sharpe": None,
+            "kelly_fraction": None,
+            "max_drawdown": rollup.max_drawdown,
+            "hit_rate": None,
+        }
+
+    total_return = rollup.last_equity / rollup.first_equity - 1.0 if rollup.first_equity > 0 else np.nan
+    cagr = (
+        (rollup.last_equity / rollup.first_equity) ** (252 / rollup.return_count) - 1.0
+        if rollup.first_equity > 0 and rollup.last_equity > 0
+        else np.nan
+    )
+    return_variance = _sample_variance(
+        rollup.return_count,
+        rollup.return_sum,
+        rollup.return_sum_squares,
+    )
+    annualized_vol = np.sqrt(return_variance) * np.sqrt(252) if pd.notna(return_variance) else np.nan
+    return_mean = rollup.return_sum / rollup.return_count
+    kelly_fraction = return_mean / return_variance if pd.notna(return_variance) and return_variance > 0 else np.nan
+    hit_rate = rollup.positive_return_count / rollup.return_count
+
+    excess_variance = _sample_variance(
+        rollup.excess_return_count,
+        rollup.excess_return_sum,
+        rollup.excess_return_sum_squares,
+    )
+    if pd.notna(excess_variance) and excess_variance > 0:
+        excess_mean = rollup.excess_return_sum / rollup.excess_return_count
+        sharpe = np.sqrt(252) * excess_mean / np.sqrt(excess_variance)
+    else:
+        sharpe = np.nan
+
+    return {
+        "total_return": total_return,
+        "cagr": cagr,
+        "annualized_vol": annualized_vol,
+        "sharpe": sharpe,
+        "kelly_fraction": kelly_fraction,
+        "max_drawdown": rollup.max_drawdown,
+        "hit_rate": hit_rate,
+    }
+
+
+def _update_summary_rollup(rollup: SummaryRollup, records: list[dict]) -> SummaryRollup:
+    for record in records:
+        equity = float(record["equity"])
+        if rollup.first_equity is None:
+            rollup.first_equity = equity
+            rollup.last_equity = equity
+            rollup.running_max_equity = equity
+            rollup.max_drawdown = 0.0
+            continue
+
+        daily_return = float(record["daily_return"])
+        rollup.return_count += 1
+        rollup.return_sum += daily_return
+        rollup.return_sum_squares += daily_return * daily_return
+        if daily_return > 0:
+            rollup.positive_return_count += 1
+
+        risk_free_return = record.get("risk_free_return")
+        if not pd.isna(risk_free_return):
+            excess_return = daily_return - float(risk_free_return)
+            rollup.excess_return_count += 1
+            rollup.excess_return_sum += excess_return
+            rollup.excess_return_sum_squares += excess_return * excess_return
+
+        rollup.last_equity = equity
+        rollup.running_max_equity = max(float(rollup.running_max_equity or equity), equity)
+        drawdown = equity / rollup.running_max_equity - 1.0 if rollup.running_max_equity > 0 else np.nan
+        if pd.notna(drawdown):
+            rollup.max_drawdown = min(float(rollup.max_drawdown or 0.0), float(drawdown))
+    return rollup
+
+
+def _rollup_from_equity_frame(equity_df: pd.DataFrame) -> SummaryRollup:
+    if equity_df.empty:
+        return SummaryRollup()
+
+    equity_df = equity_df.sort_values("date")
+    equity = equity_df["equity"].astype(float)
+    returns = equity.pct_change()
+    rollup = SummaryRollup(
+        first_equity=float(equity.iloc[0]),
+        last_equity=float(equity.iloc[-1]),
+        running_max_equity=float(equity.cummax().iloc[-1]),
+        max_drawdown=float((equity / equity.cummax() - 1.0).min()),
+    )
+    valid_returns = returns.dropna()
+    rollup.return_count = int(len(valid_returns))
+    if rollup.return_count > 0:
+        rollup.return_sum = float(valid_returns.sum())
+        rollup.return_sum_squares = float((valid_returns * valid_returns).sum())
+        rollup.positive_return_count = int((valid_returns > 0).sum())
+
+    if "risk_free_return" in equity_df.columns:
+        excess = (returns - equity_df["risk_free_return"]).dropna()
+        rollup.excess_return_count = int(len(excess))
+        if rollup.excess_return_count > 0:
+            rollup.excess_return_sum = float(excess.sum())
+            rollup.excess_return_sum_squares = float((excess * excess).sum())
+    return rollup
+
+
+def _load_strategy_summary_rollup(
+    conn: sqlite3.Connection,
+    asset_symbol: str,
+    signal_symbol: str,
+    buy_rsi: float,
+    profit_target_multiple: float,
+) -> Optional[SummaryRollup]:
+    row = conn.execute(
+        """
+        SELECT first_equity, last_equity, running_max_equity, return_count,
+               return_sum, return_sum_squares, excess_return_count,
+               excess_return_sum, excess_return_sum_squares,
+               positive_return_count, max_drawdown
+        FROM strategy_summary
+        WHERE asset_symbol = ?
+          AND signal_symbol = ?
+          AND buy_rsi = ?
+          AND profit_target_multiple = ?
+        """,
+        (asset_symbol, signal_symbol, buy_rsi, profit_target_multiple),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return SummaryRollup(
+        first_equity=float(row[0]),
+        last_equity=float(row[1]),
+        running_max_equity=float(row[2]),
+        return_count=int(row[3] or 0),
+        return_sum=float(row[4] or 0.0),
+        return_sum_squares=float(row[5] or 0.0),
+        excess_return_count=int(row[6] or 0),
+        excess_return_sum=float(row[7] or 0.0),
+        excess_return_sum_squares=float(row[8] or 0.0),
+        positive_return_count=int(row[9] or 0),
+        max_drawdown=None if row[10] is None else float(row[10]),
+    )
+
+
+def _load_legacy_equity_rollup(
+    conn: sqlite3.Connection,
+    asset_symbol: str,
+    signal_symbol: str,
+    buy_rsi: float,
+    profit_target_multiple: float,
+) -> Optional[SummaryRollup]:
+    equity_df = pd.read_sql_query(
+        """
+        SELECT date, equity, risk_free_return
+        FROM strategy_equity
+        WHERE asset_symbol = ?
+          AND signal_symbol = ?
+          AND buy_rsi = ?
+          AND profit_target_multiple = ?
+        ORDER BY date
+        """,
+        conn,
+        params=(asset_symbol, signal_symbol, buy_rsi, profit_target_multiple),
+        parse_dates=["date"],
+    )
+    if equity_df.empty:
+        return None
+    return _rollup_from_equity_frame(equity_df)
+
+
+def _load_existing_summary_rollup(
+    conn: sqlite3.Connection,
+    asset_symbol: str,
+    signal_symbol: str,
+    buy_rsi: float,
+    profit_target_multiple: float,
+) -> SummaryRollup:
+    rollup = _load_strategy_summary_rollup(
+        conn,
+        asset_symbol,
+        signal_symbol,
+        buy_rsi,
+        profit_target_multiple,
+    )
+    if rollup is not None:
+        return rollup
+    rollup = _load_legacy_equity_rollup(
+        conn,
+        asset_symbol,
+        signal_symbol,
+        buy_rsi,
+        profit_target_multiple,
+    )
+    return rollup or SummaryRollup()
+
+
+def save_strategy_summary(
+    conn: sqlite3.Connection,
+    asset_symbol: str,
+    signal_symbol: str,
+    buy_rsi: float,
+    profit_target_multiple: float,
+    state: dict,
+    rollup: SummaryRollup,
+) -> None:
+    metrics = _rollup_metrics(rollup)
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO strategy_summary
+        (asset_symbol, signal_symbol, buy_rsi, profit_target_multiple, start_date,
+         end_date, trading_days, trades_executed, total_return, cagr,
+         annualized_vol, sharpe, kelly_fraction, max_drawdown, hit_rate,
+         first_equity, last_equity, running_max_equity, return_count,
+         return_sum, return_sum_squares, excess_return_count, excess_return_sum,
+         excess_return_sum_squares, positive_return_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            asset_symbol,
+            signal_symbol,
+            buy_rsi,
+            profit_target_multiple,
+            state["start_date"],
+            state["last_date"],
+            rollup.trading_days,
+            int(state["trades_executed"]),
+            _nullable_float(metrics["total_return"]),
+            _nullable_float(metrics["cagr"]),
+            _nullable_float(metrics["annualized_vol"]),
+            _nullable_float(metrics["sharpe"]),
+            _nullable_float(metrics["kelly_fraction"]),
+            _nullable_float(metrics["max_drawdown"]),
+            _nullable_float(metrics["hit_rate"]),
+            rollup.first_equity,
+            rollup.last_equity,
+            rollup.running_max_equity,
+            rollup.return_count,
+            rollup.return_sum,
+            rollup.return_sum_squares,
+            rollup.excess_return_count,
+            rollup.excess_return_sum,
+            rollup.excess_return_sum_squares,
+            rollup.positive_return_count,
+        ),
     )
 
 
@@ -672,7 +1155,7 @@ def refresh_strategy_summaries_for_asset(
         (float(row.buy_rsi), float(row.profit_target_multiple)): row
         for row in states.itertuples(index=False)
     }
-    rows = []
+    wrote_any = False
     grouped = equity_df.groupby(["buy_rsi", "profit_target_multiple"], sort=False)
     for (buy_rsi, profit_target_multiple), group in grouped:
         state = state_by_config.get((float(buy_rsi), float(profit_target_multiple)))
@@ -680,46 +1163,24 @@ def refresh_strategy_summaries_for_asset(
             continue
 
         group = group.sort_values("date")
-        equity = group.set_index("date")["equity"]
-        risk_free_returns = group.set_index("date")["risk_free_return"]
-        summary = performance_summary(equity, risk_free_returns=risk_free_returns)
-        if summary.empty:
-            continue
-
-        rows.append(
-            (
-                asset_symbol,
-                signal_symbol,
-                float(buy_rsi),
-                float(profit_target_multiple),
-                state.start_date,
-                state.last_date,
-                int(len(equity)),
-                int(state.trades_executed),
-                _nullable_float(summary.get("Total Return")),
-                _nullable_float(summary.get("CAGR")),
-                _nullable_float(summary.get("Annualized Vol")),
-                _nullable_float(summary.get("Sharpe")),
-                _nullable_float(summary.get("Kelly Fraction")),
-                _nullable_float(summary.get("Max Drawdown")),
-                _nullable_float(summary.get("Hit Rate")),
-            )
+        rollup = _rollup_from_equity_frame(group)
+        save_strategy_summary(
+            conn,
+            asset_symbol,
+            signal_symbol,
+            float(buy_rsi),
+            float(profit_target_multiple),
+            {
+                "start_date": state.start_date,
+                "last_date": state.last_date,
+                "trades_executed": int(state.trades_executed),
+            },
+            rollup,
         )
+        wrote_any = True
 
-    if not rows:
-        return
-
-    conn.executemany(
-        """
-        INSERT OR REPLACE INTO strategy_summary
-        (asset_symbol, signal_symbol, buy_rsi, profit_target_multiple, start_date,
-         end_date, trading_days, trades_executed, total_return, cagr,
-         annualized_vol, sharpe, kelly_fraction, max_drawdown, hit_rate)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        rows,
-    )
-    conn.commit()
+    if wrote_any:
+        conn.commit()
 
 
 def clear_asset_state(conn: sqlite3.Connection, asset_symbol: str, signal_symbol: str) -> None:
@@ -763,6 +1224,303 @@ def earliest_state_date(
     return row[0] if row and row[0] is not None else None
 
 
+def load_saved_market_data(conn: sqlite3.Connection, symbols: list[str]) -> pd.DataFrame:
+    symbols = list(dict.fromkeys(symbols))
+    placeholders = ",".join("?" for _ in symbols)
+    raw = pd.read_sql_query(
+        f"""
+        SELECT symbol, date, open, high, low, close, volume
+        FROM market_data
+        WHERE symbol IN ({placeholders})
+        ORDER BY date, symbol
+        """,
+        conn,
+        params=symbols,
+        parse_dates=["date"],
+    )
+    if raw.empty:
+        return pd.DataFrame()
+
+    frames = []
+    for symbol in symbols:
+        group = raw[raw["symbol"].eq(symbol)].copy()
+        if group.empty:
+            return pd.DataFrame()
+        group = group.set_index("date")[["open", "high", "low", "close", "volume"]]
+        group.columns = [
+            f"{symbol}_Open",
+            f"{symbol}_High",
+            f"{symbol}_Low",
+            f"{symbol}_Close",
+            f"{symbol}_Volume",
+        ]
+        frames.append(group)
+
+    return pd.concat(frames, axis=1, join="inner").dropna().sort_index()
+
+
+def _action_code(action: object) -> int:
+    if action == "buy":
+        return ACTION_BUY
+    if action == "sell":
+        return ACTION_SELL
+    return ACTION_NONE
+
+
+def _action_label(action_code: int) -> str:
+    if action_code == ACTION_BUY:
+        return "buy"
+    if action_code == ACTION_SELL:
+        return "sell"
+    return "none"
+
+
+def _trading_cost_rate(cfg: BacktestConfig) -> float:
+    return (cfg.fee_bps + cfg.slippage_bps) / 10_000.0
+
+
+def _risk_free_returns_from_data(data: pd.DataFrame) -> np.ndarray:
+    risk_free_col = f"{RISK_FREE_SYMBOL}_Close"
+    if risk_free_col not in data.columns:
+        return np.full(len(data), np.nan, dtype=np.float64)
+    annual_yield = data[risk_free_col].to_numpy(dtype=np.float64) / 100.0
+    return (1.0 + annual_yield) ** (1 / 252) - 1.0
+
+
+def _market_arrays(
+    data: pd.DataFrame,
+    rsi: pd.Series,
+    asset_symbol: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return (
+        data[f"{asset_symbol}_Open"].to_numpy(dtype=np.float64),
+        data[f"{asset_symbol}_Close"].to_numpy(dtype=np.float64),
+        rsi.reindex(data.index).to_numpy(dtype=np.float64),
+        _risk_free_returns_from_data(data),
+    )
+
+
+def _rollup_to_arrays(
+    rollup: SummaryRollup,
+) -> tuple[float, float, float, int, float, float, int, float, float, int, float]:
+    return (
+        np.nan if rollup.first_equity is None else float(rollup.first_equity),
+        np.nan if rollup.last_equity is None else float(rollup.last_equity),
+        np.nan if rollup.running_max_equity is None else float(rollup.running_max_equity),
+        int(rollup.return_count),
+        float(rollup.return_sum),
+        float(rollup.return_sum_squares),
+        int(rollup.excess_return_count),
+        float(rollup.excess_return_sum),
+        float(rollup.excess_return_sum_squares),
+        int(rollup.positive_return_count),
+        np.nan if rollup.max_drawdown is None else float(rollup.max_drawdown),
+    )
+
+
+def _rollup_from_arrays(
+    first_equity: float,
+    last_equity: float,
+    running_max_equity: float,
+    return_count: int,
+    return_sum: float,
+    return_sum_squares: float,
+    excess_return_count: int,
+    excess_return_sum: float,
+    excess_return_sum_squares: float,
+    positive_return_count: int,
+    max_drawdown: float,
+) -> SummaryRollup:
+    return SummaryRollup(
+        first_equity=None if np.isnan(first_equity) else float(first_equity),
+        last_equity=None if np.isnan(last_equity) else float(last_equity),
+        running_max_equity=None if np.isnan(running_max_equity) else float(running_max_equity),
+        return_count=int(return_count),
+        return_sum=float(return_sum),
+        return_sum_squares=float(return_sum_squares),
+        excess_return_count=int(excess_return_count),
+        excess_return_sum=float(excess_return_sum),
+        excess_return_sum_squares=float(excess_return_sum_squares),
+        positive_return_count=int(positive_return_count),
+        max_drawdown=None if np.isnan(max_drawdown) else float(max_drawdown),
+    )
+
+
+def _equity_records_from_arrays(
+    *,
+    date_strings: list[str],
+    asset_symbol: str,
+    signal_symbol: str,
+    buy_rsi: float,
+    profit_target_multiple: float,
+    equity_values: np.ndarray,
+    daily_returns: np.ndarray,
+    risk_free_returns: np.ndarray,
+    in_position_values: np.ndarray,
+    action_executed_values: np.ndarray,
+    pending_action_values: np.ndarray,
+    trades_executed_values: np.ndarray,
+) -> list[dict]:
+    return [
+        {
+            "asset_symbol": asset_symbol,
+            "signal_symbol": signal_symbol,
+            "buy_rsi": buy_rsi,
+            "profit_target_multiple": profit_target_multiple,
+            "date": date_str,
+            "equity": float(equity_values[idx]),
+            "daily_return": float(daily_returns[idx]),
+            "risk_free_return": float(risk_free_returns[idx]) if not np.isnan(risk_free_returns[idx]) else np.nan,
+            "in_position": int(in_position_values[idx]),
+            "action_executed": _action_label(int(action_executed_values[idx])),
+            "pending_action": _action_label(int(pending_action_values[idx])),
+            "trades_executed": int(trades_executed_values[idx]),
+        }
+        for idx, date_str in enumerate(date_strings)
+    ]
+
+
+def _best_summary_config(
+    conn: sqlite3.Connection,
+    asset_symbol: str,
+    signal_symbol: str,
+) -> Optional[tuple[float, float]]:
+    row = conn.execute(
+        """
+        SELECT buy_rsi, profit_target_multiple
+        FROM strategy_summary
+        WHERE asset_symbol = ? AND signal_symbol = ?
+        ORDER BY sharpe IS NULL,
+                 sharpe DESC,
+                 total_return IS NULL,
+                 total_return DESC,
+                 cagr IS NULL,
+                 cagr DESC
+        LIMIT 1
+        """,
+        (asset_symbol, signal_symbol),
+    ).fetchone()
+    if row is None:
+        return None
+    return float(row[0]), float(row[1])
+
+
+def _equity_curve_exists(
+    conn: sqlite3.Connection,
+    asset_symbol: str,
+    signal_symbol: str,
+    buy_rsi: float,
+    profit_target_multiple: float,
+) -> bool:
+    return bool(
+        conn.execute(
+            """
+            SELECT 1
+            FROM strategy_equity
+            WHERE asset_symbol = ?
+              AND signal_symbol = ?
+              AND buy_rsi = ?
+              AND profit_target_multiple = ?
+            LIMIT 1
+            """,
+            (asset_symbol, signal_symbol, buy_rsi, profit_target_multiple),
+        ).fetchone()
+    )
+
+
+def _replace_best_equity_curve(
+    conn: sqlite3.Connection,
+    base_cfg: BacktestConfig,
+    asset_symbol: str,
+    signal_symbol: str,
+    buy_rsi: float,
+    profit_target_multiple: float,
+) -> None:
+    full_data = load_saved_market_data(
+        conn,
+        list(dict.fromkeys([asset_symbol, signal_symbol, RISK_FREE_SYMBOL])),
+    )
+    if full_data.empty:
+        return
+
+    rsi = ensure_rsi_values(
+        conn,
+        signal_symbol,
+        base_cfg.rsi_period,
+        full_data[f"{signal_symbol}_Close"],
+        rebuild=False,
+    )
+    open_prices, close_prices, rsi_values, risk_free_returns = _market_arrays(
+        full_data,
+        rsi,
+        asset_symbol,
+    )
+    (
+        equity_values,
+        daily_returns,
+        risk_free_returns,
+        in_position_values,
+        action_executed_values,
+        pending_action_values,
+        trades_executed_values,
+        cash,
+        shares,
+        in_position,
+        entry_price,
+        pending_action,
+        prev_equity,
+        trades_executed,
+    ) = run_single_equity_curve(
+        open_prices,
+        close_prices,
+        rsi_values,
+        risk_free_returns,
+        buy_rsi,
+        profit_target_multiple,
+        base_cfg.initial_capital,
+        _trading_cost_rate(base_cfg),
+    )
+    date_strings = [_date_str(date) for date in full_data.index]
+    state = {
+        "start_date": date_strings[0] if date_strings else None,
+        "last_date": date_strings[-1] if date_strings else None,
+        "cash": float(cash),
+        "shares": float(shares),
+        "in_position": bool(in_position),
+        "entry_price": float(entry_price),
+        "pending_action": _action_label(int(pending_action)),
+        "prev_equity": float(prev_equity),
+        "trades_executed": int(trades_executed),
+    }
+    records = _equity_records_from_arrays(
+        date_strings=date_strings,
+        asset_symbol=asset_symbol,
+        signal_symbol=signal_symbol,
+        buy_rsi=buy_rsi,
+        profit_target_multiple=profit_target_multiple,
+        equity_values=equity_values,
+        daily_returns=daily_returns,
+        risk_free_returns=risk_free_returns,
+        in_position_values=in_position_values,
+        action_executed_values=action_executed_values,
+        pending_action_values=pending_action_values,
+        trades_executed_values=trades_executed_values,
+    )
+    clear_equity_records(conn, asset_symbol, signal_symbol, buy_rsi, profit_target_multiple)
+    save_equity_records(conn, records)
+
+    rollup = _update_summary_rollup(SummaryRollup(), records)
+    save_strategy_summary(
+        conn,
+        asset_symbol,
+        signal_symbol,
+        buy_rsi,
+        profit_target_multiple,
+        state,
+        rollup,
+    )
+
+
 def process_asset_grid(
     conn: sqlite3.Connection,
     data: pd.DataFrame,
@@ -786,55 +1544,234 @@ def process_asset_grid(
         rebuild=rebuild,
     )
 
-    updated_any_config = False
-    for buy_rsi in buy_rsi_values:
-        for profit_target_multiple in profit_target_values:
-            cfg = replace(
-                base_cfg,
-                buy_rsi=buy_rsi,
-                profit_target_multiple=profit_target_multiple,
-            )
-            state = None if rebuild else load_strategy_state(
+    config_pairs = [
+        (float(buy_rsi), float(profit_target_multiple))
+        for buy_rsi in buy_rsi_values
+        for profit_target_multiple in profit_target_values
+    ]
+    if not config_pairs:
+        return
+
+    open_prices, close_prices, rsi_values, risk_free_returns = _market_arrays(
+        data,
+        rsi,
+        asset_symbol,
+    )
+    date_values = pd.to_datetime(data.index).to_numpy(dtype="datetime64[ns]")
+    date_strings = [_date_str(date) for date in data.index]
+    config_count = len(config_pairs)
+
+    buy_rsi_array = np.empty(config_count, dtype=np.float64)
+    profit_target_array = np.empty(config_count, dtype=np.float64)
+    start_indices = np.empty(config_count, dtype=np.int64)
+    cash_values = np.empty(config_count, dtype=np.float64)
+    share_values = np.empty(config_count, dtype=np.float64)
+    in_position_values = np.empty(config_count, dtype=np.bool_)
+    entry_price_values = np.empty(config_count, dtype=np.float64)
+    pending_action_values = np.empty(config_count, dtype=np.int64)
+    prev_equity_values = np.empty(config_count, dtype=np.float64)
+    trades_executed_values = np.empty(config_count, dtype=np.int64)
+
+    first_equity_values = np.empty(config_count, dtype=np.float64)
+    last_equity_values = np.empty(config_count, dtype=np.float64)
+    running_max_equity_values = np.empty(config_count, dtype=np.float64)
+    return_count_values = np.empty(config_count, dtype=np.int64)
+    return_sum_values = np.empty(config_count, dtype=np.float64)
+    return_sum_squares_values = np.empty(config_count, dtype=np.float64)
+    excess_return_count_values = np.empty(config_count, dtype=np.int64)
+    excess_return_sum_values = np.empty(config_count, dtype=np.float64)
+    excess_return_sum_squares_values = np.empty(config_count, dtype=np.float64)
+    positive_return_count_values = np.empty(config_count, dtype=np.int64)
+    max_drawdown_values = np.empty(config_count, dtype=np.float64)
+    state_start_dates: list[Optional[str]] = []
+
+    for config_idx, (buy_rsi, profit_target_multiple) in enumerate(config_pairs):
+        state = None if rebuild else load_strategy_state(
+            conn,
+            asset_symbol,
+            signal_symbol,
+            buy_rsi,
+            profit_target_multiple,
+        )
+        if state is None:
+            state = initial_strategy_state(base_cfg)
+            rollup = SummaryRollup()
+        else:
+            rollup = _load_existing_summary_rollup(
                 conn,
                 asset_symbol,
                 signal_symbol,
                 buy_rsi,
                 profit_target_multiple,
             )
-            if state is None:
-                state = initial_strategy_state(base_cfg)
 
-            work_data = data
-            if state["last_date"] is not None:
-                work_data = data[data.index > pd.Timestamp(state["last_date"])]
-            if work_data.empty:
-                continue
+        if state["last_date"] is None:
+            start_idx = 0
+        else:
+            last_date_value = np.datetime64(pd.Timestamp(state["last_date"]).to_datetime64())
+            start_idx = int(np.searchsorted(date_values, last_date_value, side="right"))
 
-            records = []
-            for date, row in work_data.iterrows():
-                rsi_value = rsi.get(pd.Timestamp(date), np.nan)
-                state, record = step_strategy_state(
-                    state,
-                    pd.Timestamp(date),
-                    row,
-                    rsi_value,
-                    cfg,
-                    asset_symbol,
-                    signal_symbol,
-                )
-                records.append(record)
+        (
+            first_equity,
+            last_equity,
+            running_max_equity,
+            return_count,
+            return_sum,
+            return_sum_squares,
+            excess_return_count,
+            excess_return_sum,
+            excess_return_sum_squares,
+            positive_return_count,
+            max_drawdown,
+        ) = _rollup_to_arrays(rollup)
 
-            save_strategy_state(
-                conn,
-                asset_symbol,
-                signal_symbol,
-                buy_rsi,
-                profit_target_multiple,
-                state,
-            )
-            save_equity_records(conn, records)
-            updated_any_config = True
+        buy_rsi_array[config_idx] = buy_rsi
+        profit_target_array[config_idx] = profit_target_multiple
+        start_indices[config_idx] = start_idx
+        cash_values[config_idx] = float(state["cash"])
+        share_values[config_idx] = float(state["shares"])
+        in_position_values[config_idx] = bool(state["in_position"])
+        entry_price_values[config_idx] = np.nan if pd.isna(state["entry_price"]) else float(state["entry_price"])
+        pending_action_values[config_idx] = _action_code(state["pending_action"])
+        prev_equity_values[config_idx] = float(state["prev_equity"])
+        trades_executed_values[config_idx] = int(state["trades_executed"])
+        first_equity_values[config_idx] = first_equity
+        last_equity_values[config_idx] = last_equity
+        running_max_equity_values[config_idx] = running_max_equity
+        return_count_values[config_idx] = return_count
+        return_sum_values[config_idx] = return_sum
+        return_sum_squares_values[config_idx] = return_sum_squares
+        excess_return_count_values[config_idx] = excess_return_count
+        excess_return_sum_values[config_idx] = excess_return_sum
+        excess_return_sum_squares_values[config_idx] = excess_return_sum_squares
+        positive_return_count_values[config_idx] = positive_return_count
+        max_drawdown_values[config_idx] = max_drawdown
+        state_start_dates.append(state["start_date"])
+
+    (
+        updated,
+        out_cash,
+        out_shares,
+        out_in_position,
+        out_entry_price,
+        out_pending_action,
+        out_prev_equity,
+        out_trades_executed,
+        out_first_equity,
+        out_last_equity,
+        out_running_max_equity,
+        out_return_count,
+        out_return_sum,
+        out_return_sum_squares,
+        out_excess_return_count,
+        out_excess_return_sum,
+        out_excess_return_sum_squares,
+        out_positive_return_count,
+        out_max_drawdown,
+    ) = run_grid_summary(
+        open_prices,
+        close_prices,
+        rsi_values,
+        risk_free_returns,
+        buy_rsi_array,
+        profit_target_array,
+        start_indices,
+        cash_values,
+        share_values,
+        in_position_values,
+        entry_price_values,
+        pending_action_values,
+        prev_equity_values,
+        trades_executed_values,
+        first_equity_values,
+        last_equity_values,
+        running_max_equity_values,
+        return_count_values,
+        return_sum_values,
+        return_sum_squares_values,
+        excess_return_count_values,
+        excess_return_sum_values,
+        excess_return_sum_squares_values,
+        positive_return_count_values,
+        max_drawdown_values,
+        _trading_cost_rate(base_cfg),
+    )
+
+    updated_any_config = bool(updated.any())
+    for config_idx, (buy_rsi, profit_target_multiple) in enumerate(config_pairs):
+        if not updated[config_idx]:
+            continue
+
+        start_idx = int(start_indices[config_idx])
+        state = {
+            "start_date": state_start_dates[config_idx] or date_strings[start_idx],
+            "last_date": date_strings[-1],
+            "cash": float(out_cash[config_idx]),
+            "shares": float(out_shares[config_idx]),
+            "in_position": bool(out_in_position[config_idx]),
+            "entry_price": float(out_entry_price[config_idx]),
+            "pending_action": _action_label(int(out_pending_action[config_idx])),
+            "prev_equity": float(out_prev_equity[config_idx]),
+            "trades_executed": int(out_trades_executed[config_idx]),
+        }
+        rollup = _rollup_from_arrays(
+            float(out_first_equity[config_idx]),
+            float(out_last_equity[config_idx]),
+            float(out_running_max_equity[config_idx]),
+            int(out_return_count[config_idx]),
+            float(out_return_sum[config_idx]),
+            float(out_return_sum_squares[config_idx]),
+            int(out_excess_return_count[config_idx]),
+            float(out_excess_return_sum[config_idx]),
+            float(out_excess_return_sum_squares[config_idx]),
+            int(out_positive_return_count[config_idx]),
+            float(out_max_drawdown[config_idx]),
+        )
+        save_strategy_state(
+            conn,
+            asset_symbol,
+            signal_symbol,
+            buy_rsi,
+            profit_target_multiple,
+            state,
+        )
+        save_strategy_summary(
+            conn,
+            asset_symbol,
+            signal_symbol,
+            buy_rsi,
+            profit_target_multiple,
+            state,
+            rollup,
+        )
 
     conn.commit()
-    if updated_any_config or strategy_summary_count(conn, asset_symbol, signal_symbol) == 0:
+    if strategy_summary_count(conn, asset_symbol, signal_symbol) == 0:
         refresh_strategy_summaries_for_asset(conn, asset_symbol, signal_symbol)
+
+    best_config = _best_summary_config(conn, asset_symbol, signal_symbol)
+    if best_config is not None:
+        best_buy_rsi, best_profit_target_multiple = best_config
+        if updated_any_config or not _equity_curve_exists(
+            conn,
+            asset_symbol,
+            signal_symbol,
+            best_buy_rsi,
+            best_profit_target_multiple,
+        ):
+            _replace_best_equity_curve(
+                conn,
+                base_cfg,
+                asset_symbol,
+                signal_symbol,
+                best_buy_rsi,
+                best_profit_target_multiple,
+            )
+        prune_non_best_equity_records(
+            conn,
+            asset_symbol,
+            signal_symbol,
+            best_buy_rsi,
+            best_profit_target_multiple,
+        )
+        conn.commit()

@@ -9,6 +9,7 @@ RISK_FREE_SYMBOL = "^IRX"
 ETF_DEFS_URL = "https://www.nasdaqtrader.com/trader.aspx?id=etf_definitions"
 SQLITE_DB_PATH = "strategy_state.sqlite"
 ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets"
+TRADIER_LIVE_BASE_URL = "https://api.tradier.com/v1"
 DOTENV_PATH = ".env"
 
 
@@ -38,6 +39,16 @@ class AlpacaOrderConfig:
     api_secret_key: Optional[str] = None
     base_url: str = ALPACA_PAPER_BASE_URL
     cash_fraction: float = 0.10
+    timeout_seconds: int = 30
+    gtc_sell_renewal_enabled: bool = True
+    gtc_sell_renewal_days_before_expiration: int = 7
+
+
+@dataclass
+class TradierMarketDataConfig:
+    enabled: bool = True
+    access_token: Optional[str] = None
+    base_url: str = TRADIER_LIVE_BASE_URL
     timeout_seconds: int = 30
 
 

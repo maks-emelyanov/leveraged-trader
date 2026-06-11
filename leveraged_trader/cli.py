@@ -8,12 +8,31 @@ import numpy as np
 from .config import (
     ALPACA_PAPER_BASE_URL,
     SQLITE_DB_PATH,
+    TRADIER_LIVE_BASE_URL,
     AlpacaOrderConfig,
     BacktestConfig,
+    TradierMarketDataConfig,
     UniverseConfig,
     load_dotenv,
 )
 from .workflow import DEFAULT_WORKFLOW_CONCURRENCY, run_resumable_optimizations
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,7 +68,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Submit one-time Alpaca paper managed GTC limit sell orders for filled managed buys. "
+            "Submit and renew Alpaca paper managed GTC limit sell orders for filled managed buys. "
             "Each order sells the original whole-share filled buy quantity at the frozen target price. "
             "Enabled by default; use "
             "--no-alpaca-submit-sell-orders to skip."
@@ -77,6 +96,53 @@ def parse_args() -> argparse.Namespace:
         help="Timeout for Alpaca API requests.",
     )
     parser.add_argument(
+        "--alpaca-gtc-sell-renewal",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("ALPACA_GTC_SELL_RENEWAL_ENABLED", True),
+        help=(
+            "Renew managed Alpaca GTC limit sells before Alpaca's aged-order expiration. "
+            "Enabled by default; use --no-alpaca-gtc-sell-renewal to skip."
+        ),
+    )
+    parser.add_argument(
+        "--alpaca-gtc-sell-renewal-days-before-expiration",
+        type=int,
+        default=_env_int("ALPACA_GTC_SELL_RENEWAL_DAYS_BEFORE_EXPIRATION", 7),
+        help="Renew managed Alpaca GTC limit sells this many days before expiration.",
+    )
+    parser.add_argument(
+        "--tradier-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("TRADIER_FALLBACK_ENABLED", True),
+        help=(
+            "Use Tradier historical daily data as a fallback when Yahoo Finance skips symbols. "
+            "Enabled by default when a Tradier token is configured; use --no-tradier-fallback to skip."
+        ),
+    )
+    parser.add_argument(
+        "--tradier-access-token",
+        default=(
+            os.environ.get("TRADIER_ACCESS_TOKEN")
+            or os.environ.get("TRADIER_API_TOKEN")
+            or os.environ.get("TRADIER_TOKEN")
+        ),
+        help=(
+            "Tradier bearer token for market-data fallback. Can also be set with "
+            "TRADIER_ACCESS_TOKEN, TRADIER_API_TOKEN, or TRADIER_TOKEN."
+        ),
+    )
+    parser.add_argument(
+        "--tradier-base-url",
+        default=os.environ.get("TRADIER_BASE_URL", TRADIER_LIVE_BASE_URL),
+        help="Tradier Brokerage API base URL for market data fallback.",
+    )
+    parser.add_argument(
+        "--tradier-timeout-seconds",
+        type=int,
+        default=_env_int("TRADIER_TIMEOUT_SECONDS", 30),
+        help="Timeout for Tradier market data requests.",
+    )
+    parser.add_argument(
         "--workflow-concurrency",
         type=int,
         default=DEFAULT_WORKFLOW_CONCURRENCY,
@@ -84,6 +150,11 @@ def parse_args() -> argparse.Namespace:
             "Maximum number of assets to process concurrently during data loading and optimization. "
             "Use 1 for fully serial behavior."
         ),
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable colored terminal output.",
     )
     return parser.parse_args()
 
@@ -110,6 +181,14 @@ def main() -> None:
         api_secret_key=args.alpaca_api_secret_key,
         base_url=args.alpaca_base_url,
         timeout_seconds=args.alpaca_timeout_seconds,
+        gtc_sell_renewal_enabled=args.alpaca_gtc_sell_renewal,
+        gtc_sell_renewal_days_before_expiration=args.alpaca_gtc_sell_renewal_days_before_expiration,
+    )
+    tradier_cfg = TradierMarketDataConfig(
+        enabled=args.tradier_fallback,
+        access_token=args.tradier_access_token,
+        base_url=args.tradier_base_url,
+        timeout_seconds=args.tradier_timeout_seconds,
     )
     buy_rsi_values = list(range(20, 51))
     profit_target_values = [round(x, 2) for x in np.arange(1.1, 5.05, 0.1)]
@@ -124,4 +203,6 @@ def main() -> None:
         alpaca_cfg=alpaca_cfg,
         output_dir=args.output_dir,
         workflow_concurrency=args.workflow_concurrency,
+        no_color=args.no_color,
+        tradier_cfg=tradier_cfg,
     )

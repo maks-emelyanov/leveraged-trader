@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import io
+import json
 import re
+from collections.abc import Iterable
+from dataclasses import dataclass
+from html import unescape
 from typing import Optional
 
 import pandas as pd
@@ -9,6 +13,157 @@ import requests
 
 from .config import ETF_DEFS_URL, UniverseConfig
 from .storage import save_table_to_sqlite
+
+
+NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
+OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
+SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+SEC_COMPANY_TICKERS_EXCHANGE_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
+SEC_MUTUAL_FUND_TICKERS_URL = "https://www.sec.gov/files/company_tickers_mf.json"
+REQUEST_HEADERS = {
+    "User-Agent": "leveraged-trader/0.1 universe audit contact@example.com",
+    "Accept": "text/html,text/csv,application/json;q=0.8,*/*;q=0.5",
+}
+
+
+@dataclass(frozen=True)
+class UniverseSource:
+    name: str
+    url: str
+    source_type: str
+    parser: str = "html"
+    enabled: bool = True
+    notes: str = ""
+
+
+WORKFLOW_ISSUER_SOURCES = [
+    ("ProShares", "https://www.proshares.com/our-etfs/find-leveraged-and-inverse-etfs"),
+    ("Direxion", "https://www.direxion.com/all-etfs"),
+    ("Leverage Shares", "https://leverageshares.com/en-us/etps/"),
+    ("Leverage Shares", "https://leverageshares.com/en-us/etps/leverage-shares-2x-long/"),
+    ("GraniteShares", "https://www.graniteshares.com/etfs/"),
+    ("Defiance", "https://www.defianceetfs.com/etfs/"),
+    ("AdvisorShares", "https://advisorshares.com/etfs/"),
+    ("AXS Investments", "https://www.axsinvestments.com/our-funds/"),
+    ("Kurv", "https://www.kurvinvest.com/etfs"),
+    ("Innovator", "https://www.innovatoretfs.com/etf/finder/"),
+    ("Innovator", "https://www.innovatoretfs.com/define/etfs/"),
+    ("Tuttle Capital", "https://www.tuttlecap.com/etfs"),
+    ("Tradr", "https://www.tradretfs.com/"),
+    ("REX Shares", "https://www.rexshares.com/learn-more-about-the-full-t-rex-leveraged-etf-lineup/"),
+    ("KraneShares", "https://kraneshares.com/leveraged-etfs/"),
+    ("Volatility Shares", "https://www.volatilityshares.com/"),
+    ("21Shares", "https://www.21shares.com/en-us/etfs"),
+    ("YieldMax", "https://www.yieldmaxetfs.com/our-etfs"),
+    ("Tidal", "https://www.tidalfinancialgroup.com/etfs/"),
+    ("Roundhill", "https://www.roundhillinvestments.com/etf/"),
+    ("Themes", "https://www.themesetfs.com/etfs/"),
+    ("Simplify", "https://www.simplify.us/etfs"),
+]
+ISSUER_UNIVERSE_SOURCES = WORKFLOW_ISSUER_SOURCES
+
+WORKFLOW_ETN_SOURCES = [
+    UniverseSource(
+        "MicroSectors",
+        "https://microsectors.com/",
+        source_type="etn_issuer",
+        parser="microsectors_html",
+        notes="Workflow ETN source; products carry issuer credit risk and are not ETFs.",
+    ),
+    UniverseSource(
+        "UBS ETRACS",
+        "https://etracs.ubs.com/product/list/index/strategy/leverage",
+        source_type="etn_issuer",
+        parser="etracs_leverage_table",
+        notes="Workflow ETN source; products carry issuer credit risk and are not ETFs.",
+    ),
+]
+
+AUDIT_UNIVERSE_SOURCES = [
+    UniverseSource(
+        "NYSE exchange-traded products directory",
+        "https://www.nyse.com/listings_directory/etf",
+        source_type="exchange_directory",
+        notes="Audit-only exchange directory; does not override issuer or Nasdaq rows.",
+    ),
+    UniverseSource(
+        "Nasdaq funds/ETFs directory",
+        "https://www.nasdaq.com/market-activity/funds-and-etfs",
+        source_type="exchange_directory",
+        parser="registered_only",
+        enabled=False,
+        notes="Registered as an audit backstop; page is dynamic and slow to fetch reliably.",
+    ),
+    UniverseSource(
+        "Cboe listed products",
+        "https://www.cboe.com/us/equities/market_statistics/listed_symbols/csv/",
+        source_type="exchange_directory",
+        parser="cboe_symbol_csv",
+        notes="Symbol-only audit cross-check; product names are not available from this endpoint.",
+    ),
+    UniverseSource(
+        "ETFdb leveraged ETF directory",
+        "https://etfdb.com/etfs/leveraged/",
+        source_type="third_party_audit",
+        parser="registered_only",
+        enabled=False,
+        notes="Registered as an audit backstop; commonly Cloudflare-blocked from unattended fetches.",
+    ),
+    UniverseSource(
+        "VettaFi ETF database",
+        "https://www.vettafi.com/etf-database/",
+        source_type="third_party_audit",
+        parser="registered_only",
+        enabled=False,
+        notes="Registered as an audit backstop; not authoritative for mappings.",
+    ),
+    UniverseSource(
+        "ETF.com ETF finder",
+        "https://www.etf.com/etfanalytics/etf-finder",
+        source_type="third_party_audit",
+        parser="registered_only",
+        enabled=False,
+        notes="Registered as an audit backstop; commonly Cloudflare-blocked from unattended fetches.",
+    ),
+    UniverseSource(
+        "SEC EDGAR company ticker registry",
+        SEC_COMPANY_TICKERS_URL,
+        source_type="filing_audit",
+        parser="sec_company_tickers",
+        notes=(
+            "Live SEC audit seed from the official company ticker registry; issuer or exchange rows remain "
+            "authoritative for workflow mappings."
+        ),
+    ),
+    UniverseSource(
+        "SEC EDGAR exchange ticker registry",
+        SEC_COMPANY_TICKERS_EXCHANGE_URL,
+        source_type="filing_audit",
+        parser="sec_exchange_tickers",
+        notes=(
+            "Live SEC audit seed with ticker, registrant name, and exchange fields; used only to flag "
+            "possible missing leveraged products."
+        ),
+    ),
+    UniverseSource(
+        "SEC EDGAR mutual fund ticker registry",
+        SEC_MUTUAL_FUND_TICKERS_URL,
+        source_type="filing_audit",
+        parser="sec_mutual_fund_tickers",
+        notes=(
+            "Live SEC audit seed with CIK, series, class, and symbol fields. It is symbol-only, so it "
+            "supports coverage checks but does not classify leverage by itself."
+        ),
+    ),
+    UniverseSource(
+        "SEC EDGAR full-text search",
+        "https://www.sec.gov/edgar/search/",
+        source_type="filing_audit",
+        parser="registered_only",
+        enabled=False,
+        notes="Registered for future prospectus text audits when a stable public full-text API is available.",
+    ),
+]
 
 
 TICKER_STOPWORDS = {
@@ -35,6 +190,21 @@ TICKER_STOPWORDS = {
     "DEFIANCE",
     "TRADR",
     "REX",
+    "NASDAQ",
+    "CLOUD",
+    "LED",
+}
+
+EXCLUDED_UNIVERSE_SYMBOLS = {
+    "NASDAQ",
+    # False positives where "long" describes duration/horizon rather than leverage.
+    "BGGG",
+    "TMNL",
+    "VCLT",
+    "VGLT",
+}
+YAHOO_SYMBOL_ALIASES = {
+    "BRKB": "BRK-B",
 }
 
 RSI_SYMBOL_PATTERNS = [
@@ -46,18 +216,110 @@ RSI_SYMBOL_PATTERNS = [
 ]
 
 
-def _normalize_symbol_candidate(symbol: str) -> Optional[str]:
-    candidate = symbol.strip(" .,-").upper()
+LEVERAGE_NAME_PATTERNS = [
+    r"\b[+-]?\d+(?:\.\d+)?\s*x\b",
+    r"\b[23]00%\b",
+    r"\bultrapro\b",
+    r"\bultra\b",
+    r"\bbull\s+[23]x\b",
+    r"\b(?:daily\s+)?target\s+[23]x\b",
+    r"\bleveraged\b",
+]
+
+LONG_DIRECTION_PATTERNS = [
+    r"\bbull\b",
+    r"\blong\b",
+    r"\blong\s+exposure\b",
+    r"\bultra\b",
+    r"\bleveraged\s+long\b",
+    r"\bleveraged\s+exposure\b",
+    r"\b[23]x\s+leveraged\b",
+    r"\+[23]x\b",
+]
+
+INVERSE_PATTERNS = [
+    r"\bbear\b",
+    r"\bshort\b",
+    r"\binverse\b",
+    r"\bultrashort\b",
+    r"\b-1x\b",
+    r"\b-2x\b",
+    r"\b-3x\b",
+]
+
+LEVERAGE_FALSE_POSITIVE_TERMS = [
+    "ULTRA SHORT TERM",
+    "ULTRA-SHORT TERM",
+    "ULTRASHORT TERM",
+    "ULTRA SHORT INCOME",
+    "ULTRA-SHORT INCOME",
+    "ULTRA BUFFER",
+    "ULTRA-BUFFER",
+    "SHORT DURATION",
+    "LONG TERM",
+    "LONG-TERM",
+    "LONG MUNICIPAL",
+]
+
+MAX_RECOGNIZED_LEVERAGE = 5.0
+
+SEC_ENTITY_AUDIT_PARSERS = {
+    "sec_company_tickers",
+    "sec_exchange_tickers",
+}
+
+SEC_AUDIT_PRODUCT_CONTEXT_PATTERNS = [
+    r"\bETFS?\b",
+    r"\bETNS?\b",
+    r"\bEXCHANGE[-\s]+TRADED\b",
+    r"\bFUNDS?\b",
+    r"\bPROSHARES\b",
+    r"\bDIREXION\b",
+    r"\bGRANITESHARES\b",
+    r"\bDEFIANCE\b",
+    r"\bTRADR\b",
+    r"\bT-?REX\b",
+    r"\bMICROSECTORS\b",
+    r"\bETRACS\b",
+    r"\bLEVERAGE\s+SHARES\b",
+    r"\bYIELDMAX\b",
+    r"\bAXS\b",
+    r"\bKURV\b",
+    r"\bTUTTLE\b",
+    r"\bREX\s+SHARES\b",
+]
+
+
+def normalize_yahoo_symbol(symbol: object) -> Optional[str]:
+    if symbol is None or pd.isna(symbol):
+        return None
+    candidate = str(symbol).strip(" .,-").upper()
+    candidate = YAHOO_SYMBOL_ALIASES.get(candidate, candidate)
+    if candidate in {"", "NAN", "NONE", "NULL"}:
+        return None
+    if candidate in EXCLUDED_UNIVERSE_SYMBOLS:
+        return None
+    if not re.fullmatch(r"[A-Z][A-Z0-9.-]*", candidate):
+        return None
+    return candidate
+
+
+def _normalize_symbol_candidate(symbol: str, known_symbols: Optional[set[str]] = None) -> Optional[str]:
+    candidate = normalize_yahoo_symbol(symbol)
+    if candidate is None:
+        return None
     if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,5}", candidate):
         return None
     if candidate in TICKER_STOPWORDS:
         return None
     if re.fullmatch(r"\d+(?:\.\d+)?X", candidate):
         return None
+    if known_symbols is not None and candidate not in known_symbols:
+        return None
     return candidate
 
 
-def infer_rsi_symbol(asset_symbol: str, fund_name: str) -> str:
+def infer_rsi_symbol(asset_symbol: str, fund_name: str, known_symbols: Optional[set[str]] = None) -> str:
     """
     Infer the unleveraged signal ticker from a leveraged ETF name.
 
@@ -72,11 +334,78 @@ def infer_rsi_symbol(asset_symbol: str, fund_name: str) -> str:
         match = re.search(pattern, normalized_name)
         if not match:
             continue
-        candidate = _normalize_symbol_candidate(match.group(1))
+        candidate = _normalize_symbol_candidate(match.group(1), known_symbols=known_symbols)
         if candidate is not None and candidate != asset_symbol:
             return candidate
 
     return asset_symbol
+
+
+def infer_leverage_and_direction(name: str) -> tuple[Optional[float], Optional[str]]:
+    normalized_name = str(name).upper()
+    leverage: Optional[float] = None
+
+    match = re.search(r"(?<![A-Z0-9])([+-]?\d+(?:\.\d+)?)\s*X(?![A-Z0-9])", normalized_name)
+    if match:
+        leverage = abs(float(match.group(1)))
+        if leverage > MAX_RECOGNIZED_LEVERAGE:
+            leverage = None
+    elif re.search(r"\b200%\b", normalized_name):
+        leverage = 2.0
+    elif re.search(r"\b300%\b", normalized_name):
+        leverage = 3.0
+    elif re.search(r"\bULTRAPRO\b", normalized_name):
+        leverage = 3.0
+    elif re.search(r"\b(?:ULTRA|ULTRASHORT)\b", normalized_name):
+        leverage = 2.0
+
+    direction: Optional[str]
+    if any(re.search(pattern, normalized_name, re.I) for pattern in INVERSE_PATTERNS):
+        direction = "inverse"
+    elif any(re.search(pattern, normalized_name, re.I) for pattern in LONG_DIRECTION_PATTERNS):
+        direction = "long"
+    elif leverage is not None and leverage > 1.0:
+        direction = "long"
+    else:
+        direction = None
+
+    return leverage, direction
+
+
+def leveraged_name_filter(name: str) -> bool:
+    normalized_name = f" {str(name).upper()} "
+    if any(term in normalized_name for term in LEVERAGE_FALSE_POSITIVE_TERMS):
+        return False
+    leverage, _direction = infer_leverage_and_direction(normalized_name)
+    if leverage is not None:
+        return leverage > 1.0
+    return any(re.search(pattern, normalized_name, re.I) for pattern in LEVERAGE_NAME_PATTERNS)
+
+
+def _read_nasdaq_symbol_file(url: str, timeout: int) -> pd.DataFrame:
+    resp = requests.get(url, timeout=timeout, headers=REQUEST_HEADERS)
+    resp.raise_for_status()
+    lines = [
+        line
+        for line in resp.text.splitlines()
+        if line and not line.startswith("File Creation Time")
+    ]
+    return pd.read_csv(io.StringIO("\n".join(lines)), sep="|")
+
+
+def load_active_listed_symbols(timeout: int = 30) -> set[str]:
+    symbols: set[str] = set()
+    for url, symbol_col in [
+        (NASDAQ_LISTED_URL, "Symbol"),
+        (OTHER_LISTED_URL, "ACT Symbol"),
+    ]:
+        try:
+            listed = _read_nasdaq_symbol_file(url, timeout)
+        except Exception:
+            continue
+        if symbol_col in listed.columns:
+            symbols.update(listed[symbol_col].dropna().astype(str).str.upper())
+    return symbols
 
 
 def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -93,15 +422,22 @@ def _infer_column(columns: list[str], pattern: str) -> Optional[str]:
     return None
 
 
+def _read_html_tables(html: str) -> list[pd.DataFrame]:
+    try:
+        return pd.read_html(io.StringIO(html), flavor=["lxml"])
+    except ValueError:
+        return []
+
+
 def load_current_etf_universe(timeout: int = 30) -> pd.DataFrame:
     """
     Load the current Nasdaq Trader ETF definitions table.
     Free public source for the ETF universe.
     """
-    resp = requests.get(ETF_DEFS_URL, timeout=timeout)
+    resp = requests.get(ETF_DEFS_URL, timeout=timeout, headers=REQUEST_HEADERS)
     resp.raise_for_status()
 
-    tables = pd.read_html(io.StringIO(resp.text))
+    tables = _read_html_tables(resp.text)
     if not tables:
         raise RuntimeError("No tables found on Nasdaq Trader ETF definitions page.")
 
@@ -131,68 +467,621 @@ def load_current_etf_universe(timeout: int = 30) -> pd.DataFrame:
 
     out = df[[symbol_col, name_col, fund_type_col]].copy()
     out.columns = ["symbol", "name", "fund_type"]
-    out["symbol"] = out["symbol"].astype(str).str.strip().str.upper()
+    out["symbol"] = out["symbol"].astype(str).map(normalize_yahoo_symbol)
     out["name"] = out["name"].astype(str).str.strip()
     out["fund_type"] = out["fund_type"].astype(str).str.strip()
 
+    out = out[out["symbol"].notna()]
     out = out[out["fund_type"].str.startswith("ETF", na=False)].drop_duplicates(subset=["symbol"])
-    out = out[out["symbol"].str.fullmatch(r"[A-Z\.]+", na=False)]
+    out = out[out["symbol"].str.fullmatch(r"[A-Z][A-Z0-9.-]*", na=False)]
     return out.reset_index(drop=True)
 
 
-LONG_LEVERAGED_PATTERNS = [
-    r"\b2x\b",
-    r"\b3x\b",
-    r"\b1\.5x\b",
-    r"\b200%\b",
-    r"\b300%\b",
-    r"\bultra\b",
-    r"\bultrapro\b",
-    r"\bbull\b",
-    r"\blong\b",
-    r"\bdaily target 2x long\b",
-    r"\bdaily target 3x long\b",
-]
-
-INVERSE_PATTERNS = [
-    r"\bbear\b",
-    r"\bshort\b",
-    r"\binverse\b",
-    r"\bultrashort\b",
-    r"\b-1x\b",
-    r"\b-2x\b",
-    r"\b-3x\b",
-]
-
-
 def is_long_leveraged_name(name: str) -> bool:
-    n = name.lower()
-    if any(re.search(p, n) for p in INVERSE_PATTERNS):
+    n = str(name).upper()
+    if not leveraged_name_filter(n):
         return False
-    if any(re.search(p, n) for p in LONG_LEVERAGED_PATTERNS):
-        return True
-    if "direxion daily" in n and "bull" in n:
-        return True
-    if "graniteshares 2x long" in n:
-        return True
-    if "leverage shares 2x long" in n:
-        return True
-    if "defiance daily target 2x long" in n:
-        return True
-    if "tradr 2x long" in n:
-        return True
-    return False
+    _leverage, direction = infer_leverage_and_direction(n)
+    return direction != "inverse"
+
+
+def _first_matching_column(columns: Iterable[object], patterns: list[str]) -> Optional[object]:
+    normalized = [(column, str(column).strip()) for column in columns]
+    for pattern in patterns:
+        regex = re.compile(pattern, re.I)
+        for raw_column, column in normalized:
+            if regex.search(column):
+                return raw_column
+    return None
+
+
+def _html_text(value: object) -> str:
+    without_tags = re.sub(r"<[^>]+>", " ", str(value))
+    return re.sub(r"\s+", " ", unescape(without_tags)).strip()
+
+
+def _fund_rows_to_universe(
+    rows: Iterable[dict[str, object]],
+    source_name: str,
+    *,
+    source_label: str,
+    require_leveraged: bool,
+    product_type: str = "ETF",
+) -> pd.DataFrame:
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+
+    out = out[["symbol", "name"]].copy()
+    out["symbol"] = out["symbol"].map(normalize_yahoo_symbol)
+    out["name"] = out["name"].map(_html_text)
+    out = out[out["symbol"].notna()]
+    out = out[out["name"].ne("")]
+    if require_leveraged:
+        out = out[out["name"].apply(leveraged_name_filter)]
+    out["fund_type"] = f"{product_type} ({source_name})"
+    out["source"] = source_label
+    return out.drop_duplicates("symbol").reset_index(drop=True)
+
+
+def _fund_table_to_universe(
+    table: pd.DataFrame,
+    source_name: str,
+    *,
+    source_label: str,
+    require_leveraged: bool,
+) -> pd.DataFrame:
+    symbol_col = _first_matching_column(
+        table.columns,
+        [
+            r"^ticker$",
+            r"\bticker\b",
+            r"^symbol$",
+            r"\bsymbol\b",
+            r"fund\s+ticker",
+        ],
+    )
+    name_col = _first_matching_column(
+        table.columns,
+        [
+            r"fund\s+name",
+            r"^name$",
+            r"\bname\b",
+            r"\bfund\b",
+            r"^etf$",
+            r"^etn$",
+            r"product\s+name",
+        ],
+    )
+    if symbol_col is None or name_col is None:
+        return pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+
+    rows = (
+        {"symbol": row[symbol_col], "name": row[name_col]}
+        for _idx, row in table[[symbol_col, name_col]].iterrows()
+    )
+    return _fund_rows_to_universe(
+        rows,
+        source_name,
+        source_label=source_label,
+        require_leveraged=require_leveraged,
+    )
+
+
+def _issuer_table_to_universe(table: pd.DataFrame, issuer: str) -> pd.DataFrame:
+    return _fund_table_to_universe(
+        table,
+        issuer,
+        source_label=f"{issuer} issuer table",
+        require_leveraged=True,
+    )
+
+
+def _html_cards_to_universe(
+    html: str,
+    source_name: str,
+    *,
+    source_label: str,
+    require_leveraged: bool,
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+
+    webflow_grid_pattern = re.compile(
+        r'class="tag is-ticker[^"]*">(?P<symbol>[^<]+)</div>\s*</div>\s*'
+        r'<div class="grid_table_cell">\s*'
+        r'<div[^>]*class="[^"]*u-weight-medium[^"]*"[^>]*>(?P<name>[^<]+)</div>',
+        re.I | re.S,
+    )
+    webflow_sort_pattern = re.compile(
+        r'<div fs-cmssort-field="IDENTIFIER" class="text-weight-xbold">(?P<symbol>[^<]+)</div>'
+        r'.{0,900}?<div role="cell" class="table3_column">\s*'
+        r'<div fs-cmssort-field="IDENTIFIER">(?P<name>[^<]+)</div>',
+        re.I | re.S,
+    )
+    nav_dropdown_pattern = re.compile(
+        r'href="/etf/(?P<slug>[a-z0-9.-]+)"[^>]*class="nav_dropdown_link[^"]*"[^>]*>'
+        r'.{0,900}?<div class="u-display-inline">(?P<symbol>[^<]+)</div>'
+        r'.{0,900}?<div class="nav_dropdown_link_caption">(?P<name>[^<]+)</div>',
+        re.I | re.S,
+    )
+
+    for pattern in [webflow_grid_pattern, webflow_sort_pattern, nav_dropdown_pattern]:
+        for match in pattern.finditer(html):
+            rows.append({"symbol": match.group("symbol"), "name": match.group("name")})
+
+    return _fund_rows_to_universe(
+        rows,
+        source_name,
+        source_label=source_label,
+        require_leveraged=require_leveraged,
+    )
+
+
+def _microsectors_html_to_universe(html: str, source: UniverseSource) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    item_pattern = re.compile(
+        r'<div class="item">\s*<a[^>]*>\s*<div class="suite-name">(?P<suite>.*?)</div>'
+        r'(?P<body>.*?)(?=<div class="item">|</div></div></div></div></div>|$)',
+        re.I | re.S,
+    )
+    product_pattern = re.compile(
+        r'<div class="product-symbol">(?P<symbol>[^<]+)</div>\s*'
+        r'<div class="product-description">(?P<description>[^<]+)</div>',
+        re.I | re.S,
+    )
+    for item in item_pattern.finditer(html):
+        suite = _html_text(item.group("suite"))
+        for product in product_pattern.finditer(item.group("body")):
+            description = _html_text(product.group("description"))
+            rows.append(
+                {
+                    "symbol": product.group("symbol"),
+                    "name": f"MicroSectors {suite} {description} ETN",
+                }
+            )
+
+    return _fund_rows_to_universe(
+        rows,
+        source.name,
+        source_label=f"{source.name} ETN issuer table",
+        require_leveraged=True,
+        product_type="ETN",
+    )
+
+
+def _normalize_hidden_url_symbol(symbol: str) -> str:
+    if len(symbol) % 2 == 0:
+        midpoint = len(symbol) // 2
+        if symbol[:midpoint] == symbol[midpoint:]:
+            return symbol[:midpoint]
+    return symbol
+
+
+def _etracs_leverage_table_to_universe(html: str, source: UniverseSource) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for table in _read_html_tables(html):
+        table = _clean_columns(table)
+        symbol_col = _first_matching_column(table.columns, [r"ticker\s+symbol", r"^ticker$", r"^symbol$"])
+        name_col = _first_matching_column(table.columns, [r"^name$", r"\bname\b"])
+        leverage_col = _first_matching_column(table.columns, [r"^leverage$"])
+        if symbol_col is None or name_col is None:
+            continue
+
+        for _idx, row in table.iterrows():
+            symbol_text = str(row[symbol_col])
+            symbol_match = re.search(r"/ussymbol/([A-Z][A-Z0-9.-]*)", symbol_text)
+            if symbol_match is None:
+                symbol_match = re.search(r"\b([A-Z][A-Z0-9.-]{1,5})\b\s*$", symbol_text)
+            if symbol_match is None:
+                continue
+            symbol = _normalize_hidden_url_symbol(symbol_match.group(1))
+
+            leverage_text = str(row[leverage_col]) if leverage_col is not None else ""
+            if leverage_col is not None and not re.search(r"\d+(?:\.\d+)?\s*x", leverage_text, re.I):
+                continue
+
+            rows.append({"symbol": symbol, "name": row[name_col]})
+
+    return _fund_rows_to_universe(
+        rows,
+        source.name,
+        source_label=f"{source.name} ETN issuer table",
+        require_leveraged=True,
+        product_type="ETN",
+    )
+
+
+def _html_source_to_universe(
+    html: str,
+    source_name: str,
+    *,
+    source_label: str,
+    require_leveraged: bool,
+) -> pd.DataFrame:
+    rows = []
+    for table in _read_html_tables(html):
+        source_rows = _fund_table_to_universe(
+            _clean_columns(table),
+            source_name,
+            source_label=source_label,
+            require_leveraged=require_leveraged,
+        )
+        if not source_rows.empty:
+            rows.append(source_rows)
+
+    card_rows = _html_cards_to_universe(
+        html,
+        source_name,
+        source_label=source_label,
+        require_leveraged=require_leveraged,
+    )
+    if not card_rows.empty:
+        rows.append(card_rows)
+
+    if not rows:
+        return pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+    return pd.concat(rows, ignore_index=True).drop_duplicates("symbol").reset_index(drop=True)
+
+
+def load_issuer_etf_universe(timeout: int = 30) -> pd.DataFrame:
+    rows = []
+    for issuer, url in ISSUER_UNIVERSE_SOURCES:
+        try:
+            resp = requests.get(url, timeout=timeout, headers=REQUEST_HEADERS)
+            resp.raise_for_status()
+        except Exception:
+            continue
+        issuer_rows = _html_source_to_universe(
+            resp.text,
+            issuer,
+            source_label=f"{issuer} issuer table",
+            require_leveraged=True,
+        )
+        if not issuer_rows.empty:
+            rows.append(issuer_rows)
+
+    if not rows:
+        return pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+    return pd.concat(rows, ignore_index=True).drop_duplicates("symbol").sort_values("symbol").reset_index(drop=True)
+
+
+def load_etn_universe(timeout: int = 30) -> pd.DataFrame:
+    rows = []
+    for source in WORKFLOW_ETN_SOURCES:
+        try:
+            resp = requests.get(source.url, timeout=timeout, headers=REQUEST_HEADERS)
+            resp.raise_for_status()
+            if source.parser == "microsectors_html":
+                source_rows = _microsectors_html_to_universe(resp.text, source)
+            elif source.parser == "etracs_leverage_table":
+                source_rows = _etracs_leverage_table_to_universe(resp.text, source)
+            else:
+                source_rows = _html_source_to_universe(
+                    resp.text,
+                    source.name,
+                    source_label=f"{source.name} ETN issuer table",
+                    require_leveraged=True,
+                )
+                source_rows["fund_type"] = source_rows["fund_type"].str.replace(
+                    r"^ETF",
+                    "ETN",
+                    regex=True,
+                )
+        except Exception:
+            continue
+        if not source_rows.empty:
+            rows.append(source_rows)
+
+    if not rows:
+        return pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+    return pd.concat(rows, ignore_index=True).drop_duplicates("symbol").sort_values("symbol").reset_index(drop=True)
+
+
+def _cboe_symbol_csv_to_universe(csv_text: str, source: UniverseSource) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(io.StringIO(csv_text))
+    except Exception:
+        return pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+
+    symbol_col = _first_matching_column(df.columns, [r"^symbol$", r"^ticker$", r"^name$"])
+    if symbol_col is None:
+        return pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+
+    rows = ({"symbol": symbol, "name": symbol} for symbol in df[symbol_col])
+    return _fund_rows_to_universe(
+        rows,
+        source.name,
+        source_label=f"{source.name} audit source",
+        require_leveraged=False,
+    )
+
+
+def _sec_company_tickers_to_universe(json_text: str, source: UniverseSource) -> pd.DataFrame:
+    try:
+        raw = pd.read_json(io.StringIO(json_text), orient="index")
+    except Exception:
+        return pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+    if not {"ticker", "title"}.issubset(raw.columns):
+        return pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+
+    rows = (
+        {"symbol": row["ticker"], "name": row["title"]}
+        for _idx, row in raw[["ticker", "title"]].iterrows()
+    )
+    return _fund_rows_to_universe(
+        rows,
+        source.name,
+        source_label=f"{source.name} audit source",
+        require_leveraged=False,
+        product_type="SEC",
+    )
+
+
+def _sec_fields_data_json_to_rows(
+    json_text: str,
+    *,
+    symbol_field: str,
+    name_field: Optional[str],
+) -> list[dict[str, object]]:
+    try:
+        payload = json.loads(json_text)
+    except Exception:
+        return []
+
+    fields = payload.get("fields")
+    data = payload.get("data")
+    if not isinstance(fields, list) or not isinstance(data, list):
+        return []
+    if symbol_field not in fields:
+        return []
+
+    symbol_idx = fields.index(symbol_field)
+    name_idx = fields.index(name_field) if name_field in fields else None
+
+    rows: list[dict[str, object]] = []
+    for raw_row in data:
+        if not isinstance(raw_row, list) or symbol_idx >= len(raw_row):
+            continue
+        symbol = raw_row[symbol_idx]
+        name = raw_row[name_idx] if name_idx is not None and name_idx < len(raw_row) else symbol
+        rows.append({"symbol": symbol, "name": name})
+    return rows
+
+
+def _sec_exchange_tickers_to_universe(json_text: str, source: UniverseSource) -> pd.DataFrame:
+    rows = _sec_fields_data_json_to_rows(
+        json_text,
+        symbol_field="ticker",
+        name_field="name",
+    )
+    return _fund_rows_to_universe(
+        rows,
+        source.name,
+        source_label=f"{source.name} audit source",
+        require_leveraged=False,
+        product_type="SEC",
+    )
+
+
+def _sec_mutual_fund_tickers_to_universe(json_text: str, source: UniverseSource) -> pd.DataFrame:
+    rows = _sec_fields_data_json_to_rows(
+        json_text,
+        symbol_field="symbol",
+        name_field=None,
+    )
+    return _fund_rows_to_universe(
+        rows,
+        source.name,
+        source_label=f"{source.name} audit source",
+        require_leveraged=False,
+        product_type="SEC MF",
+    )
+
+
+def _audit_source_status_row(
+    source: UniverseSource,
+    *,
+    status: str,
+    row_count: int = 0,
+    error: str = "",
+) -> dict[str, object]:
+    return {
+        "source": source.name,
+        "source_type": source.source_type,
+        "url": source.url,
+        "parser": source.parser,
+        "enabled": source.enabled,
+        "status": status,
+        "row_count": row_count,
+        "error": error,
+        "notes": source.notes,
+    }
+
+
+def _audit_source_columns() -> list[str]:
+    return [
+        "symbol",
+        "name",
+        "fund_type",
+        "source",
+        "audit_source_type",
+        "source_url",
+        "is_leveraged_candidate",
+        "is_long_leveraged_candidate",
+        "leverage",
+        "direction",
+    ]
+
+
+def _sec_audit_row_has_product_context(name: object) -> bool:
+    normalized_name = re.sub(r"\s+", " ", str(name).upper()).strip()
+    return any(re.search(pattern, normalized_name, re.I) for pattern in SEC_AUDIT_PRODUCT_CONTEXT_PATTERNS)
+
+
+def _audit_row_leverage_metadata(name: object, source: UniverseSource) -> pd.Series:
+    if source.parser in SEC_ENTITY_AUDIT_PARSERS and not _sec_audit_row_has_product_context(name):
+        return pd.Series(
+            {
+                "is_leveraged_candidate": False,
+                "is_long_leveraged_candidate": False,
+                "leverage": None,
+                "direction": None,
+            }
+        )
+
+    leverage, direction = infer_leverage_and_direction(str(name))
+    return pd.Series(
+        {
+            "is_leveraged_candidate": leveraged_name_filter(str(name)),
+            "is_long_leveraged_candidate": is_long_leveraged_name(str(name)),
+            "leverage": leverage,
+            "direction": direction,
+        }
+    )
+
+
+def _with_audit_metadata(rows: pd.DataFrame, source: UniverseSource) -> pd.DataFrame:
+    out = rows.copy()
+    out["audit_source_type"] = source.source_type
+    out["source_url"] = source.url
+    leverage_metadata = out["name"].apply(lambda name: _audit_row_leverage_metadata(name, source))
+    out = pd.concat([out, leverage_metadata], axis=1)
+    return out[_audit_source_columns()].reset_index(drop=True)
+
+
+def load_audit_universe_sources(timeout: int = 30) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rows = []
+    status_rows = []
+    for source in AUDIT_UNIVERSE_SOURCES:
+        if not source.enabled or source.parser == "registered_only":
+            status_rows.append(_audit_source_status_row(source, status="registered_only"))
+            continue
+
+        try:
+            resp = requests.get(source.url, timeout=timeout, headers=REQUEST_HEADERS)
+            resp.raise_for_status()
+            if source.parser == "cboe_symbol_csv":
+                source_rows = _cboe_symbol_csv_to_universe(resp.text, source)
+            elif source.parser == "sec_company_tickers":
+                source_rows = _sec_company_tickers_to_universe(resp.text, source)
+            elif source.parser == "sec_exchange_tickers":
+                source_rows = _sec_exchange_tickers_to_universe(resp.text, source)
+            elif source.parser == "sec_mutual_fund_tickers":
+                source_rows = _sec_mutual_fund_tickers_to_universe(resp.text, source)
+            else:
+                source_rows = _html_source_to_universe(
+                    resp.text,
+                    source.name,
+                    source_label=f"{source.name} audit source",
+                    require_leveraged=False,
+                )
+        except Exception as exc:
+            status_rows.append(
+                _audit_source_status_row(
+                    source,
+                    status="error",
+                    error=f"{type(exc).__name__}: {exc}"[:250],
+                )
+            )
+            continue
+
+        if not source_rows.empty:
+            source_rows = _with_audit_metadata(source_rows, source)
+            rows.append(source_rows)
+        status_rows.append(
+            _audit_source_status_row(
+                source,
+                status="loaded" if not source_rows.empty else "loaded_no_rows",
+                row_count=len(source_rows),
+            )
+        )
+
+    if rows:
+        audit_rows = (
+            pd.concat(rows, ignore_index=True)
+            .drop_duplicates(["symbol", "source"])
+            .sort_values(["source", "symbol"])
+            .reset_index(drop=True)
+        )
+    else:
+        audit_rows = pd.DataFrame(columns=_audit_source_columns())
+
+    status = pd.DataFrame(status_rows)
+    return audit_rows, status
+
+
+def build_universe_audit_report(
+    audit_rows: pd.DataFrame,
+    merged_universe: pd.DataFrame,
+    workflow_assets: pd.DataFrame,
+) -> pd.DataFrame:
+    columns = _audit_source_columns() + [
+        "in_merged_universe",
+        "in_workflow_universe",
+        "audit_reason",
+    ]
+    if audit_rows.empty:
+        return pd.DataFrame(columns=columns)
+
+    merged_symbols = set(merged_universe["symbol"].dropna().astype(str))
+    workflow_symbols = set(workflow_assets["symbol"].dropna().astype(str))
+
+    out = audit_rows.copy()
+    out["in_merged_universe"] = out["symbol"].isin(merged_symbols)
+    out["in_workflow_universe"] = out["symbol"].isin(workflow_symbols)
+    out = out[out["is_leveraged_candidate"] & ~out["in_merged_universe"]].copy()
+    out["audit_reason"] = "leveraged-looking audit source row missing from merged source universe"
+    return out[columns].sort_values(["source", "symbol"]).reset_index(drop=True)
+
+
+def _merge_universe_sources(nasdaq_df: pd.DataFrame, issuer_df: pd.DataFrame) -> pd.DataFrame:
+    nasdaq = nasdaq_df.copy()
+    nasdaq["source"] = "Nasdaq ETF definitions"
+    combined = pd.concat([nasdaq, issuer_df], ignore_index=True, sort=False)
+    if combined.empty:
+        return combined
+    combined["source_rank"] = combined["source"].ne("Nasdaq ETF definitions").astype(int)
+    combined = combined.sort_values(["symbol", "source_rank"], ascending=[True, False])
+    combined = combined.drop_duplicates("symbol", keep="first")
+    return combined.drop(columns=["source_rank"]).reset_index(drop=True)
+
+
+def _workflow_row_metadata(row: pd.Series, known_symbols: Optional[set[str]]) -> pd.Series:
+    leverage, direction = infer_leverage_and_direction(row["name"])
+    rsi_symbol = infer_rsi_symbol(row["symbol"], row["name"], known_symbols=known_symbols)
+    if rsi_symbol == row["symbol"]:
+        confidence = "fallback_to_self"
+        mapping_source = "asset_symbol"
+    elif known_symbols is None or rsi_symbol in known_symbols:
+        confidence = "inferred"
+        mapping_source = "name_inference"
+    else:
+        confidence = "needs_review"
+        mapping_source = "name_inference"
+
+    return pd.Series(
+        {
+            "rsi_symbol": rsi_symbol,
+            "leverage": leverage,
+            "direction": direction,
+            "underlying_symbol": rsi_symbol,
+            "underlying_name": rsi_symbol,
+            "mapping_source": mapping_source,
+            "confidence": confidence,
+        }
+    )
 
 
 def select_universes(etf_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Returns current long leveraged single-stock ETFs and all current long leveraged ETFs.
     """
-    single_stock = etf_df[
-        etf_df["fund_type"].str.contains(r"ETF \(Single Stock\)", regex=True, na=False)
+    eligible = etf_df[~etf_df["symbol"].isin(EXCLUDED_UNIVERSE_SYMBOLS)].copy()
+    single_stock = eligible[
+        eligible["fund_type"].str.contains(r"ETF \(Single Stock\)", regex=True, na=False)
     ].copy()
     single_stock_long = single_stock[single_stock["name"].apply(is_long_leveraged_name)].copy()
-    all_long_leveraged = etf_df[etf_df["name"].apply(is_long_leveraged_name)].copy()
+    all_long_leveraged = eligible[eligible["name"].apply(is_long_leveraged_name)].copy()
 
     return (
         single_stock_long.sort_values("symbol").reset_index(drop=True),
@@ -201,15 +1090,22 @@ def select_universes(etf_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def determine_workflow_assets(cfg: UniverseConfig) -> pd.DataFrame:
-    etf_df = load_current_etf_universe(timeout=cfg.request_timeout_seconds)
+    nasdaq_df = load_current_etf_universe(timeout=cfg.request_timeout_seconds)
+    issuer_df = load_issuer_etf_universe(timeout=cfg.request_timeout_seconds)
+    etn_df = load_etn_universe(timeout=cfg.request_timeout_seconds)
+    discovered_df = pd.concat([issuer_df, etn_df], ignore_index=True, sort=False)
+    etf_df = _merge_universe_sources(nasdaq_df, discovered_df)
+    active_symbols = load_active_listed_symbols(timeout=cfg.request_timeout_seconds)
+    known_symbols: Optional[set[str]]
+    if active_symbols:
+        known_symbols = set(etf_df["symbol"].dropna().astype(str).str.upper())
+        known_symbols.update(active_symbols)
+    else:
+        known_symbols = None
+
     single_stock_long, all_long_leveraged = select_universes(etf_df)
     nasdaq_universe = build_nasdaq_universe_table(etf_df)
     save_table_to_sqlite(nasdaq_universe, cfg.sqlite_db_path, "nasdaq_etf_universe")
-
-    print(f"Current ETFs in Nasdaq table: {len(etf_df)}")
-    print(f"Current long single-stock leveraged ETFs found: {len(single_stock_long)}")
-    print(f"Current long leveraged ETFs found: {len(all_long_leveraged)}")
-    print(f"Saved Nasdaq ETF universe to {cfg.sqlite_db_path}: table=nasdaq_etf_universe")
 
     if all_long_leveraged.empty:
         raise RuntimeError("Nasdaq ETF universe returned no current long leveraged ETFs.")
@@ -219,23 +1115,47 @@ def determine_workflow_assets(cfg: UniverseConfig) -> pd.DataFrame:
         if cfg.top_n is None
         else all_long_leveraged.head(cfg.top_n).copy()
     )
+    audit_rows, audit_status = load_audit_universe_sources(timeout=cfg.request_timeout_seconds)
+    audit_report = build_universe_audit_report(audit_rows, etf_df, all_long_leveraged)
+    save_table_to_sqlite(audit_rows, cfg.sqlite_db_path, "universe_audit_rows")
+    save_table_to_sqlite(audit_report, cfg.sqlite_db_path, "universe_audit_missing_candidates")
+    save_table_to_sqlite(audit_status, cfg.sqlite_db_path, "universe_audit_source_status")
 
-    workflow_assets["rsi_symbol"] = workflow_assets.apply(
-        lambda row: infer_rsi_symbol(row["symbol"], row["name"]),
-        axis=1,
-    )
+    metadata = workflow_assets.apply(lambda row: _workflow_row_metadata(row, known_symbols), axis=1)
+    workflow_assets = pd.concat([workflow_assets.reset_index(drop=True), metadata.reset_index(drop=True)], axis=1)
 
     if cfg.top_n is None:
-        print("\nAll long leveraged ETFs from Nasdaq universe")
+        universe_title = "All Long Leveraged ETFs/ETNs From Merged Universe"
     else:
-        print(f"\nFirst {cfg.top_n} long leveraged ETFs from Nasdaq universe")
-    print(workflow_assets.to_string(index=False))
+        universe_title = f"First {cfg.top_n} Long Leveraged ETFs/ETNs From Merged Universe"
 
-    return workflow_assets[["symbol", "name", "rsi_symbol"]].reset_index(drop=True)
-
-
-def determine_workflow_symbols(cfg: UniverseConfig) -> list[str]:
-    return determine_workflow_assets(cfg)["symbol"].tolist()
+    out = workflow_assets[["symbol", "name", "rsi_symbol"]].reset_index(drop=True)
+    for column in [
+        "leverage",
+        "direction",
+        "underlying_symbol",
+        "underlying_name",
+        "fund_type",
+        "source",
+        "mapping_source",
+        "confidence",
+    ]:
+        if column in workflow_assets.columns:
+            out[column] = workflow_assets[column].to_numpy()
+    out.attrs["universe_title"] = universe_title
+    out.attrs["universe_counts"] = {
+        "Current ETFs in Nasdaq table": len(nasdaq_df),
+        "Current issuer-discovered leveraged ETFs found": len(issuer_df),
+        "Current issuer-discovered leveraged ETNs found": len(etn_df),
+        "Merged current ETFs/ETNs": len(etf_df),
+        "Current long single-stock leveraged ETFs found": len(single_stock_long),
+        "Current long leveraged ETFs/ETNs found": len(all_long_leveraged),
+        "Audit sources registered": len(AUDIT_UNIVERSE_SOURCES),
+        "Audit rows parsed": len(audit_rows),
+        "Audit leveraged candidates missing from merged universe": len(audit_report),
+    }
+    out.attrs["universe_db_path"] = cfg.sqlite_db_path
+    return out
 
 
 def build_nasdaq_universe_table(etf_df: pd.DataFrame) -> pd.DataFrame:
@@ -247,8 +1167,11 @@ def build_nasdaq_universe_table(etf_df: pd.DataFrame) -> pd.DataFrame:
         na=False,
     )
     out["is_single_stock_long_leveraged"] = out["is_single_stock"] & out["is_long_leveraged"]
-    out["rsi_symbol"] = out.apply(
-        lambda row: infer_rsi_symbol(row["symbol"], row["name"]) if row["is_long_leveraged"] else row["symbol"],
-        axis=1,
-    )
+    out["rsi_symbol"] = out.apply(_infer_nasdaq_table_rsi_symbol, axis=1)
     return out.sort_values("symbol").reset_index(drop=True)
+
+
+def _infer_nasdaq_table_rsi_symbol(row: pd.Series) -> str:
+    if row["is_long_leveraged"]:
+        return infer_rsi_symbol(row["symbol"], row["name"])
+    return row["symbol"]
