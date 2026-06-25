@@ -24,20 +24,20 @@ Leveraged Trader is organized as a small package with IO-heavy boundaries kept s
 
 ## Data Flow
 
-1. Load the current leveraged ETF/ETN universe from Nasdaq ETF definitions plus best-effort issuer ETF and ETN tables. Each issuer/ETN source's result is saved to `universe_workflow_source_status`; fetch failures and unparseable responses are surfaced as a degraded universe and can be made fatal with `--require-workflow-source-success`, while a successfully parsed source with zero leveraged matches remains healthy.
+1. Initialize the SQLite schema and reconcile active Alpaca managed positions before refreshing market data. This startup reconciliation can attach or renew managed GTC sells for buys that filled after a previous run.
+2. Load the current leveraged ETF/ETN universe from Nasdaq ETF definitions plus best-effort issuer ETF and ETN tables. Each issuer/ETN source's result is saved to `universe_workflow_source_status`; fetch failures and unparseable responses are surfaced as a degraded universe and can be made fatal with `--require-workflow-source-success`, while a successfully parsed source with zero leveraged matches remains healthy.
    Issuer discovery includes ProShares, Direxion, Leverage Shares, GraniteShares, Defiance, AdvisorShares, AXS Investments, Kurv, Innovator, Tuttle Capital, Tradr, REX Shares, KraneShares, Volatility Shares, 21Shares, YieldMax, Tidal, Roundhill, Themes, Simplify, MicroSectors, and UBS ETRACS.
-2. Merge universe sources by symbol, infer leverage/direction, and infer each leveraged asset's RSI signal symbol. An optional workflow `top_n` limit must be a positive integer; `None` selects every discovered asset.
+3. Merge universe sources by symbol, infer leverage/direction, and infer each leveraged asset's RSI signal symbol. An optional workflow `top_n` limit must be a positive integer; `None` selects every discovered asset.
    Inferred underlyings are validated against active listed symbols only when both Nasdaq symbol files load successfully; a partial listing snapshot is recorded for audit but cannot exclude issuer-discovered products.
-3. Write audit-only universe source tables for exchange directories, third-party ETF directories, and SEC EDGAR registry review. These audit sources can flag missing leveraged-looking candidates, but they do not override Nasdaq or issuer rows.
-4. Download canonical full daily Yahoo Finance histories for the leveraged asset, RSI signal symbol, and risk-free benchmark before each update. Historical corrections or removed sessions invalidate the affected asset state; a benchmark correction or removal invalidates all strategy rollups. The risk-free benchmark is forward-filled onto the asset/signal calendar in both live and SQLite rebuild paths. The current US session is excluded so signals use settled prior-session data.
+4. Write audit-only universe source tables for exchange directories, third-party ETF directories, and SEC EDGAR registry review. These audit sources can flag missing leveraged-looking candidates, but they do not override Nasdaq or issuer rows.
+5. Download canonical full daily Yahoo Finance histories for the leveraged asset, RSI signal symbol, and risk-free benchmark before each update. Historical corrections or removed sessions invalidate the affected asset state; a benchmark correction or removal invalidates all strategy rollups. The risk-free benchmark is forward-filled onto the asset/signal calendar in both live and SQLite rebuild paths. The current US session is excluded so signals use settled prior-session data.
    If Yahoo skips an asset or signal symbol, retry that symbol with Tradier historical daily data when configured.
-5. Update or rebuild SQLite state for each parameter combination.
-6. Summarize the best strategy per asset.
-7. Build buy and sell recommendation reports.
-8. Write CSV outputs to `outputs/` or the configured output directory.
-9. Reconcile Alpaca managed positions and submit or renew anchored GTC limit sells for whole-share filled buys unless disabled by CLI flags.
-10. Calculate closed managed Alpaca realized P/L from actual buy and sell fill prices.
-11. Submit guarded whole-share Alpaca paper buy orders for the current recommendations unless disabled by CLI flags.
+6. Update or rebuild SQLite state for each parameter combination.
+7. Summarize the best strategy per asset.
+8. Build buy and sell recommendation reports, eligible-buy reports, and closed managed Alpaca realized P/L from actual buy and sell fill prices.
+9. Submit guarded whole-share Alpaca paper buy orders for the current recommendations unless disabled by CLI flags.
+10. If any managed buy was submitted or recovered, run a second Alpaca reconciliation so fast fills can receive their managed GTC limit sells in the same workflow run.
+11. Load managed-position state and write CSV outputs to `outputs/` or the configured output directory.
 
 `update` mode resumes from persisted SQLite strategy state, while `rebuild` mode recomputes strategy state from scratch.
 Asset-level work is scheduled through `asyncio` with blocking Yahoo Finance, Tradier, Alpaca, and SQLite calls isolated in worker threads. Downloads remain concurrent, while one workflow-wide lock serializes SQLite strategy-state processing: a shared benchmark correction can invalidate every strategy, and same-signal tasks also share canonical RSI history. Each processing unit also uses a SQLite `BEGIN IMMEDIATE` transaction plus a persisted state generation check, so independent processes cannot commit stale dependent state after an invalidation. `--workflow-concurrency` controls the maximum number of assets in flight. Individual asset failures remain visible in the summary, but a run with no completed assets raises a workflow error before reports or buy submission.

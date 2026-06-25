@@ -46,7 +46,8 @@ The CLI also supports `--alpaca-timeout-seconds` for request timeout tuning (def
 `--alpaca-gtc-sell-renewal-days-before-expiration` for managed GTC sell renewal timing (default: `7`),
 `--tradier-timeout-seconds` for market-data fallback timeout tuning (default: `30`),
 `--workflow-concurrency` for asset-level concurrency tuning (default: `4`), and `--no-color`
-for plain terminal output. Tradier fallback is enabled by default when a token is configured.
+for plain terminal output. The Tradier fallback flag is enabled by default, but fallback requests
+are only usable when a non-placeholder Tradier token is configured.
 
 Run an update:
 
@@ -77,6 +78,25 @@ Show all options:
 ```bash
 uv run leveraged-trader --help
 ```
+
+## Recommended Operating Schedule
+
+This cadence describes the mechanics of the workflow; it is not investment advice. The workflow
+intentionally excludes the current US daily bar, so live buy submissions are designed for the
+premarket after the signal day has settled.
+
+- Premarket before the regular open, for example 8:00-9:20 a.m. ET: run `uv run leveraged-trader`.
+  This reconciles existing managed positions first, refreshes settled histories, submits eligible
+  prior-session buy signals as regular-session day limit buys, then reconciles again if any managed
+  buy was submitted or recovered.
+- After Alpaca shows a managed buy filled, run
+  `uv run leveraged-trader --no-alpaca-submit-buy-orders` to attach or renew managed GTC limit sells
+  without placing new buy orders. This is useful shortly after the open and again later if a day
+  limit buy fills later in the session.
+- If a limit buy never fills, no sell is submitted. A later reconciliation records the terminal buy
+  status and closes the managed intent without a position.
+- Extra reconciliation runs are intended to be idempotent: deterministic client order IDs, active
+  managed-position checks, and live open-order checks protect against duplicate managed buys or sells.
 
 ## CLI Reference
 
