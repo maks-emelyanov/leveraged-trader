@@ -35,6 +35,16 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -58,8 +68,8 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Submit Alpaca paper market buy orders for current buy recommendations. "
-            "Each order uses 10%% of account cash to size a whole-share quantity. Enabled by default; use "
+            "Submit bounded Alpaca paper day limit buy orders for current buy recommendations. "
+            "The batch uses a capped fraction of account cash to size whole-share quantities. Enabled by default; use "
             "--no-alpaca-submit-buy-orders to skip."
         ),
     )
@@ -69,7 +79,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help=(
             "Submit and renew Alpaca paper managed GTC limit sell orders for filled managed buys. "
-            "Each order sells the original whole-share filled buy quantity at the frozen target price. "
+            "Each order sells the remaining whole-share managed quantity at the frozen target price. "
             "Enabled by default; use "
             "--no-alpaca-submit-sell-orders to skip."
         ),
@@ -94,6 +104,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=30,
         help="Timeout for Alpaca API requests.",
+    )
+    parser.add_argument(
+        "--alpaca-batch-cash-fraction",
+        type=float,
+        default=_env_float("ALPACA_BATCH_CASH_FRACTION", 0.10),
+        help="Maximum fraction of account cash reserved across one buy-order batch (default: 0.10).",
+    )
+    parser.add_argument(
+        "--alpaca-buy-limit-buffer-bps",
+        type=float,
+        default=_env_float("ALPACA_BUY_LIMIT_BUFFER_BPS", 500.0),
+        help="Basis-point buffer above the price estimate for whole-share day buy limits (default: 500).",
     )
     parser.add_argument(
         "--alpaca-gtc-sell-renewal",
@@ -152,6 +174,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--require-workflow-source-success",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Abort before running strategies if an issuer or ETN workflow-universe source fails. "
+            "Disabled by default; source failures are otherwise recorded as a degraded universe."
+        ),
+    )
+    parser.add_argument(
         "--no-color",
         action="store_true",
         help="Disable colored terminal output.",
@@ -173,13 +204,19 @@ def main() -> None:
     )
 
     mode = args.mode
-    universe_cfg = UniverseConfig(top_n=None, sqlite_db_path=args.db)
+    universe_cfg = UniverseConfig(
+        top_n=None,
+        sqlite_db_path=args.db,
+        require_workflow_source_success=args.require_workflow_source_success,
+    )
     alpaca_cfg = AlpacaOrderConfig(
         enabled=args.alpaca_submit_buy_orders,
         sell_enabled=args.alpaca_submit_sell_orders,
         api_key_id=args.alpaca_api_key_id,
         api_secret_key=args.alpaca_api_secret_key,
         base_url=args.alpaca_base_url,
+        batch_cash_fraction=args.alpaca_batch_cash_fraction,
+        buy_limit_buffer_bps=args.alpaca_buy_limit_buffer_bps,
         timeout_seconds=args.alpaca_timeout_seconds,
         gtc_sell_renewal_enabled=args.alpaca_gtc_sell_renewal,
         gtc_sell_renewal_days_before_expiration=args.alpaca_gtc_sell_renewal_days_before_expiration,

@@ -5,7 +5,8 @@ import re
 import threading
 from collections.abc import Mapping
 from contextlib import contextmanager
-from typing import Optional
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -14,7 +15,6 @@ import yfinance.shared as yf_shared
 
 from .config import RISK_FREE_SYMBOL, TradierMarketDataConfig
 from .storage import _date_str
-
 
 _YFINANCE_DOWNLOAD_LOCK = threading.Lock()
 _OHLCV_FIELDS = ["Open", "High", "Low", "Close", "Volume"]
@@ -25,6 +25,7 @@ _TRADIER_PLACEHOLDER_TOKENS = {
     "replace_me",
 }
 TRADIER_RECOVERED_SYMBOLS_ATTR = "tradier_recovered_symbols"
+_NEW_YORK = ZoneInfo("America/New_York")
 
 
 class MarketDataDownloadError(RuntimeError):
@@ -97,7 +98,7 @@ def _tradier_symbol(symbol: str) -> str:
     return symbol.strip().upper().replace("-", "/")
 
 
-def _tradier_token_error(cfg: TradierMarketDataConfig) -> Optional[str]:
+def _tradier_token_error(cfg: TradierMarketDataConfig) -> str | None:
     if not cfg.enabled:
         return "Tradier fallback is disabled"
     token = (cfg.access_token or "").strip()
@@ -142,8 +143,8 @@ def _tradier_history_days(payload: Mapping[str, object]) -> list[Mapping[str, ob
 
 def _load_tradier_symbol_frame(
     symbol: str,
-    start: Optional[str],
-    end: Optional[str],
+    start: str | None,
+    end: str | None,
     cfg: TradierMarketDataConfig,
 ) -> pd.DataFrame:
     token_error = _tradier_token_error(cfg)
@@ -250,10 +251,10 @@ def _extract_symbol_frame(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
 
 def _download_yfinance(
     symbols: list[str],
-    start: Optional[str],
-    end: Optional[str],
+    start: str | None,
+    end: str | None,
     auto_adjust: bool,
-) -> tuple[Optional[pd.DataFrame], dict[str, str]]:
+) -> tuple[pd.DataFrame | None, dict[str, str]]:
     with _YFINANCE_DOWNLOAD_LOCK, _suppress_yfinance_logger():
         yf_shared._ERRORS = {}
         try:
@@ -274,7 +275,7 @@ def _download_yfinance(
 
 
 def _yfinance_symbol_frames(
-    raw: Optional[pd.DataFrame],
+    raw: pd.DataFrame | None,
     symbols: list[str],
     download_errors: Mapping[str, str],
 ) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
@@ -299,16 +300,19 @@ def _yfinance_symbol_frames(
             errors.update(exc.symbol_reasons)
             continue
 
-        keep = [column for column in _OHLCV_FIELDS if column in df.columns]
-        if not keep:
+        missing_fields = [column for column in _OHLCV_FIELDS if column not in df.columns]
+        if missing_fields:
             errors[symbol] = (
-                "Yahoo Finance response did not include OHLCV columns "
-                f"(columns={list(df.columns)})"
+                "Yahoo Finance response was missing required OHLCV columns: "
+                f"{', '.join(missing_fields)}"
             )
             continue
 
-        df = df[keep].copy()
-        df.columns = [f"{symbol}_{column}" for column in keep]
+        df = df[_OHLCV_FIELDS].copy().dropna(subset=_OHLCV_FIELDS)
+        if df.empty:
+            errors[symbol] = "Yahoo Finance response had no complete OHLCV daily rows"
+            continue
+        df.columns = [f"{symbol}_{column}" for column in _OHLCV_FIELDS]
         frames[symbol] = df
 
     return frames, errors
@@ -316,8 +320,8 @@ def _yfinance_symbol_frames(
 
 def _load_tradier_fallback_frames(
     symbols: list[str],
-    start: Optional[str],
-    end: Optional[str],
+    start: str | None,
+    end: str | None,
     cfg: TradierMarketDataConfig,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
     frames: dict[str, pd.DataFrame] = {}
@@ -338,7 +342,7 @@ def _load_tradier_fallback_frames(
     return frames, errors
 
 
-def _combined_provider_reason(yahoo_reason: Optional[str], tradier_reason: Optional[str]) -> str:
+def _combined_provider_reason(yahoo_reason: str | None, tradier_reason: str | None) -> str:
     parts = []
     if yahoo_reason:
         parts.append(f"Yahoo Finance: {_clean_yfinance_error(yahoo_reason)}")
@@ -371,12 +375,50 @@ def _raise_no_overlap_error(
     raise MarketDataDownloadError(symbol_reasons, source="Market data providers")
 
 
+def exclude_current_trading_session(
+    data: pd.DataFrame,
+    *,
+    now: datetime | None = None,
+) -> pd.DataFrame:
+    """Exclude today's US daily candle so live signals use settled prior data.
+
+    A wall-clock cutoff cannot prove a third-party daily bar is final.  Keeping
+    the current session out of the strategy makes the following premarket run
+    the only live-submission window for the prior, settled session.
+    """
+    if data.empty:
+        return data
+
+    eastern_now = now.astimezone(_NEW_YORK) if now and now.tzinfo else now
+    if eastern_now is None:
+        eastern_now = datetime.now(_NEW_YORK)
+    elif eastern_now.tzinfo is None:
+        eastern_now = eastern_now.replace(tzinfo=_NEW_YORK)
+
+    latest_session = pd.Timestamp(data.index.max()).date()
+    if latest_session < eastern_now.date():
+        return data
+
+    finalized = data[pd.to_datetime(data.index).date < eastern_now.date()].copy()
+    finalized.attrs.update(data.attrs)
+    return finalized
+
+
+def exclude_unfinalized_daily_bar(
+    data: pd.DataFrame,
+    *,
+    now: datetime | None = None,
+) -> pd.DataFrame:
+    """Backward-compatible alias for settled-session filtering."""
+    return exclude_current_trading_session(data, now=now)
+
+
 def load_market_data(
-    start: Optional[str] = None,
-    end: Optional[str] = None,
+    start: str | None = None,
+    end: str | None = None,
     auto_adjust: bool = True,
-    symbols: Optional[list[str]] = None,
-    tradier_cfg: Optional[TradierMarketDataConfig] = None,
+    symbols: list[str] | None = None,
+    tradier_cfg: TradierMarketDataConfig | None = None,
 ) -> pd.DataFrame:
     """
     Downloads daily data and returns a merged DataFrame with SYMBOL_Field
@@ -459,10 +501,10 @@ def load_market_data(
 def load_strategy_data(
     asset_symbol: str,
     signal_symbol: str,
-    start: Optional[str] = None,
-    end: Optional[str] = None,
+    start: str | None = None,
+    end: str | None = None,
     auto_adjust: bool = True,
-    tradier_cfg: Optional[TradierMarketDataConfig] = None,
+    tradier_cfg: TradierMarketDataConfig | None = None,
 ) -> pd.DataFrame:
     core_symbols = [asset_symbol, signal_symbol]
     data = load_market_data(
@@ -488,4 +530,53 @@ def load_strategy_data(
     )
     if recovered_symbols:
         out.attrs[TRADIER_RECOVERED_SYMBOLS_ATTR] = recovered_symbols
-    return out
+    return exclude_current_trading_session(out)
+
+
+def load_signal_history(
+    signal_symbol: str,
+    *,
+    end: str | None = None,
+    auto_adjust: bool = True,
+    tradier_cfg: TradierMarketDataConfig | None = None,
+) -> pd.DataFrame:
+    """Load the canonical, settled daily history for one RSI signal symbol."""
+    return load_symbol_history(
+        signal_symbol,
+        end=end,
+        auto_adjust=auto_adjust,
+        tradier_cfg=tradier_cfg,
+    )
+
+
+def load_symbol_history(
+    symbol: str,
+    *,
+    end: str | None = None,
+    auto_adjust: bool = True,
+    tradier_cfg: TradierMarketDataConfig | None = None,
+) -> pd.DataFrame:
+    """Load complete, settled daily history for one persisted market symbol."""
+    data = load_market_data(
+        start=None,
+        end=end,
+        auto_adjust=auto_adjust,
+        symbols=[symbol],
+        tradier_cfg=tradier_cfg,
+    )
+    return exclude_current_trading_session(data)
+
+
+def load_risk_free_history(
+    *,
+    end: str | None = None,
+    auto_adjust: bool = True,
+    tradier_cfg: TradierMarketDataConfig | None = None,
+) -> pd.DataFrame:
+    """Load the complete canonical benchmark history shared by all strategies."""
+    return load_symbol_history(
+        RISK_FREE_SYMBOL,
+        end=end,
+        auto_adjust=auto_adjust,
+        tradier_cfg=tradier_cfg,
+    )

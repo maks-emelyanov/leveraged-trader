@@ -10,10 +10,12 @@ from leveraged_trader.universe import (
     AUDIT_UNIVERSE_SOURCES,
     ISSUER_UNIVERSE_SOURCES,
     WORKFLOW_ETN_SOURCES,
+    ActiveListedSymbols,
     UniverseSource,
     _etracs_leverage_table_to_universe,
     _html_cards_to_universe,
     _issuer_table_to_universe,
+    _merge_universe_sources,
     _microsectors_html_to_universe,
     _sec_company_tickers_to_universe,
     _sec_exchange_tickers_to_universe,
@@ -24,11 +26,91 @@ from leveraged_trader.universe import (
     infer_leverage_and_direction,
     infer_rsi_symbol,
     is_long_leveraged_name,
+    load_active_listed_symbols,
     load_current_etf_universe,
+    load_issuer_etf_universe,
 )
 
 
 class UniverseTests(unittest.TestCase):
+    @patch("leveraged_trader.universe.load_current_etf_universe")
+    def test_invalid_workflow_universe_limit_fails_before_discovery(self, mock_load_current: Mock) -> None:
+        for invalid_limit in [0, -1, True, 1.5]:
+            with (
+                self.subTest(top_n=invalid_limit),
+                self.assertRaisesRegex(ValueError, "positive integer or None"),
+            ):
+                determine_workflow_assets(
+                    UniverseConfig(sqlite_db_path="state.sqlite", top_n=invalid_limit)
+                )
+
+        mock_load_current.assert_not_called()
+
+    def test_positive_workflow_universe_limit_preserves_workflow_metadata(self) -> None:
+        nasdaq_rows = pd.DataFrame(
+            [
+                {"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"},
+                {"symbol": "UPRO", "name": "ProShares UltraPro S&P500", "fund_type": "ETF"},
+            ]
+        )
+        empty_rows = pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+        empty_rows.attrs["workflow_source_status"] = []
+
+        with (
+            patch("leveraged_trader.universe.load_current_etf_universe", return_value=nasdaq_rows),
+            patch("leveraged_trader.universe.load_issuer_etf_universe", return_value=empty_rows),
+            patch("leveraged_trader.universe.load_etn_universe", return_value=empty_rows),
+            patch(
+                "leveraged_trader.universe.load_active_listed_symbols",
+                return_value={"TQQQ", "UPRO", "QQQ", "SPY"},
+            ),
+            patch(
+                "leveraged_trader.universe.load_audit_universe_sources",
+                return_value=(pd.DataFrame(), pd.DataFrame()),
+            ),
+            patch("leveraged_trader.universe.save_table_to_sqlite"),
+        ):
+            workflow_assets = determine_workflow_assets(
+                UniverseConfig(sqlite_db_path="state.sqlite", top_n=1)
+            )
+
+        self.assertEqual(len(workflow_assets), 1)
+        self.assertIn("rsi_symbol", workflow_assets.columns)
+
+    @patch("leveraged_trader.universe._read_nasdaq_symbol_file")
+    def test_active_listing_status_marks_partial_download_non_authoritative(
+        self,
+        mock_read: Mock,
+    ) -> None:
+        mock_read.side_effect = [
+            pd.DataFrame({"Symbol": ["TQQQ"]}),
+            RuntimeError("otherlisted unavailable"),
+        ]
+
+        active_symbols = load_active_listed_symbols()
+
+        self.assertEqual(active_symbols, {"TQQQ"})
+        self.assertFalse(active_symbols.is_complete)
+        self.assertEqual(active_symbols.source_status[1]["status"], "error")
+
+    def test_nasdaq_metadata_wins_duplicate_issuer_symbol(self) -> None:
+        merged = _merge_universe_sources(
+            pd.DataFrame([
+                {"symbol": "TQQQ", "name": "Nasdaq Current Name", "fund_type": "ETF"},
+            ]),
+            pd.DataFrame([
+                {
+                    "symbol": "TQQQ",
+                    "name": "Issuer Stale Name",
+                    "fund_type": "ETF (Issuer)",
+                    "source": "Issuer table",
+                },
+            ]),
+        )
+
+        self.assertEqual(merged.loc[0, "name"], "Nasdaq Current Name")
+        self.assertEqual(merged.loc[0, "source"], "Nasdaq ETF definitions")
+
     def test_infers_underlying_symbol_from_leveraged_name(self) -> None:
         self.assertEqual(infer_rsi_symbol("TQQQ", "ProShares UltraPro QQQ"), "QQQ")
 
@@ -50,6 +132,7 @@ class UniverseTests(unittest.TestCase):
 
     def test_normalizes_brkb_to_yahoo_symbol(self) -> None:
         self.assertEqual(infer_rsi_symbol("BRKU", "2X Long BRKB Daily ETF"), "BRK-B")
+        self.assertEqual(infer_rsi_symbol("BRKU", "2X Long BRK.B Daily ETF"), "BRK-B")
 
     def test_long_duration_names_are_not_leveraged(self) -> None:
         self.assertFalse(is_long_leveraged_name("Vanguard Long-Term Corporate Bond ETF"))
@@ -393,7 +476,10 @@ class UniverseTests(unittest.TestCase):
         self.assertIn("TQQQ", universe["symbol"].tolist())
 
     @patch("builtins.print")
-    @patch("leveraged_trader.universe.load_active_listed_symbols", return_value={"TQQQ", "BRKU", "BRK-B", "QQQ"})
+    @patch(
+        "leveraged_trader.universe.load_active_listed_symbols",
+        return_value={"TQQQ", "BRKU", "BRK-B", "QQQ", "EXTRA", "BDCX"},
+    )
     @patch("leveraged_trader.universe.load_audit_universe_sources")
     @patch("leveraged_trader.universe.load_etn_universe")
     @patch("leveraged_trader.universe.load_issuer_etf_universe")
@@ -506,12 +592,261 @@ class UniverseTests(unittest.TestCase):
             saved_table_names,
             [
                 "nasdaq_etf_universe",
+                "universe_inactive_discovered_products",
+                "universe_active_listing_source_status",
+                "universe_workflow_source_status",
                 "universe_audit_rows",
                 "universe_audit_missing_candidates",
                 "universe_audit_source_status",
             ],
         )
         mock_print.assert_not_called()
+
+    def test_inactive_issuer_only_product_is_excluded_from_workflow(self) -> None:
+        nasdaq_rows = pd.DataFrame(
+            [{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"}]
+        )
+        issuer_rows = pd.DataFrame(
+            [
+                {
+                    "symbol": "STALE",
+                    "name": "Example 2X Long STALE Daily ETF",
+                    "fund_type": "ETF (Example)",
+                    "source": "Example issuer table",
+                }
+            ]
+        )
+        with (
+            patch("leveraged_trader.universe.load_current_etf_universe", return_value=nasdaq_rows),
+            patch("leveraged_trader.universe.load_issuer_etf_universe", return_value=issuer_rows),
+            patch(
+                "leveraged_trader.universe.load_etn_universe",
+                return_value=pd.DataFrame(columns=issuer_rows.columns),
+            ),
+            patch("leveraged_trader.universe.load_active_listed_symbols", return_value={"TQQQ", "QQQ"}),
+            patch(
+                "leveraged_trader.universe.load_audit_universe_sources",
+                return_value=(pd.DataFrame(), pd.DataFrame()),
+            ),
+            patch("leveraged_trader.universe.save_table_to_sqlite") as mock_save_table,
+        ):
+            workflow_assets = determine_workflow_assets(UniverseConfig(sqlite_db_path="state.sqlite"))
+
+        self.assertEqual(workflow_assets["symbol"].tolist(), ["TQQQ"])
+        inactive_rows = next(
+            call.args[0]
+            for call in mock_save_table.call_args_list
+            if call.args[2] == "universe_inactive_discovered_products"
+        )
+        self.assertEqual(inactive_rows["symbol"].tolist(), ["STALE"])
+        self.assertEqual(
+            workflow_assets.attrs["universe_counts"]["Inactive issuer-discovered ETFs/ETNs skipped"],
+            1,
+        )
+
+    def test_partial_active_listing_snapshot_does_not_filter_issuer_products(self) -> None:
+        nasdaq_rows = pd.DataFrame(
+            [{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"}]
+        )
+        issuer_rows = pd.DataFrame(
+            [{
+                "symbol": "ISSUER", "name": "Example 2X Long ISSUER Daily ETF",
+                "fund_type": "ETF (Example)", "source": "Example issuer table",
+            }]
+        )
+        partial_listing = ActiveListedSymbols(
+            {"TQQQ"},
+            [
+                {"source": "nasdaq_listed", "status": "loaded"},
+                {"source": "other_listed", "status": "error"},
+            ],
+        )
+        with (
+            patch("leveraged_trader.universe.load_current_etf_universe", return_value=nasdaq_rows),
+            patch("leveraged_trader.universe.load_issuer_etf_universe", return_value=issuer_rows),
+            patch(
+                "leveraged_trader.universe.load_etn_universe",
+                return_value=pd.DataFrame(columns=issuer_rows.columns),
+            ),
+            patch("leveraged_trader.universe.load_active_listed_symbols", return_value=partial_listing),
+            patch(
+                "leveraged_trader.universe.load_audit_universe_sources",
+                return_value=(pd.DataFrame(), pd.DataFrame()),
+            ),
+            patch("leveraged_trader.universe.save_table_to_sqlite"),
+        ):
+            workflow_assets = determine_workflow_assets(UniverseConfig(sqlite_db_path="state.sqlite"))
+
+        self.assertEqual(workflow_assets["symbol"].tolist(), ["ISSUER", "TQQQ"])
+        self.assertFalse(workflow_assets.attrs["universe_counts"]["Active listing snapshot complete"])
+
+    def test_issuer_source_failure_is_recorded_on_the_returned_universe(self) -> None:
+        with (
+            patch("leveraged_trader.universe.ISSUER_UNIVERSE_SOURCES", [("Test Issuer", "https://issuer.test")]),
+            patch("leveraged_trader.universe.requests.get", side_effect=RuntimeError("offline")),
+        ):
+            issuer_universe = load_issuer_etf_universe()
+
+        self.assertTrue(issuer_universe.empty)
+        status = issuer_universe.attrs["workflow_source_status"]
+        self.assertEqual(status[0]["status"], "source_error")
+        self.assertIn("offline", str(status[0]["error"]))
+
+    @patch("leveraged_trader.universe.requests.get")
+    def test_issuer_source_with_unparseable_success_response_is_a_parse_error(self, mock_get: Mock) -> None:
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.text = "<html><body>temporary maintenance page</body></html>"
+        mock_get.return_value = response
+
+        issuer_universe = load_issuer_etf_universe()
+
+        self.assertTrue(issuer_universe.empty)
+        status = issuer_universe.attrs["workflow_source_status"]
+        self.assertTrue(status)
+        self.assertTrue(all(row["status"] == "parse_error" for row in status))
+        self.assertTrue(all("No product rows" in str(row["error"]) for row in status))
+
+    @patch("leveraged_trader.universe.requests.get")
+    def test_issuer_source_with_valid_zero_leveraged_matches_is_healthy(self, mock_get: Mock) -> None:
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.text = """
+            <table>
+                <tr><th>Ticker</th><th>Fund Name</th></tr>
+                <tr><td>SAFE</td><td>Acme Income ETF</td></tr>
+            </table>
+        """
+        mock_get.return_value = response
+
+        with patch(
+            "leveraged_trader.universe.ISSUER_UNIVERSE_SOURCES",
+            [("Test Issuer", "https://issuer.test")],
+        ):
+            issuer_universe = load_issuer_etf_universe()
+
+        self.assertTrue(issuer_universe.empty)
+        status = issuer_universe.attrs["workflow_source_status"]
+        self.assertEqual(status[0]["status"], "loaded_zero_matches")
+        self.assertEqual(status[0]["parsed_row_count"], 1)
+        self.assertEqual(status[0]["row_count"], 0)
+
+    def test_strict_workflow_source_mode_aborts_after_recording_source_health(self) -> None:
+        nasdaq_rows = pd.DataFrame(
+            [{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"}]
+        )
+        issuer_rows = pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+        issuer_rows.attrs["workflow_source_status"] = [
+            {
+                "source": "Test Issuer",
+                "source_type": "issuer_etf",
+                "url": "https://issuer.test",
+                "status": "error",
+                "row_count": 0,
+                "error": "offline",
+            }
+        ]
+        etn_rows = pd.DataFrame(columns=issuer_rows.columns)
+        etn_rows.attrs["workflow_source_status"] = []
+        with (
+            patch("leveraged_trader.universe.load_current_etf_universe", return_value=nasdaq_rows),
+            patch("leveraged_trader.universe.load_issuer_etf_universe", return_value=issuer_rows),
+            patch("leveraged_trader.universe.load_etn_universe", return_value=etn_rows),
+            patch("leveraged_trader.universe.load_active_listed_symbols", return_value={"TQQQ", "QQQ"}),
+            patch("leveraged_trader.universe.save_table_to_sqlite") as mock_save_table,
+            self.assertRaisesRegex(RuntimeError, "Test Issuer"),
+        ):
+            determine_workflow_assets(
+                UniverseConfig(sqlite_db_path="state.sqlite", require_workflow_source_success=True)
+            )
+
+        self.assertIn(
+            "universe_workflow_source_status",
+            [call.args[2] for call in mock_save_table.call_args_list],
+        )
+
+    def test_parse_error_workflow_source_marks_the_universe_degraded(self) -> None:
+        nasdaq_rows = pd.DataFrame(
+            [{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"}]
+        )
+        issuer_rows = pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+        issuer_rows.attrs["workflow_source_status"] = [
+            {
+                "source": "Test Issuer",
+                "source_type": "issuer_etf",
+                "url": "https://issuer.test",
+                "status": "parse_error",
+                "row_count": 0,
+                "error": "No product rows could be parsed from a successful source response.",
+            }
+        ]
+        etn_rows = pd.DataFrame(columns=issuer_rows.columns)
+        etn_rows.attrs["workflow_source_status"] = []
+
+        with (
+            patch("leveraged_trader.universe.load_current_etf_universe", return_value=nasdaq_rows),
+            patch("leveraged_trader.universe.load_issuer_etf_universe", return_value=issuer_rows),
+            patch("leveraged_trader.universe.load_etn_universe", return_value=etn_rows),
+            patch("leveraged_trader.universe.load_active_listed_symbols", return_value={"TQQQ", "QQQ"}),
+            patch(
+                "leveraged_trader.universe.load_audit_universe_sources",
+                return_value=(pd.DataFrame(), pd.DataFrame()),
+            ),
+            patch("leveraged_trader.universe.save_table_to_sqlite"),
+        ):
+            workflow_assets = determine_workflow_assets(UniverseConfig(sqlite_db_path="state.sqlite"))
+
+        self.assertTrue(workflow_assets.attrs["universe_degraded"])
+        self.assertEqual(workflow_assets.attrs["universe_counts"]["Workflow universe sources failed"], 1)
+
+        with (
+            patch("leveraged_trader.universe.load_current_etf_universe", return_value=nasdaq_rows),
+            patch("leveraged_trader.universe.load_issuer_etf_universe", return_value=issuer_rows),
+            patch("leveraged_trader.universe.load_etn_universe", return_value=etn_rows),
+            patch("leveraged_trader.universe.load_active_listed_symbols", return_value={"TQQQ", "QQQ"}),
+            patch("leveraged_trader.universe.save_table_to_sqlite"),
+            self.assertRaisesRegex(RuntimeError, "Test Issuer"),
+        ):
+            determine_workflow_assets(
+                UniverseConfig(sqlite_db_path="state.sqlite", require_workflow_source_success=True)
+            )
+
+    def test_zero_match_workflow_source_is_healthy_in_strict_mode(self) -> None:
+        nasdaq_rows = pd.DataFrame(
+            [{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"}]
+        )
+        issuer_rows = pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+        issuer_rows.attrs["workflow_source_status"] = [
+            {
+                "source": "Test Issuer",
+                "source_type": "issuer_etf",
+                "url": "https://issuer.test",
+                "status": "loaded_zero_matches",
+                "parsed_row_count": 1,
+                "row_count": 0,
+                "error": "",
+            }
+        ]
+        etn_rows = pd.DataFrame(columns=issuer_rows.columns)
+        etn_rows.attrs["workflow_source_status"] = []
+
+        with (
+            patch("leveraged_trader.universe.load_current_etf_universe", return_value=nasdaq_rows),
+            patch("leveraged_trader.universe.load_issuer_etf_universe", return_value=issuer_rows),
+            patch("leveraged_trader.universe.load_etn_universe", return_value=etn_rows),
+            patch("leveraged_trader.universe.load_active_listed_symbols", return_value={"TQQQ", "QQQ"}),
+            patch(
+                "leveraged_trader.universe.load_audit_universe_sources",
+                return_value=(pd.DataFrame(), pd.DataFrame()),
+            ),
+            patch("leveraged_trader.universe.save_table_to_sqlite"),
+        ):
+            workflow_assets = determine_workflow_assets(
+                UniverseConfig(sqlite_db_path="state.sqlite", require_workflow_source_success=True)
+            )
+
+        self.assertFalse(workflow_assets.attrs["universe_degraded"])
+        self.assertEqual(workflow_assets.attrs["universe_counts"]["Workflow universe sources failed"], 0)
 
 
 if __name__ == "__main__":

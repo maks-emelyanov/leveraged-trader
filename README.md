@@ -6,19 +6,19 @@ This project is intended for research and paper trading. It is not financial adv
 
 ## Features
 
-- Discovers current long leveraged ETFs/ETNs from Nasdaq ETF definitions plus best-effort issuer and ETN pages.
+- Discovers current long leveraged ETFs/ETNs from Nasdaq ETF definitions plus best-effort issuer and ETN pages; source health distinguishes fetch/parser failures from healthy zero-match pages, and issuer-only products are filtered only when both active-listing sources load successfully.
 - Writes audit-only source checks for exchange directories, third-party ETF directories, and SEC EDGAR registry review.
 - Infers an RSI signal symbol from each leveraged ETF name.
 - Downloads daily Yahoo Finance OHLCV data, with optional Tradier fallback for skipped symbols.
 - Optimizes RSI buy thresholds and profit-target sell multiples.
 - Uses a NumPy/Numba-backed optimization loop for the parameter grid.
-- Processes asset workflows concurrently with async orchestration.
+- Downloads asset workflows concurrently with async orchestration while serializing shared SQLite strategy-state updates.
 - Renders width-aware terminal progress and tables with semantic status coloring.
-- Persists strategy state in SQLite for resumable updates.
+- Persists strategy state in SQLite for resumable updates, with transactional cross-process invalidation safety.
 - Writes buy and sell recommendation reports.
-- Submits guarded whole-share Alpaca paper buy market orders by default.
-- Tracks submitted Alpaca buys as managed live positions in SQLite.
-- Submits and renews managed Alpaca GTC limit sells from actual fill price times the original sell multiple.
+- Submits guarded, budget-capped whole-share Alpaca paper buy limit orders by default.
+- Atomically claims a durable Alpaca buy intent before submission, preventing concurrent workers from submitting or closing the same client order ID.
+- Submits and renews managed Alpaca GTC limit sells from actual fill price times the original sell multiple, including partial buy fills.
 - Guards Alpaca buys against already-held symbols, active managed positions, and open buy or sell orders.
 
 ## Quickstart
@@ -35,6 +35,8 @@ Edit `.env` with Alpaca paper credentials before running the default Alpaca subm
 ALPACA_API_KEY_ID=your_alpaca_paper_api_key_id
 ALPACA_API_SECRET_KEY=your_alpaca_paper_api_secret_key
 ALPACA_BASE_URL=https://paper-api.alpaca.markets
+ALPACA_BATCH_CASH_FRACTION=0.10
+ALPACA_BUY_LIMIT_BUFFER_BPS=500
 ALPACA_GTC_SELL_RENEWAL_ENABLED=true
 ALPACA_GTC_SELL_RENEWAL_DAYS_BEFORE_EXPIRATION=7
 TRADIER_ACCESS_TOKEN=your_tradier_access_token
@@ -58,7 +60,7 @@ Rebuild all cached state:
 uv run leveraged-trader --mode rebuild
 ```
 
-Submit paper buys for the current run's recommendations and reconcile managed GTC limit sells:
+Run the paper-trading workflow during the premarket window to submit prior-session signals for that day's open and reconcile managed GTC limit sells:
 
 ```bash
 uv run leveraged-trader
@@ -89,6 +91,8 @@ Common options:
 - `--alpaca-api-secret-key VALUE`: override `ALPACA_API_SECRET_KEY`.
 - `--alpaca-base-url URL`: override `ALPACA_BASE_URL` (defaults to Alpaca paper endpoint).
 - `--alpaca-timeout-seconds INT`: Alpaca request timeout in seconds (default: `30`).
+- `--alpaca-batch-cash-fraction FLOAT`: maximum fraction of cash reserved across one buy batch (default: `0.10`).
+- `--alpaca-buy-limit-buffer-bps FLOAT`: price buffer for whole-share day buy limits in basis points (default: `500`).
 - `--alpaca-gtc-sell-renewal / --no-alpaca-gtc-sell-renewal`: renew managed Alpaca GTC sells before expiration.
 - `--alpaca-gtc-sell-renewal-days-before-expiration INT`: renewal window for managed GTC sells (default: `7`).
 - `--tradier-fallback / --no-tradier-fallback`: enable or skip Tradier fallback for Yahoo-skipped symbols.
@@ -96,6 +100,7 @@ Common options:
 - `--tradier-base-url URL`: override `TRADIER_BASE_URL` (defaults to Tradier production `/v1`).
 - `--tradier-timeout-seconds INT`: Tradier request timeout in seconds (default: `30`).
 - `--workflow-concurrency INT`: maximum number of assets processed concurrently (default: `4`; use `1` for serial behavior).
+- `--require-workflow-source-success / --no-require-workflow-source-success`: fail a universe run after recording source health if an issuer or ETN source fetch or parser failed; a successfully parsed zero-match page remains healthy (default: disabled).
 - `--no-color`: disable colored terminal output.
 
 ## Outputs
@@ -121,7 +126,11 @@ uv run leveraged-trader --output-dir outputs/dev
 
 The SQLite state database defaults to `strategy_state.sqlite`; use `--db` to override it. Universe
 generation also persists `nasdaq_etf_universe`, `universe_audit_rows`,
-`universe_audit_missing_candidates`, and `universe_audit_source_status` tables for source review.
+`universe_audit_missing_candidates`, `universe_audit_source_status`, and
+`universe_workflow_source_status` tables for source review. A source failure or a successful response
+that cannot be parsed leaves the run marked as degraded in terminal output. A successfully parsed
+source with zero leveraged matches remains healthy; use `--require-workflow-source-success` when a
+partial universe caused by a fetch or parser failure is not acceptable.
 
 Terminal output is intentionally compact: concurrent asset work is shown as aggregate progress, then
 the final asset summary is sorted by workflow index. CSV files retain full order IDs and detail, while
@@ -134,6 +143,8 @@ Supported environment variables:
 - `ALPACA_API_KEY_ID`
 - `ALPACA_API_SECRET_KEY`
 - `ALPACA_BASE_URL`
+- `ALPACA_BATCH_CASH_FRACTION`
+- `ALPACA_BUY_LIMIT_BUFFER_BPS`
 - `ALPACA_GTC_SELL_RENEWAL_ENABLED`
 - `ALPACA_GTC_SELL_RENEWAL_DAYS_BEFORE_EXPIRATION`
 - `TRADIER_ACCESS_TOKEN`
@@ -155,24 +166,33 @@ Alpaca submission is enabled by default. Use `--no-alpaca-submit-buy-orders` or 
 
 Buy orders:
 
-- Use 10% of current Alpaca paper account cash to size an integer whole-share `qty`.
-- Are skipped if the 10% cash allocation is below one whole share at the latest price estimate.
+- Reserve at most the configured batch fraction of current Alpaca paper account cash across all submitted buys.
+- Split the batch budget equally across recommendations that pass all live preflight checks (including a quote) and size integer whole-share quantities.
+- Use regular-session day limit orders with a configurable price buffer; a gap beyond the limit safely leaves the order unfilled.
+- Serialize limit prices at Alpaca's valid tick: four decimals below `$1` and two at or above `$1`; buy caps round down and sell targets round up.
+- Are skipped if the allocated batch budget is below one whole share at the protected limit price.
 - Are skipped if the symbol is already held.
 - Are skipped if the symbol already has an active managed position.
 - Are skipped if an open buy or sell order already exists for the symbol.
+- Are submitted only during Alpaca's premarket window, and only when the signal date is the immediately preceding trading session; intraday, after-close, and stale signals are deferred.
 - Use `extended_hours=false` and `time_in_force=day`.
 - Are persisted with the buy RSI and sell multiple that were selected when the buy was submitted.
+- Atomically claim an intent before the request is sent; only that claimant may submit the deterministic client order ID. A timeout, duplicate-ID response, or other ambiguous broker result is recovered by client order ID when possible. A transient broker `404` remains blocked during a short visibility lease before the intent can be closed, preventing another workflow from orphaning an in-flight accepted order. Once that lease expires, only a closed `submission_not_found` record with no broker order ID may be atomically reclaimed for a retry attempt; rejected and other failed submissions remain final.
 
 Managed sell orders:
 
 - Are reconciled from persisted managed buy records, not from the latest optimized sell signal.
 - Use the actual Alpaca filled average buy price times the original sell multiple.
-- Sell the exact filled buy quantity with a managed GTC limit order.
-- Renew active GTC sells before Alpaca's aged-order expiration, keeping the original quantity and frozen target price.
+- Create a protective GTC sell for confirmed whole shares even while the parent buy remains partially filled, and replace it if later buy fills change the covered quantity or average-fill target—even if the prior partial-fill sell already completed.
+- Sell the remaining managed quantity with a GTC limit order; cumulative partial fills remain active until the full buy quantity is closed.
+- Persist the deterministic sell client order ID before broker submission. Ambiguous sell POST outcomes are recovered by client order ID on later reconciliation, and matching open `rsi-exit-...` orders can be reattached to the managed row.
+- Reconcile immediately after each submitted buy batch, so fills can receive their managed sell in the same workflow run.
+- Renew active GTC sells before Alpaca's aged-order expiration, using the remaining managed quantity and frozen target price. The renewal-cancel intent is persisted before requesting cancellation, so a timeout can still be completed after Alpaca later reports the order canceled.
 - Resubmit expired GTC sells when renewal is enabled and the managed position is still open.
 - Are not resubmitted automatically after a sell order is rejected or manually canceled.
 - Skip GTC sell submission for legacy fractional managed quantities and keep the managed position active for review.
-- Keep the managed position active, blocking new buys, until the managed sell is filled.
+- Keep the managed position active, blocking new buys, until cumulative managed sell fills close the full buy quantity.
+- Block automatic renewal and require manual review if Alpaca reports a partial fill without a valid average fill price, or if cumulative sells exceed the managed buy quantity.
 - Use `extended_hours=false` and `time_in_force=gtc`.
 - Persist actual sell fill quantity and average price, then include closed managed positions in `alpaca_realized_pnl.csv`.
 
@@ -184,7 +204,21 @@ Managed position lifecycle:
 - Filled managed sells set `sell_status="filled"`, store actual sell fill data, and populate `closed_at`; rows are retained as trade history.
 - Closed rows missing actual sell fill data are counted as incomplete and excluded from realized P/L totals.
 - Existing Alpaca positions that predate this table are not managed automatically unless imported into `alpaca_managed_positions`.
-- Existing unmanaged Alpaca sell orders still protect against repeat buys while they remain open, but they are not linked to `managed_positions.csv`.
+- Existing unmanaged Alpaca sell orders still protect against repeat buys while they remain open. Deterministic managed exit orders can be linked back to `managed_positions.csv`; unrelated sell orders are not linked automatically.
+
+## Consistency and Concurrency
+
+The risk-free benchmark is forward-filled onto the common asset/signal trading calendar both during
+live processing and when SQLite data is rebuilt into an equity curve. This keeps reported strategy
+days and benchmark returns consistent when the benchmark source has a missing session.
+
+Strategy-state updates use a SQLite immediate transaction and a persisted generation counter. A
+benchmark invalidation and the dependent asset/config updates therefore commit as one serialized
+operation even if two workflow processes use the same database.
+
+If every asset workflow fails, the command exits with an error before it writes reports or submits
+new buys. Partial asset failures remain visible in the final asset summary while successful assets
+continue through the workflow.
 
 ## Development
 

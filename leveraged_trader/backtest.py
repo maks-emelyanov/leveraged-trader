@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 import numpy as np
 import pandas as pd
 
@@ -10,7 +8,7 @@ from .config import BacktestConfig
 
 def performance_summary(
     equity_curve: pd.Series,
-    risk_free_returns: Optional[pd.Series] = None,
+    risk_free_returns: pd.Series | None = None,
 ) -> pd.Series:
     rets = equity_curve.pct_change().dropna()
     if rets.empty:

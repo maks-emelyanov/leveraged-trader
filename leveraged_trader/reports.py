@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
-from typing import Optional
 
 import pandas as pd
 
 from .storage import load_strategy_state, refresh_strategy_summaries_for_asset
-
 
 REALIZED_PNL_COLUMNS = [
     "Closed Positions",
@@ -109,10 +107,11 @@ def summarize_saved_results(
             na_position="last",
         )
 
-    if best_curves:
-        curves = pd.concat(best_curves, axis=1, join="outer", sort=False).sort_index()
-    else:
-        curves = pd.DataFrame()
+    curves = (
+        pd.concat(best_curves, axis=1, join="outer", sort=False).sort_index()
+        if best_curves
+        else pd.DataFrame()
+    )
 
     return optimization_summary, curves
 
@@ -151,7 +150,7 @@ def build_alpaca_realized_pnl_summary(conn: sqlite3.Connection) -> pd.DataFrame:
     positions = pd.read_sql_query(
         """
         SELECT filled_qty, filled_avg_price, sell_filled_qty,
-               sell_filled_avg_price, closed_at
+               sell_filled_avg_price, sold_qty, sold_value, remaining_qty, closed_at
         FROM alpaca_managed_positions
         WHERE closed_at IS NOT NULL
           AND sell_status = 'filled'
@@ -179,20 +178,37 @@ def build_alpaca_realized_pnl_summary(conn: sqlite3.Connection) -> pd.DataFrame:
         "filled_avg_price",
         "sell_filled_qty",
         "sell_filled_avg_price",
+        "sold_qty",
+        "sold_value",
+        "remaining_qty",
     ]
     for column in numeric_columns:
         positions[column] = pd.to_numeric(positions[column], errors="coerce")
 
-    complete = positions.dropna(subset=numeric_columns).copy()
+    positions["effective_sold_qty"] = positions["sold_qty"].where(
+        positions["sold_qty"].gt(0),
+        positions["sell_filled_qty"],
+    )
+    positions["effective_sold_value"] = positions["sold_value"].where(
+        positions["sold_value"].gt(0),
+        positions["sell_filled_qty"] * positions["sell_filled_avg_price"],
+    )
+    positions["effective_remaining_qty"] = positions["remaining_qty"].where(
+        positions["remaining_qty"].notna(),
+        positions["filled_qty"] - positions["effective_sold_qty"],
+    )
+    complete = positions.dropna(
+        subset=["filled_qty", "filled_avg_price", "effective_sold_qty", "effective_sold_value"],
+    ).copy()
     complete = complete[
         complete["filled_qty"].gt(0)
         & complete["filled_avg_price"].gt(0)
-        & complete["sell_filled_qty"].gt(0)
-        & complete["sell_filled_avg_price"].gt(0)
+        & complete["effective_sold_qty"].gt(0)
+        & complete["effective_remaining_qty"].abs().le(1e-8)
     ]
 
     total_buy_cost = float((complete["filled_qty"] * complete["filled_avg_price"]).sum())
-    total_sell_value = float((complete["sell_filled_qty"] * complete["sell_filled_avg_price"]).sum())
+    total_sell_value = float(complete["effective_sold_value"].sum())
     realized_pl = total_sell_value - total_buy_cost
     realized_pl_pct = (realized_pl / total_buy_cost * 100.0) if total_buy_cost > 0 else 0.0
 
@@ -218,7 +234,7 @@ def build_pending_action_report(
     rsi_period: int,
     pending_action_filter: str,
     require_multiple_trades: bool,
-    min_sharpe: Optional[float],
+    min_sharpe: float | None,
 ) -> pd.DataFrame:
     if pending_action_filter not in {"buy", "sell"}:
         raise ValueError(f"Unsupported pending action report: {pending_action_filter}")
@@ -245,9 +261,12 @@ def build_pending_action_report(
         buy_rsi = float(summary_row["Buy RSI"])
         profit_target_multiple = float(summary_row["Sell Return Multiple"])
         trades_executed = int(summary_row["Trades Executed"])
-        sharpe = float(summary_row["Sharpe"])
         if require_multiple_trades and trades_executed <= 1:
             continue
+        try:
+            sharpe = float(summary_row["Sharpe"])
+        except (TypeError, ValueError):
+            sharpe = float("nan")
         if min_sharpe is not None and (pd.isna(sharpe) or sharpe < min_sharpe):
             continue
 

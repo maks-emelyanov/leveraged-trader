@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import asdict, dataclass
 
 import numpy as np
 import pandas as pd
 
 from .backtest import initial_strategy_state
-from .config import BacktestConfig, RISK_FREE_SYMBOL
-from .indicators import compute_rsi_details
+from .config import RISK_FREE_SYMBOL, BacktestConfig
+from .indicators import compute_rsi_details, rsi_value_from_average_gain_loss
 from .optimized_backtest import (
     ACTION_BUY,
     ACTION_NONE,
@@ -17,7 +18,6 @@ from .optimized_backtest import (
     run_grid_summary,
     run_single_equity_curve,
 )
-
 
 SUMMARY_ROLLUP_COLUMNS = {
     "first_equity": "REAL",
@@ -33,6 +33,8 @@ SUMMARY_ROLLUP_COLUMNS = {
 }
 
 ALPACA_MANAGED_POSITION_COLUMNS = {
+    "buy_submission_claimed_at": "TEXT",
+    "buy_submission_attempt_count": "INTEGER NOT NULL DEFAULT 1",
     "sell_expires_at": "TEXT",
     "sell_renewal_count": "INTEGER NOT NULL DEFAULT 0",
     "sell_renewal_requested_at": "TEXT",
@@ -41,14 +43,21 @@ ALPACA_MANAGED_POSITION_COLUMNS = {
     "sell_filled_at": "TEXT",
     "realized_pl": "REAL",
     "realized_pl_pct": "REAL",
+    "sold_qty": "REAL NOT NULL DEFAULT 0",
+    "sold_value": "REAL NOT NULL DEFAULT 0",
+    "remaining_qty": "REAL",
 }
+
+STRATEGY_STATE_SCHEMA_VERSION = 2
+_MARKET_DATA_FIELDS = ("Open", "High", "Low", "Close", "Volume")
+SQLITE_BUSY_TIMEOUT_MS = 60_000
 
 
 @dataclass
 class SummaryRollup:
-    first_equity: Optional[float] = None
-    last_equity: Optional[float] = None
-    running_max_equity: Optional[float] = None
+    first_equity: float | None = None
+    last_equity: float | None = None
+    running_max_equity: float | None = None
     return_count: int = 0
     return_sum: float = 0.0
     return_sum_squares: float = 0.0
@@ -56,7 +65,7 @@ class SummaryRollup:
     excess_return_sum: float = 0.0
     excess_return_sum_squares: float = 0.0
     positive_return_count: int = 0
-    max_drawdown: Optional[float] = None
+    max_drawdown: float | None = None
 
     @property
     def trading_days(self) -> int:
@@ -64,7 +73,8 @@ class SummaryRollup:
 
 
 def save_table_to_sqlite(df: pd.DataFrame, db_path: str, table_name: str) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000) as conn:
+        conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
         df.to_sql(table_name, conn, if_exists="replace", index=False)
 
 
@@ -159,6 +169,21 @@ def init_state_db(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (symbol, date)
         );
 
+        CREATE TABLE IF NOT EXISTS strategy_config (
+            asset_symbol TEXT NOT NULL,
+            signal_symbol TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            PRIMARY KEY (asset_symbol, signal_symbol)
+        );
+
+        CREATE TABLE IF NOT EXISTS strategy_state_generation (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            generation INTEGER NOT NULL
+        );
+
+        INSERT OR IGNORE INTO strategy_state_generation (id, generation)
+        VALUES (1, 0);
+
         CREATE TABLE IF NOT EXISTS alpaca_managed_positions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT NOT NULL,
@@ -169,6 +194,8 @@ def init_state_db(conn: sqlite3.Connection) -> None:
             buy_client_order_id TEXT NOT NULL UNIQUE,
             buy_alpaca_order_id TEXT,
             buy_submitted_at TEXT,
+            buy_submission_claimed_at TEXT,
+            buy_submission_attempt_count INTEGER NOT NULL DEFAULT 1,
             buy_status TEXT NOT NULL,
             filled_qty REAL,
             filled_avg_price REAL,
@@ -186,10 +213,21 @@ def init_state_db(conn: sqlite3.Connection) -> None:
             sell_filled_at TEXT,
             realized_pl REAL,
             realized_pl_pct REAL,
+            sold_qty REAL NOT NULL DEFAULT 0,
+            sold_value REAL NOT NULL DEFAULT 0,
+            remaining_qty REAL,
             closed_at TEXT,
             notes TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS alpaca_managed_sell_fills (
+            managed_position_id INTEGER NOT NULL,
+            alpaca_order_id TEXT NOT NULL,
+            filled_qty REAL NOT NULL,
+            filled_value REAL NOT NULL,
+            PRIMARY KEY (managed_position_id, alpaca_order_id)
         );
         """
     )
@@ -222,6 +260,132 @@ def _date_str(value: object) -> str:
     return pd.Timestamp(value).date().isoformat()
 
 
+def strategy_config_fingerprint(
+    base_cfg: BacktestConfig,
+    buy_rsi_values: list[float],
+    profit_target_values: list[float],
+) -> str:
+    """Return a stable identity for every setting that changes a simulation."""
+    payload = {
+        "schema_version": STRATEGY_STATE_SCHEMA_VERSION,
+        "backtest": asdict(base_cfg),
+        "buy_rsi_values": sorted({float(value) for value in buy_rsi_values}),
+        "profit_target_values": sorted({float(value) for value in profit_target_values}),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _strategy_config_pairs(
+    buy_rsi_values: list[float],
+    profit_target_values: list[float],
+) -> set[tuple[float, float]]:
+    return {
+        (float(buy_rsi), float(profit_target_multiple))
+        for buy_rsi in buy_rsi_values
+        for profit_target_multiple in profit_target_values
+    }
+
+
+def strategy_state_matches_config(
+    conn: sqlite3.Connection,
+    asset_symbol: str,
+    signal_symbol: str,
+    base_cfg: BacktestConfig,
+    buy_rsi_values: list[float],
+    profit_target_values: list[float],
+) -> bool:
+    """Whether persisted state exactly matches the requested simulation setup."""
+    expected_pairs = _strategy_config_pairs(buy_rsi_values, profit_target_values)
+    if not expected_pairs:
+        return False
+
+    fingerprint = strategy_config_fingerprint(base_cfg, buy_rsi_values, profit_target_values)
+    if not strategy_config_matches_fingerprint(conn, asset_symbol, signal_symbol, fingerprint):
+        return False
+
+    rows = conn.execute(
+        """
+        SELECT buy_rsi, profit_target_multiple
+        FROM strategy_state
+        WHERE asset_symbol = ? AND signal_symbol = ?
+        """,
+        (asset_symbol, signal_symbol),
+    ).fetchall()
+    actual_pairs = {(float(row[0]), float(row[1])) for row in rows}
+    return actual_pairs == expected_pairs
+
+
+def strategy_config_matches_fingerprint(
+    conn: sqlite3.Connection,
+    asset_symbol: str,
+    signal_symbol: str,
+    fingerprint: str,
+) -> bool:
+    config_row = conn.execute(
+        """
+        SELECT fingerprint
+        FROM strategy_config
+        WHERE asset_symbol = ? AND signal_symbol = ?
+        """,
+        (asset_symbol, signal_symbol),
+    ).fetchone()
+    return config_row is not None and str(config_row[0]) == fingerprint
+
+
+def save_strategy_config(
+    conn: sqlite3.Connection,
+    asset_symbol: str,
+    signal_symbol: str,
+    fingerprint: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO strategy_config (asset_symbol, signal_symbol, fingerprint)
+        VALUES (?, ?, ?)
+        ON CONFLICT(asset_symbol, signal_symbol) DO UPDATE SET fingerprint = excluded.fingerprint
+        """,
+        (asset_symbol, signal_symbol, fingerprint),
+    )
+
+
+def _market_values_differ(existing: object, incoming: object) -> bool:
+    if existing is None or pd.isna(existing):
+        return incoming is not None and not pd.isna(incoming)
+    if incoming is None or pd.isna(incoming):
+        return True
+    return not bool(np.isclose(float(existing), float(incoming), rtol=1e-12, atol=1e-12))
+
+
+def _revised_market_symbols(
+    conn: sqlite3.Connection,
+    data: pd.DataFrame,
+    symbols: list[str],
+) -> set[str]:
+    """Detect corrections to an already persisted session before overwriting it."""
+    if data.empty:
+        return set()
+
+    revised_symbols: set[str] = set()
+    for date, row in data.iterrows():
+        date_str = _date_str(date)
+        for symbol in symbols:
+            existing = conn.execute(
+                """
+                SELECT open, high, low, close, volume
+                FROM market_data
+                WHERE symbol = ? AND date = ?
+                """,
+                (symbol, date_str),
+            ).fetchone()
+            if existing is None:
+                continue
+            incoming = [row.get(f"{symbol}_{field}") for field in _MARKET_DATA_FIELDS]
+            if any(_market_values_differ(old, new) for old, new in zip(existing, incoming, strict=True)):
+                revised_symbols.add(symbol)
+    return revised_symbols
+
+
 def save_market_data(conn: sqlite3.Connection, data: pd.DataFrame, symbols: list[str]) -> None:
     rows = []
     for date, row in data.iterrows():
@@ -247,7 +411,54 @@ def save_market_data(conn: sqlite3.Connection, data: pd.DataFrame, symbols: list
         """,
         rows,
     )
-    conn.commit()
+
+
+def _synchronize_market_data_history(
+    conn: sqlite3.Connection,
+    data: pd.DataFrame,
+    symbol: str,
+) -> bool:
+    """Persist a complete single-symbol history and remove vanished sessions.
+
+    This helper is deliberately used only with provider histories that are
+    known to be complete.  Tail updates are not authoritative: treating those
+    as complete would erase otherwise valid older bars.
+    """
+    if data.empty:
+        return False
+
+    expected_columns = {f"{symbol}_{field}" for field in _MARKET_DATA_FIELDS}
+    missing_columns = expected_columns.difference(data.columns)
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise ValueError(f"Authoritative {symbol} history is missing required columns: {missing}.")
+
+    existing_dates = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT date FROM market_data WHERE symbol = ?",
+            (symbol,),
+        ).fetchall()
+    }
+    revised = bool(_revised_market_symbols(conn, data, [symbol]))
+    incoming_dates = {_date_str(date) for date in data.index}
+    removed_dates = existing_dates.difference(incoming_dates)
+    # A new tail date is a normal incremental update.  A newly discovered date
+    # at or before the prior tail changes historical inputs and needs replay.
+    prior_tail = max(existing_dates) if existing_dates else None
+    historical_additions = {
+        date
+        for date in incoming_dates.difference(existing_dates)
+        if prior_tail is not None and date <= prior_tail
+    }
+    if removed_dates:
+        conn.executemany(
+            "DELETE FROM market_data WHERE symbol = ? AND date = ?",
+            [(symbol, date) for date in removed_dates],
+        )
+
+    save_market_data(conn, data, [symbol])
+    return revised or bool(removed_dates) or bool(historical_additions)
 
 
 def save_rsi_values(
@@ -276,7 +487,6 @@ def save_rsi_values(
         """,
         rows,
     )
-    conn.commit()
 
 
 def load_rsi_series_for_dates(
@@ -368,13 +578,7 @@ def ensure_rsi_values(
         loss = max(-delta, 0.0)
         avg_gain = (1 - alpha) * avg_gain + alpha * gain
         avg_loss = (1 - alpha) * avg_loss + alpha * loss
-        if avg_loss == 0:
-            rsi = 100.0
-        elif avg_gain == 0:
-            rsi = 0.0
-        else:
-            rs = avg_gain / avg_loss
-            rsi = 100 - (100 / (1 + rs))
+        rsi = rsi_value_from_average_gain_loss(avg_gain, avg_loss)
         rows.append(
             (
                 signal_symbol,
@@ -396,7 +600,6 @@ def ensure_rsi_values(
         """,
         rows,
     )
-    conn.commit()
     return load_rsi_series_for_dates(conn, signal_symbol, rsi_period, close.index)
 
 
@@ -406,7 +609,7 @@ def load_strategy_state(
     signal_symbol: str,
     buy_rsi: float,
     profit_target_multiple: float,
-) -> Optional[dict]:
+) -> dict | None:
     row = conn.execute(
         """
         SELECT start_date, last_date, cash, shares, in_position, entry_price,
@@ -477,21 +680,35 @@ def save_alpaca_managed_buy_order(
     profit_target_multiple: float,
     buy_signal_date: str,
     buy_client_order_id: str,
-    buy_alpaca_order_id: Optional[str],
-    buy_submitted_at: Optional[str],
+    buy_alpaca_order_id: str | None,
+    buy_submitted_at: str | None,
     buy_status: str,
-    notes: Optional[str] = None,
-) -> None:
+    notes: str | None = None,
+) -> int:
+    """Persist an observed broker state for a managed buy intent.
+
+    New submissions must use ``claim_alpaca_managed_buy_intent`` first.  This
+    helper intentionally remains an upsert because it is used after Alpaca has
+    authoritatively identified an existing order by client order ID.
+    """
     conn.execute(
         """
         INSERT INTO alpaca_managed_positions
         (symbol, signal_symbol, buy_rsi, profit_target_multiple, buy_signal_date,
-         buy_client_order_id, buy_alpaca_order_id, buy_submitted_at, buy_status, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         buy_client_order_id, buy_alpaca_order_id, buy_submitted_at,
+         buy_submission_claimed_at, buy_status, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
         ON CONFLICT(buy_client_order_id) DO UPDATE SET
             buy_alpaca_order_id = COALESCE(excluded.buy_alpaca_order_id, buy_alpaca_order_id),
             buy_submitted_at = COALESCE(excluded.buy_submitted_at, buy_submitted_at),
             buy_status = excluded.buy_status,
+            closed_at = CASE
+                WHEN excluded.buy_alpaca_order_id IS NOT NULL
+                     AND LOWER(excluded.buy_status) NOT IN
+                         ('canceled', 'done_for_day', 'expired', 'rejected', 'stopped', 'suspended')
+                    THEN NULL
+                ELSE closed_at
+            END,
             notes = COALESCE(excluded.notes, notes),
             updated_at = CURRENT_TIMESTAMP
         """,
@@ -509,6 +726,106 @@ def save_alpaca_managed_buy_order(
         ),
     )
     conn.commit()
+    row = conn.execute(
+        "SELECT id FROM alpaca_managed_positions WHERE buy_client_order_id = ?",
+        (buy_client_order_id,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("Managed Alpaca buy position was not persisted.")
+    return int(row[0])
+
+
+def claim_alpaca_managed_buy_intent(
+    conn: sqlite3.Connection,
+    *,
+    symbol: str,
+    signal_symbol: str,
+    buy_rsi: float,
+    profit_target_multiple: float,
+    buy_signal_date: str,
+    buy_client_order_id: str,
+    allow_retry_after_not_found: bool = False,
+) -> tuple[int, bool]:
+    """Atomically claim a managed-buy client order ID.
+
+    Returns ``(position_id, True)`` only for the process that inserted the
+    intent or reactivated a verified missing submission.  A retry is allowed
+    only when the caller has already confirmed that Alpaca cannot find the
+    deterministic client order ID.  Competing processes receive the existing
+    ID without changing its broker state.
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO alpaca_managed_positions
+        (symbol, signal_symbol, buy_rsi, profit_target_multiple, buy_signal_date,
+         buy_client_order_id, buy_submission_claimed_at, buy_status, notes)
+        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'submission_pending', ?)
+        ON CONFLICT(buy_client_order_id) DO NOTHING
+        """,
+        (
+            symbol,
+            signal_symbol,
+            buy_rsi,
+            profit_target_multiple,
+            buy_signal_date,
+            buy_client_order_id,
+            "managed buy submission intent persisted before broker request",
+        ),
+    )
+    claimed = cursor.rowcount == 1
+    if not claimed and allow_retry_after_not_found:
+        retry_cursor = conn.execute(
+            """
+            UPDATE alpaca_managed_positions
+            SET buy_status = 'submission_pending',
+                buy_submission_claimed_at = CURRENT_TIMESTAMP,
+                buy_submission_attempt_count = buy_submission_attempt_count + 1,
+                closed_at = NULL,
+                notes = 'managed buy submission retry claimed after Alpaca did not find the client order ID',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE buy_client_order_id = ?
+              AND buy_status = 'submission_not_found'
+              AND buy_alpaca_order_id IS NULL
+              AND filled_qty IS NULL
+              AND sell_client_order_id IS NULL
+              AND closed_at IS NOT NULL
+            """,
+            (buy_client_order_id,),
+        )
+        claimed = retry_cursor.rowcount == 1
+    conn.commit()
+    row = conn.execute(
+        "SELECT id FROM alpaca_managed_positions WHERE buy_client_order_id = ?",
+        (buy_client_order_id,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("Managed Alpaca buy position was not persisted.")
+    return int(row[0]), claimed
+
+
+def fail_alpaca_managed_buy_submission_if_pending(
+    conn: sqlite3.Connection,
+    position_id: int,
+    *,
+    notes: str,
+) -> bool:
+    """Close only the still-unsubmitted intent owned by this submit attempt."""
+    cursor = conn.execute(
+        """
+        UPDATE alpaca_managed_positions
+        SET buy_status = 'submission_failed',
+            closed_at = CURRENT_TIMESTAMP,
+            notes = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND buy_status = 'submission_pending'
+          AND buy_alpaca_order_id IS NULL
+          AND closed_at IS NULL
+        """,
+        (notes, position_id),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
 
 
 def load_alpaca_managed_positions(conn: sqlite3.Connection, *, active_only: bool = False) -> pd.DataFrame:
@@ -517,12 +834,13 @@ def load_alpaca_managed_positions(conn: sqlite3.Connection, *, active_only: bool
         f"""
         SELECT id, symbol, signal_symbol, buy_rsi, profit_target_multiple,
                buy_signal_date, buy_client_order_id, buy_alpaca_order_id,
-               buy_submitted_at, buy_status, filled_qty, filled_avg_price,
+               buy_submitted_at, buy_submission_claimed_at, buy_submission_attempt_count,
+               buy_status, filled_qty, filled_avg_price,
                filled_at, target_sell_price, sell_client_order_id,
                sell_alpaca_order_id, sell_submitted_at, sell_status,
                sell_expires_at, sell_renewal_count, sell_renewal_requested_at,
                sell_filled_qty, sell_filled_avg_price, sell_filled_at,
-               realized_pl, realized_pl_pct,
+               realized_pl, realized_pl_pct, sold_qty, sold_value, remaining_qty,
                closed_at, notes, created_at, updated_at
         FROM alpaca_managed_positions
         {where}
@@ -548,9 +866,9 @@ def update_alpaca_managed_buy_status(
     position_id: int,
     *,
     buy_status: str,
-    buy_alpaca_order_id: Optional[str] = None,
-    buy_submitted_at: Optional[str] = None,
-    notes: Optional[str] = None,
+    buy_alpaca_order_id: str | None = None,
+    buy_submitted_at: str | None = None,
+    notes: str | None = None,
 ) -> None:
     conn.execute(
         """
@@ -558,11 +876,25 @@ def update_alpaca_managed_buy_status(
         SET buy_status = ?,
             buy_alpaca_order_id = COALESCE(?, buy_alpaca_order_id),
             buy_submitted_at = COALESCE(?, buy_submitted_at),
+            closed_at = CASE
+                WHEN ? IS NOT NULL
+                     AND LOWER(?) NOT IN ('canceled', 'done_for_day', 'expired', 'rejected', 'stopped', 'suspended')
+                    THEN NULL
+                ELSE closed_at
+            END,
             notes = COALESCE(?, notes),
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
-        (buy_status, buy_alpaca_order_id, buy_submitted_at, notes, position_id),
+        (
+            buy_status,
+            buy_alpaca_order_id,
+            buy_submitted_at,
+            buy_alpaca_order_id,
+            buy_status,
+            notes,
+            position_id,
+        ),
     )
     conn.commit()
 
@@ -574,11 +906,11 @@ def mark_alpaca_managed_buy_filled(
     buy_status: str,
     filled_qty: float,
     filled_avg_price: float,
-    filled_at: Optional[str],
+    filled_at: str | None,
     target_sell_price: float,
-    buy_alpaca_order_id: Optional[str] = None,
-    buy_submitted_at: Optional[str] = None,
-    notes: Optional[str] = None,
+    buy_alpaca_order_id: str | None = None,
+    buy_submitted_at: str | None = None,
+    notes: str | None = None,
 ) -> None:
     conn.execute(
         """
@@ -586,6 +918,12 @@ def mark_alpaca_managed_buy_filled(
         SET buy_status = ?,
             buy_alpaca_order_id = COALESCE(?, buy_alpaca_order_id),
             buy_submitted_at = COALESCE(?, buy_submitted_at),
+            closed_at = CASE
+                WHEN ? IS NOT NULL
+                     AND LOWER(?) NOT IN ('canceled', 'done_for_day', 'expired', 'rejected', 'stopped', 'suspended')
+                    THEN NULL
+                ELSE closed_at
+            END,
             filled_qty = ?,
             filled_avg_price = ?,
             filled_at = COALESCE(?, filled_at),
@@ -598,6 +936,8 @@ def mark_alpaca_managed_buy_filled(
             buy_status,
             buy_alpaca_order_id,
             buy_submitted_at,
+            buy_alpaca_order_id,
+            buy_status,
             filled_qty,
             filled_avg_price,
             filled_at,
@@ -614,12 +954,12 @@ def record_alpaca_managed_sell_order(
     position_id: int,
     *,
     sell_client_order_id: str,
-    sell_alpaca_order_id: Optional[str],
-    sell_submitted_at: Optional[str],
+    sell_alpaca_order_id: str | None,
+    sell_submitted_at: str | None,
     sell_status: str,
-    sell_expires_at: Optional[str] = None,
+    sell_expires_at: str | None = None,
     increment_renewal_count: bool = False,
-    notes: Optional[str] = None,
+    notes: str | None = None,
 ) -> None:
     conn.execute(
         """
@@ -654,11 +994,11 @@ def update_alpaca_managed_sell_status(
     position_id: int,
     *,
     sell_status: str,
-    sell_alpaca_order_id: Optional[str] = None,
-    sell_submitted_at: Optional[str] = None,
-    sell_expires_at: Optional[str] = None,
-    sell_renewal_requested_at: Optional[str] = None,
-    notes: Optional[str] = None,
+    sell_alpaca_order_id: str | None = None,
+    sell_submitted_at: str | None = None,
+    sell_expires_at: str | None = None,
+    sell_renewal_requested_at: str | None = None,
+    notes: str | None = None,
 ) -> None:
     conn.execute(
         """
@@ -692,12 +1032,13 @@ def mark_alpaca_managed_sell_filled(
     sell_status: str,
     sell_filled_qty: float,
     sell_filled_avg_price: float,
-    sell_filled_at: Optional[str],
-    sell_alpaca_order_id: Optional[str] = None,
-    sell_submitted_at: Optional[str] = None,
-    sell_expires_at: Optional[str] = None,
-    notes: Optional[str] = None,
-) -> None:
+    sell_filled_at: str | None,
+    sell_alpaca_order_id: str | None = None,
+    sell_submitted_at: str | None = None,
+    sell_expires_at: str | None = None,
+    notes: str | None = None,
+) -> float:
+    """Record an order's cumulative fills and return the remaining buy quantity."""
     row = conn.execute(
         """
         SELECT filled_qty, filled_avg_price
@@ -711,13 +1052,52 @@ def mark_alpaca_managed_sell_filled(
 
     buy_qty = None if row[0] is None else float(row[0])
     buy_avg_price = None if row[1] is None else float(row[1])
-    realized_pl = None
-    realized_pl_pct = None
-    if buy_qty is not None and buy_avg_price is not None and buy_qty > 0 and buy_avg_price > 0:
-        buy_cost = buy_qty * buy_avg_price
-        sell_value = float(sell_filled_qty) * float(sell_filled_avg_price)
-        realized_pl = sell_value - buy_cost
-        realized_pl_pct = realized_pl / buy_cost * 100.0
+    if buy_qty is None or buy_avg_price is None or buy_qty <= 0 or buy_avg_price <= 0:
+        raise ValueError(f"Managed Alpaca position {position_id} is missing a valid filled buy quantity or price.")
+
+    order_key = sell_alpaca_order_id or f"legacy-{position_id}"
+    observed_qty = float(sell_filled_qty)
+    observed_value = observed_qty * float(sell_filled_avg_price)
+    prior = conn.execute(
+        """
+        SELECT filled_qty, filled_value
+        FROM alpaca_managed_sell_fills
+        WHERE managed_position_id = ? AND alpaca_order_id = ?
+        """,
+        (position_id, order_key),
+    ).fetchone()
+    if prior is not None and observed_qty + 1e-8 < float(prior[0]):
+        raise ValueError("Alpaca sell filled quantity moved backwards for a managed order.")
+
+    conn.execute(
+        """
+        INSERT INTO alpaca_managed_sell_fills
+        (managed_position_id, alpaca_order_id, filled_qty, filled_value)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(managed_position_id, alpaca_order_id) DO UPDATE SET
+            filled_qty = excluded.filled_qty,
+            filled_value = excluded.filled_value
+        """,
+        (position_id, order_key, observed_qty, observed_value),
+    )
+    totals = conn.execute(
+        """
+        SELECT COALESCE(SUM(filled_qty), 0), COALESCE(SUM(filled_value), 0)
+        FROM alpaca_managed_sell_fills
+        WHERE managed_position_id = ?
+        """,
+        (position_id,),
+    ).fetchone()
+    sold_qty = float(totals[0])
+    sold_value = float(totals[1])
+    # Keep an overfill visible to the reconciler instead of silently treating it
+    # as a completed managed position.  A negative remaining quantity requires
+    # manual review; automatically closing it would conceal a possible short.
+    remaining_qty = buy_qty - sold_qty
+    matched_qty = min(sold_qty, buy_qty)
+    realized_pl = sold_value - matched_qty * buy_avg_price
+    realized_pl_pct = realized_pl / (matched_qty * buy_avg_price) * 100.0 if matched_qty > 0 else None
+    cumulative_sell_avg_price = sold_value / sold_qty if sold_qty > 0 else None
 
     conn.execute(
         """
@@ -729,6 +1109,9 @@ def mark_alpaca_managed_sell_filled(
             sell_filled_qty = ?,
             sell_filled_avg_price = ?,
             sell_filled_at = COALESCE(?, sell_filled_at),
+            sold_qty = ?,
+            sold_value = ?,
+            remaining_qty = ?,
             realized_pl = ?,
             realized_pl_pct = ?,
             notes = COALESCE(?, notes),
@@ -740,9 +1123,12 @@ def mark_alpaca_managed_sell_filled(
             sell_alpaca_order_id,
             sell_submitted_at,
             sell_expires_at,
-            sell_filled_qty,
-            sell_filled_avg_price,
+            sold_qty,
+            cumulative_sell_avg_price,
             sell_filled_at,
+            sold_qty,
+            sold_value,
+            remaining_qty,
             realized_pl,
             realized_pl_pct,
             notes,
@@ -750,14 +1136,15 @@ def mark_alpaca_managed_sell_filled(
         ),
     )
     conn.commit()
+    return remaining_qty
 
 
 def close_alpaca_managed_position(
     conn: sqlite3.Connection,
     position_id: int,
     *,
-    closed_at: Optional[str],
-    notes: Optional[str] = None,
+    closed_at: str | None,
+    notes: str | None = None,
 ) -> None:
     conn.execute(
         """
@@ -847,7 +1234,7 @@ def _sample_variance(count: int, total: float, total_squares: float) -> float:
     return max(variance, 0.0)
 
 
-def _rollup_metrics(rollup: SummaryRollup) -> dict[str, Optional[float]]:
+def _rollup_metrics(rollup: SummaryRollup) -> dict[str, float | None]:
     if rollup.first_equity is None or rollup.last_equity is None or rollup.return_count <= 0:
         return {
             "total_return": None,
@@ -964,7 +1351,7 @@ def _load_strategy_summary_rollup(
     signal_symbol: str,
     buy_rsi: float,
     profit_target_multiple: float,
-) -> Optional[SummaryRollup]:
+) -> SummaryRollup | None:
     row = conn.execute(
         """
         SELECT first_equity, last_equity, running_max_equity, return_count,
@@ -1002,7 +1389,7 @@ def _load_legacy_equity_rollup(
     signal_symbol: str,
     buy_rsi: float,
     profit_target_multiple: float,
-) -> Optional[SummaryRollup]:
+) -> SummaryRollup | None:
     equity_df = pd.read_sql_query(
         """
         SELECT date, equity, risk_free_return
@@ -1099,7 +1486,7 @@ def save_strategy_summary(
     )
 
 
-def _nullable_float(value: object) -> Optional[float]:
+def _nullable_float(value: object) -> float | None:
     return None if pd.isna(value) else float(value)
 
 
@@ -1155,7 +1542,6 @@ def refresh_strategy_summaries_for_asset(
         (float(row.buy_rsi), float(row.profit_target_multiple)): row
         for row in states.itertuples(index=False)
     }
-    wrote_any = False
     grouped = equity_df.groupby(["buy_rsi", "profit_target_multiple"], sort=False)
     for (buy_rsi, profit_target_multiple), group in grouped:
         state = state_by_config.get((float(buy_rsi), float(profit_target_multiple)))
@@ -1177,18 +1563,48 @@ def refresh_strategy_summaries_for_asset(
             },
             rollup,
         )
-        wrote_any = True
-
-    if wrote_any:
-        conn.commit()
-
-
 def clear_asset_state(conn: sqlite3.Connection, asset_symbol: str, signal_symbol: str) -> None:
     params = (asset_symbol, signal_symbol)
     conn.execute("DELETE FROM strategy_state WHERE asset_symbol = ? AND signal_symbol = ?", params)
     conn.execute("DELETE FROM strategy_equity WHERE asset_symbol = ? AND signal_symbol = ?", params)
     conn.execute("DELETE FROM strategy_summary WHERE asset_symbol = ? AND signal_symbol = ?", params)
-    conn.commit()
+    conn.execute("DELETE FROM strategy_config WHERE asset_symbol = ? AND signal_symbol = ?", params)
+
+
+def clear_signal_state(conn: sqlite3.Connection, signal_symbol: str) -> None:
+    """Invalidate every strategy that depends on a corrected RSI symbol."""
+    conn.execute("DELETE FROM strategy_state WHERE signal_symbol = ?", (signal_symbol,))
+    conn.execute("DELETE FROM strategy_equity WHERE signal_symbol = ?", (signal_symbol,))
+    conn.execute("DELETE FROM strategy_summary WHERE signal_symbol = ?", (signal_symbol,))
+    conn.execute("DELETE FROM strategy_config WHERE signal_symbol = ?", (signal_symbol,))
+
+
+def strategy_state_generation(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT generation FROM strategy_state_generation WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO strategy_state_generation (id, generation) VALUES (1, 0)"
+        )
+        return 0
+    return int(row[0])
+
+
+def _bump_strategy_state_generation(conn: sqlite3.Connection) -> int:
+    conn.execute(
+        "UPDATE strategy_state_generation SET generation = generation + 1 WHERE id = 1"
+    )
+    return strategy_state_generation(conn)
+
+
+def clear_all_strategy_state(conn: sqlite3.Connection) -> None:
+    """Invalidate all simulations after a shared benchmark correction."""
+    conn.execute("DELETE FROM strategy_state")
+    conn.execute("DELETE FROM strategy_equity")
+    conn.execute("DELETE FROM strategy_summary")
+    conn.execute("DELETE FROM strategy_config")
+    _bump_strategy_state_generation(conn)
 
 
 def expected_state_count(
@@ -1212,7 +1628,7 @@ def earliest_state_date(
     conn: sqlite3.Connection,
     asset_symbol: str,
     signal_symbol: str,
-) -> Optional[str]:
+) -> str | None:
     row = conn.execute(
         """
         SELECT MIN(last_date)
@@ -1241,7 +1657,7 @@ def load_saved_market_data(conn: sqlite3.Connection, symbols: list[str]) -> pd.D
     if raw.empty:
         return pd.DataFrame()
 
-    frames = []
+    frames_by_symbol: dict[str, pd.DataFrame] = {}
     for symbol in symbols:
         group = raw[raw["symbol"].eq(symbol)].copy()
         if group.empty:
@@ -1254,9 +1670,40 @@ def load_saved_market_data(conn: sqlite3.Connection, symbols: list[str]) -> pd.D
             f"{symbol}_Close",
             f"{symbol}_Volume",
         ]
-        frames.append(group)
+        frames_by_symbol[symbol] = group
 
-    return pd.concat(frames, axis=1, join="inner").dropna().sort_index()
+    risk_free = frames_by_symbol.pop(RISK_FREE_SYMBOL, None)
+    if frames_by_symbol:
+        out = pd.concat(list(frames_by_symbol.values()), axis=1, join="inner").dropna().sort_index()
+    elif risk_free is not None:
+        return risk_free.sort_index()
+    else:
+        return pd.DataFrame()
+
+    if risk_free is not None:
+        # Match load_strategy_data: benchmark gaps must not change the asset
+        # and signal trading calendar during a saved-state rebuild.
+        out = out.join(risk_free, how="left")
+        out[risk_free.columns] = out[risk_free.columns].ffill()
+    return out
+
+
+def load_saved_close_series(conn: sqlite3.Connection, symbol: str) -> pd.Series:
+    rows = pd.read_sql_query(
+        """
+        SELECT date, close
+        FROM market_data
+        WHERE symbol = ?
+          AND close IS NOT NULL
+        ORDER BY date
+        """,
+        conn,
+        params=(symbol,),
+        parse_dates=["date"],
+    )
+    if rows.empty:
+        return pd.Series(dtype=float)
+    return rows.set_index("date")["close"].astype(float)
 
 
 def _action_code(action: object) -> int:
@@ -1384,7 +1831,7 @@ def _best_summary_config(
     conn: sqlite3.Connection,
     asset_symbol: str,
     signal_symbol: str,
-) -> Optional[tuple[float, float]]:
+) -> tuple[float, float] | None:
     row = conn.execute(
         """
         SELECT buy_rsi, profit_target_multiple
@@ -1530,18 +1977,90 @@ def process_asset_grid(
     buy_rsi_values: list[float],
     profit_target_values: list[float],
     rebuild: bool,
+    signal_history: pd.DataFrame | None = None,
+    strategy_fingerprint: str | None = None,
+    authoritative_histories: dict[str, pd.DataFrame] | None = None,
+    commit: bool = True,
 ) -> None:
+    symbols = list(dict.fromkeys([asset_symbol, signal_symbol, RISK_FREE_SYMBOL]))
+    expected_state_generation = strategy_state_generation(conn)
+    strategy_fingerprint = strategy_fingerprint or strategy_config_fingerprint(
+        base_cfg,
+        buy_rsi_values,
+        profit_target_values,
+    )
+    config_is_current = strategy_config_matches_fingerprint(
+        conn,
+        asset_symbol,
+        signal_symbol,
+        strategy_fingerprint,
+    )
+    if authoritative_histories is not None:
+        authoritative_symbols = set(authoritative_histories)
+        unexpected_symbols = authoritative_symbols.difference(symbols)
+        if unexpected_symbols:
+            unexpected = ", ".join(sorted(unexpected_symbols))
+            raise ValueError(f"Unexpected authoritative market symbols: {unexpected}.")
+
+        revised_symbols = set()
+        for symbol, history in authoritative_histories.items():
+            if _synchronize_market_data_history(conn, history, symbol) and not rebuild:
+                revised_symbols.add(symbol)
+
+        # The complete histories above are canonical.  Only retain the legacy
+        # merged-frame save for symbols without a canonical history.
+        fallback_symbols = [symbol for symbol in symbols if symbol not in authoritative_symbols]
+        if fallback_symbols:
+            save_market_data(conn, data, fallback_symbols)
+        signal_history_revisions = set()
+    else:
+        revised_symbols = set() if rebuild else _revised_market_symbols(conn, data, symbols)
+        signal_history_revisions = (
+            set()
+            if rebuild or signal_history is None
+            else _revised_market_symbols(conn, signal_history, [signal_symbol])
+        )
+        save_market_data(conn, data, symbols)
+        if signal_history is not None:
+            save_market_data(conn, signal_history, [signal_symbol])
+
+    signal_revised = signal_symbol in revised_symbols or signal_symbol in signal_history_revisions
+    corrected_existing_session = bool(revised_symbols or signal_history_revisions)
+    if RISK_FREE_SYMBOL in revised_symbols:
+        # ^IRX feeds every strategy's Sharpe rollup, so a historical correction
+        # cannot be repaired safely by rebuilding only the current asset.
+        clear_all_strategy_state(conn)
+        expected_state_generation = strategy_state_generation(conn)
+    if signal_revised:
+        clear_signal_state(conn, signal_symbol)
+    if corrected_existing_session:
+        # The compact resume state cannot replay a changed historical bar.  Load
+        # the corrected full history we just persisted and recompute this asset.
+        data = load_saved_market_data(conn, symbols)
+        rebuild = True
+    elif not rebuild and not config_is_current:
+        # Another asset sharing this signal may have invalidated the compact
+        # state after this asset's preflight check.  Rebuild from saved history
+        # rather than continuing from an incompatible tail state.
+        data = load_saved_market_data(conn, symbols)
+        rebuild = True
+
+    if data.empty:
+        if commit:
+            conn.commit()
+        return
     if rebuild:
         clear_asset_state(conn, asset_symbol, signal_symbol)
 
-    symbols = list(dict.fromkeys([asset_symbol, signal_symbol, RISK_FREE_SYMBOL]))
-    save_market_data(conn, data, symbols)
+    canonical_signal_close = load_saved_close_series(conn, signal_symbol)
+    if canonical_signal_close.empty:
+        canonical_signal_close = data[f"{signal_symbol}_Close"].dropna().sort_index()
     rsi = ensure_rsi_values(
         conn,
         signal_symbol,
         base_cfg.rsi_period,
-        data[f"{signal_symbol}_Close"],
-        rebuild=rebuild,
+        canonical_signal_close,
+        rebuild=rebuild or signal_revised,
     )
 
     config_pairs = [
@@ -1550,6 +2069,8 @@ def process_asset_grid(
         for profit_target_multiple in profit_target_values
     ]
     if not config_pairs:
+        if commit:
+            conn.commit()
         return
 
     open_prices, close_prices, rsi_values, risk_free_returns = _market_arrays(
@@ -1583,7 +2104,7 @@ def process_asset_grid(
     excess_return_sum_squares_values = np.empty(config_count, dtype=np.float64)
     positive_return_count_values = np.empty(config_count, dtype=np.int64)
     max_drawdown_values = np.empty(config_count, dtype=np.float64)
-    state_start_dates: list[Optional[str]] = []
+    state_start_dates: list[str | None] = []
 
     for config_idx, (buy_rsi, profit_target_multiple) in enumerate(config_pairs):
         state = None if rebuild else load_strategy_state(
@@ -1745,7 +2266,6 @@ def process_asset_grid(
             rollup,
         )
 
-    conn.commit()
     if strategy_summary_count(conn, asset_symbol, signal_symbol) == 0:
         refresh_strategy_summaries_for_asset(conn, asset_symbol, signal_symbol)
 
@@ -1774,4 +2294,9 @@ def process_asset_grid(
             best_buy_rsi,
             best_profit_target_multiple,
         )
+
+    if strategy_state_generation(conn) != expected_state_generation:
+        raise RuntimeError("Strategy state generation changed during an atomic asset update.")
+    save_strategy_config(conn, asset_symbol, signal_symbol, strategy_fingerprint)
+    if commit:
         conn.commit()

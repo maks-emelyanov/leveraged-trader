@@ -133,6 +133,24 @@ class OutputTests(unittest.TestCase):
         for line in output.splitlines():
             self.assertLessEqual(len(line), 100)
 
+    def test_settings_handles_empty_grid_values(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+
+        reporter.settings(
+            mode="update",
+            db_path="state.sqlite",
+            workflow_concurrency=1,
+            risk_free_symbol="^IRX",
+            buy_rsi_values=[],
+            profit_target_values=[],
+        )
+        output = console.export_text(styles=False)
+
+        self.assertIn("Buy RSI values", output)
+        self.assertIn("Sell return multiples", output)
+        self.assertIn("none", output)
+
 
 if __name__ == "__main__":
     unittest.main()

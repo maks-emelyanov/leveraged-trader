@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Optional
-
 
 RISK_FREE_SYMBOL = "^IRX"
 ETF_DEFS_URL = "https://www.nasdaqtrader.com/trader.aspx?id=etf_definitions"
@@ -27,18 +25,21 @@ class BacktestConfig:
 @dataclass
 class UniverseConfig:
     request_timeout_seconds: int = 30
-    top_n: Optional[int] = None
+    top_n: int | None = None
     sqlite_db_path: str = SQLITE_DB_PATH
+    require_workflow_source_success: bool = False
 
 
 @dataclass
 class AlpacaOrderConfig:
     enabled: bool = False
     sell_enabled: bool = False
-    api_key_id: Optional[str] = None
-    api_secret_key: Optional[str] = None
+    api_key_id: str | None = None
+    api_secret_key: str | None = None
     base_url: str = ALPACA_PAPER_BASE_URL
     cash_fraction: float = 0.10
+    batch_cash_fraction: float | None = None
+    buy_limit_buffer_bps: float = 500.0
     timeout_seconds: int = 30
     gtc_sell_renewal_enabled: bool = True
     gtc_sell_renewal_days_before_expiration: int = 7
@@ -47,7 +48,7 @@ class AlpacaOrderConfig:
 @dataclass
 class TradierMarketDataConfig:
     enabled: bool = True
-    access_token: Optional[str] = None
+    access_token: str | None = None
     base_url: str = TRADIER_LIVE_BASE_URL
     timeout_seconds: int = 30
 

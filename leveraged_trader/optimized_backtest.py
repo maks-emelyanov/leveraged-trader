@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 import numpy as np
 
@@ -113,33 +113,47 @@ def run_grid_summary(
             close_price = close_prices[row_idx]
             rsi = rsi_values[row_idx]
 
+            deferred_action = ACTION_NONE
             if pending_action == ACTION_BUY and not in_position:
-                shares = cash / open_price if open_price > 0.0 else 0.0
-                turnover_notional = shares * open_price
-                cash -= turnover_notional
-                cash -= turnover_notional * trading_cost_rate
-                in_position = shares > 0.0
-                entry_price = open_price if in_position else np.nan
-                trades_executed += 1
+                cost_multiplier = 1.0 + trading_cost_rate
+                if open_price > 0.0 and cash > 0.0 and cost_multiplier > 0.0:
+                    turnover_notional = cash / cost_multiplier
+                    shares = turnover_notional / open_price
+                    cash -= turnover_notional * cost_multiplier
+                    # Avoid a tiny negative balance caused by floating-point rounding.
+                    cash = max(cash, 0.0)
+                    in_position = shares > 0.0
+                    entry_price = open_price if in_position else np.nan
+                    if in_position:
+                        trades_executed += 1
+                else:
+                    deferred_action = ACTION_BUY
             elif pending_action == ACTION_SELL and in_position:
-                turnover_notional = shares * open_price
-                cash += turnover_notional
-                cash -= turnover_notional * trading_cost_rate
-                shares = 0.0
-                in_position = False
-                entry_price = np.nan
-                trades_executed += 1
+                if open_price > 0.0:
+                    turnover_notional = shares * open_price
+                    cash += turnover_notional
+                    cash -= turnover_notional * trading_cost_rate
+                    shares = 0.0
+                    in_position = False
+                    entry_price = np.nan
+                    trades_executed += 1
+                else:
+                    deferred_action = ACTION_SELL
 
             equity = cash + shares * close_price
             daily_return = equity / prev_equity - 1.0 if prev_equity > 0.0 else 0.0
 
-            next_action = ACTION_NONE
-            if not np.isnan(rsi):
+            next_action = deferred_action
+            if deferred_action == ACTION_NONE and not np.isnan(rsi):
                 if (not in_position) and rsi <= buy_rsi:
                     next_action = ACTION_BUY
-                elif in_position and not np.isnan(entry_price) and entry_price > 0.0:
-                    if close_price / entry_price >= profit_target_multiple:
-                        next_action = ACTION_SELL
+                elif (
+                    in_position
+                    and not np.isnan(entry_price)
+                    and entry_price > 0.0
+                    and close_price / entry_price >= profit_target_multiple
+                ):
+                    next_action = ACTION_SELL
 
             if np.isnan(first_equity):
                 first_equity = equity
@@ -243,35 +257,50 @@ def run_single_equity_curve(
         open_price = open_prices[row_idx]
         close_price = close_prices[row_idx]
         rsi = rsi_values[row_idx]
-        action_executed = pending_action
+        action_executed = ACTION_NONE
 
+        deferred_action = ACTION_NONE
         if pending_action == ACTION_BUY and not in_position:
-            shares = cash / open_price if open_price > 0.0 else 0.0
-            turnover_notional = shares * open_price
-            cash -= turnover_notional
-            cash -= turnover_notional * trading_cost_rate
-            in_position = shares > 0.0
-            entry_price = open_price if in_position else np.nan
-            trades_executed += 1
+            cost_multiplier = 1.0 + trading_cost_rate
+            if open_price > 0.0 and cash > 0.0 and cost_multiplier > 0.0:
+                turnover_notional = cash / cost_multiplier
+                shares = turnover_notional / open_price
+                cash -= turnover_notional * cost_multiplier
+                cash = max(cash, 0.0)
+                in_position = shares > 0.0
+                entry_price = open_price if in_position else np.nan
+                if in_position:
+                    trades_executed += 1
+                    action_executed = ACTION_BUY
+            else:
+                deferred_action = ACTION_BUY
         elif pending_action == ACTION_SELL and in_position:
-            turnover_notional = shares * open_price
-            cash += turnover_notional
-            cash -= turnover_notional * trading_cost_rate
-            shares = 0.0
-            in_position = False
-            entry_price = np.nan
-            trades_executed += 1
+            if open_price > 0.0:
+                turnover_notional = shares * open_price
+                cash += turnover_notional
+                cash -= turnover_notional * trading_cost_rate
+                shares = 0.0
+                in_position = False
+                entry_price = np.nan
+                trades_executed += 1
+                action_executed = ACTION_SELL
+            else:
+                deferred_action = ACTION_SELL
 
         equity = cash + shares * close_price
         daily_return = equity / prev_equity - 1.0 if prev_equity > 0.0 else 0.0
 
-        next_action = ACTION_NONE
-        if not np.isnan(rsi):
+        next_action = deferred_action
+        if deferred_action == ACTION_NONE and not np.isnan(rsi):
             if (not in_position) and rsi <= buy_rsi:
                 next_action = ACTION_BUY
-            elif in_position and not np.isnan(entry_price) and entry_price > 0.0:
-                if close_price / entry_price >= profit_target_multiple:
-                    next_action = ACTION_SELL
+            elif (
+                in_position
+                and not np.isnan(entry_price)
+                and entry_price > 0.0
+                and close_price / entry_price >= profit_target_multiple
+            ):
+                next_action = ACTION_SELL
 
         equity_values[row_idx] = equity
         daily_returns[row_idx] = daily_return

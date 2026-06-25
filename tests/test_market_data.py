@@ -1,16 +1,47 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime
 from unittest.mock import Mock, patch
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yfinance.shared as yf_shared
 
 from leveraged_trader.config import TradierMarketDataConfig
-from leveraged_trader.market_data import TRADIER_RECOVERED_SYMBOLS_ATTR, MarketDataDownloadError, load_market_data
+from leveraged_trader.market_data import (
+    TRADIER_RECOVERED_SYMBOLS_ATTR,
+    MarketDataDownloadError,
+    exclude_unfinalized_daily_bar,
+    load_market_data,
+)
 
 
 class MarketDataTests(unittest.TestCase):
+    def test_current_session_daily_bar_is_excluded_before_finalization(self) -> None:
+        index = pd.to_datetime(["2026-01-02", "2026-01-05"])
+        data = pd.DataFrame({"AAA_Close": [100.0, 110.0]}, index=index)
+        data.attrs[TRADIER_RECOVERED_SYMBOLS_ATTR] = ["AAA"]
+
+        finalized = exclude_unfinalized_daily_bar(
+            data,
+            now=datetime(2026, 1, 5, 15, 30, tzinfo=ZoneInfo("America/New_York")),
+        )
+
+        self.assertEqual(finalized.index.tolist(), [pd.Timestamp("2026-01-02")])
+        self.assertEqual(finalized.attrs[TRADIER_RECOVERED_SYMBOLS_ATTR], ["AAA"])
+
+    def test_current_session_daily_bar_is_excluded_after_close_too(self) -> None:
+        index = pd.to_datetime(["2026-01-02", "2026-01-05"])
+        data = pd.DataFrame({"AAA_Close": [100.0, 110.0]}, index=index)
+
+        finalized = exclude_unfinalized_daily_bar(
+            data,
+            now=datetime(2026, 1, 5, 16, 15, tzinfo=ZoneInfo("America/New_York")),
+        )
+
+        self.assertEqual(finalized.index.tolist(), [pd.Timestamp("2026-01-02")])
+
     def test_yfinance_errors_become_single_human_readable_download_error(self) -> None:
         def fake_download(**_: object) -> pd.DataFrame:
             yf_shared._ERRORS = {
@@ -19,9 +50,11 @@ class MarketDataTests(unittest.TestCase):
             }
             return pd.DataFrame()
 
-        with patch("leveraged_trader.market_data.yf.download", side_effect=fake_download):
-            with self.assertRaises(MarketDataDownloadError) as raised:
-                load_market_data(symbols=["PRICE", "CLOUD"])
+        with (
+            patch("leveraged_trader.market_data.yf.download", side_effect=fake_download),
+            self.assertRaises(MarketDataDownloadError) as raised,
+        ):
+            load_market_data(symbols=["PRICE", "CLOUD"])
 
         message = str(raised.exception)
         self.assertEqual(raised.exception.symbols, ["CLOUD", "PRICE"])
@@ -47,6 +80,48 @@ class MarketDataTests(unittest.TestCase):
         self.assertEqual(raised.exception.symbols, ["MISSING"])
         self.assertIn("MISSING", message)
         self.assertIn("missing from the Yahoo Finance response", message)
+
+    @patch("leveraged_trader.market_data.requests.get")
+    @patch("leveraged_trader.market_data.yf.download")
+    def test_incomplete_yahoo_ohlcv_frame_uses_tradier_fallback(
+        self,
+        mock_download: Mock,
+        mock_get: Mock,
+    ) -> None:
+        index = pd.to_datetime(["2026-01-02"])
+        mock_download.return_value = pd.DataFrame(
+            [[10.5]],
+            index=index,
+            columns=pd.MultiIndex.from_tuples([("AAA", "Close")]),
+        )
+        mock_get.return_value = Mock(
+            status_code=200,
+            text="",
+            json=Mock(
+                return_value={
+                    "history": {
+                        "day": {
+                            "date": "2026-01-02",
+                            "open": 10,
+                            "high": 11,
+                            "low": 9,
+                            "close": 10.5,
+                            "volume": 1000,
+                        }
+                    }
+                }
+            ),
+        )
+
+        data = load_market_data(
+            symbols=["AAA"],
+            tradier_cfg=TradierMarketDataConfig(access_token="token"),
+        )
+
+        self.assertEqual(data.columns.tolist(), [
+            "AAA_Open", "AAA_High", "AAA_Low", "AAA_Close", "AAA_Volume"
+        ])
+        self.assertEqual(data.attrs[TRADIER_RECOVERED_SYMBOLS_ATTR], ["AAA"])
 
     @patch("leveraged_trader.market_data.requests.get")
     @patch("leveraged_trader.market_data.yf.download")

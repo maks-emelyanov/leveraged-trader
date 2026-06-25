@@ -4,7 +4,7 @@ import math
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import pandas as pd
 from rich import box
@@ -13,12 +13,17 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn
 from rich.table import Column, Table
 from rich.text import Text
 
-
 STATUS_STYLES = {
     "accepted": "green",
+    "batch_budget_exhausted": "yellow",
     "filled": "green",
     "submitted": "green",
+    "partially_filled": "yellow",
+    "submission_pending": "yellow",
+    "submission_unknown": "red",
+    "submission_not_found": "yellow",
     "done": "green",
+    "duplicate_signal": "yellow",
     "existing": "cyan",
     "managed": "cyan",
     "managed_only": "cyan",
@@ -26,6 +31,7 @@ STATUS_STYLES = {
     "renewed": "green",
     "disabled": "yellow",
     "fractional_qty": "yellow",
+    "incomplete_fill_metadata": "red",
     "insufficient_notional": "yellow",
     "not_held": "yellow",
     "pending_cancel": "yellow",
@@ -36,6 +42,7 @@ STATUS_STYLES = {
     "rejected": "red",
     "stopped": "red",
     "suspended": "red",
+    "quantity_mismatch": "red",
 }
 
 
@@ -88,15 +95,15 @@ Formatter = Callable[[Any], str]
 @dataclass(frozen=True)
 class TableColumn:
     source: str
-    header: Optional[str] = None
+    header: str | None = None
     justify: str = "left"
-    style: Optional[str] = None
-    min_width: Optional[int] = None
-    max_width: Optional[int] = None
-    ratio: Optional[int] = None
+    style: str | None = None
+    min_width: int | None = None
+    max_width: int | None = None
+    ratio: int | None = None
     no_wrap: bool = False
     overflow: str = "fold"
-    formatter: Optional[Formatter] = None
+    formatter: Formatter | None = None
     status: bool = False
 
     @property
@@ -120,7 +127,7 @@ class AssetProgress:
 
 
 class WorkflowReporter:
-    def __init__(self, *, console: Optional[Console] = None, no_color: bool = False) -> None:
+    def __init__(self, *, console: Console | None = None, no_color: bool = False) -> None:
         self.console = console or Console(no_color=no_color)
 
     @contextmanager
@@ -172,10 +179,10 @@ class WorkflowReporter:
         table.add_row("Workflow concurrency", str(workflow_concurrency))
         table.add_row("Start date", "Earliest overlapping history for each leveraged asset and RSI symbol")
         table.add_row("Sharpe benchmark", f"{risk_free_symbol} 13-week U.S. Treasury bill")
-        table.add_row("Buy RSI values", f"{buy_rsi_values[0]} to {buy_rsi_values[-1]} step 1")
+        table.add_row("Buy RSI values", _grid_range_label(buy_rsi_values, places=0, step_label="1"))
         table.add_row(
             "Sell return multiples",
-            f"{profit_target_values[0]:.1f} to {profit_target_values[-1]:.1f} step 0.1",
+            _grid_range_label(profit_target_values, places=1, step_label="0.1"),
         )
         self.console.print(table)
 
@@ -186,7 +193,7 @@ class WorkflowReporter:
         columns: list[TableColumn],
         *,
         empty_message: str,
-        caption: Optional[str] = None,
+        caption: str | None = None,
     ) -> None:
         self.section(title)
         if df.empty:
@@ -198,6 +205,7 @@ class WorkflowReporter:
         title = str(df.attrs.get("universe_title", "Workflow ETF Universe"))
         counts = df.attrs.get("universe_counts", {})
         db_path = df.attrs.get("universe_db_path")
+        universe_degraded = bool(df.attrs.get("universe_degraded", False))
 
         self.section(title)
         if counts or db_path:
@@ -212,6 +220,14 @@ class WorkflowReporter:
                     f"{db_path}: nasdaq_etf_universe, universe_audit_*",
                 )
             self.console.print(stats)
+        if universe_degraded:
+            self.console.print(
+                Text(
+                    "Workflow universe is degraded: one or more issuer/ETN sources failed. "
+                    "See universe_workflow_source_status in SQLite.",
+                    style="yellow",
+                )
+            )
 
         if df.empty:
             self.console.print(Text("No long leveraged ETFs found.", style="dim"))
@@ -310,6 +326,7 @@ class WorkflowReporter:
                 TableColumn("Date", no_wrap=True),
                 TableColumn("Notional", justify="right", formatter=format_decimal_2, no_wrap=True),
                 TableColumn("Qty", justify="right", formatter=format_qty, no_wrap=True),
+                TableColumn("Limit Price", "Limit", justify="right", formatter=format_decimal_2, no_wrap=True),
                 TableColumn("Status", status=True, no_wrap=True),
                 TableColumn("Message", ratio=1, min_width=24, formatter=format_message),
             ],
@@ -369,7 +386,7 @@ class WorkflowReporter:
             caption="Closed positions missing actual sell fill prices are excluded from realized P/L totals.",
         )
 
-    def _table(self, df: pd.DataFrame, columns: list[TableColumn], *, caption: Optional[str]) -> Table:
+    def _table(self, df: pd.DataFrame, columns: list[TableColumn], *, caption: str | None) -> Table:
         table = Table(
             box=box.SIMPLE_HEAVY,
             expand=True,
@@ -412,6 +429,12 @@ def format_value(value: Any) -> str:
     if isinstance(value, float):
         return format_decimal(value, 4)
     return str(value)
+
+
+def _grid_range_label(values: list[float], *, places: int, step_label: str) -> str:
+    if not values:
+        return "none"
+    return f"{float(values[0]):.{places}f} to {float(values[-1]):.{places}f} step {step_label}"
 
 
 def format_message(value: Any) -> str:

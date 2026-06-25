@@ -1,23 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 
 from .alpaca import reconcile_alpaca_managed_positions, submit_alpaca_paper_buy_orders
 from .config import (
+    RISK_FREE_SYMBOL,
     AlpacaOrderConfig,
     BacktestConfig,
-    RISK_FREE_SYMBOL,
     TradierMarketDataConfig,
     UniverseConfig,
 )
-from .market_data import TRADIER_RECOVERED_SYMBOLS_ATTR, load_strategy_data
+from .market_data import (
+    TRADIER_RECOVERED_SYMBOLS_ATTR,
+    load_risk_free_history,
+    load_signal_history,
+    load_strategy_data,
+    load_symbol_history,
+)
 from .output import AssetProgress, WorkflowReporter
 from .reports import (
     build_alpaca_realized_pnl_summary,
@@ -27,18 +33,43 @@ from .reports import (
 )
 from .storage import (
     active_alpaca_managed_symbols,
-    earliest_state_date,
-    expected_state_count,
     init_state_db,
     load_alpaca_managed_positions,
     process_asset_grid,
     save_workflow_assets,
+    strategy_config_fingerprint,
+    strategy_state_matches_config,
 )
 from .universe import determine_workflow_assets
 
-
 DEFAULT_WORKFLOW_CONCURRENCY = 4
 SQLITE_BUSY_TIMEOUT_MS = 60_000
+
+
+def _validate_grid_values(name: str, values: list[float]) -> None:
+    if not values:
+        raise ValueError(f"{name} must not be empty.")
+    for value in values:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must contain only finite numeric values.")
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must contain only finite numeric values.") from exc
+        if not math.isfinite(numeric_value):
+            raise ValueError(f"{name} must contain only finite numeric values.")
+
+
+def _validate_optimization_grids(
+    buy_rsi_values: list[float],
+    profit_target_values: list[float],
+) -> None:
+    _validate_grid_values("buy_rsi_values", buy_rsi_values)
+    _validate_grid_values("profit_target_values", profit_target_values)
+
+
+class WorkflowRunError(RuntimeError):
+    """Raised when a workflow run cannot produce any usable strategy result."""
 
 
 @dataclass(frozen=True)
@@ -46,7 +77,7 @@ class AssetRunPlan:
     asset_symbol: str
     signal_symbol: str
     rebuild: bool
-    start: Optional[str]
+    start: str | None
     action: str
     start_label: str
 
@@ -57,7 +88,7 @@ class AssetRunResult:
     asset_symbol: str
     signal_symbol: str
     action: str
-    rows_processed: Optional[int]
+    rows_processed: int | None
     status: str
     message: str
 
@@ -75,10 +106,12 @@ class AssetRunResult:
 
 
 @contextmanager
-def _state_connection(db_path: str) -> sqlite3.Connection:
+def _state_connection(db_path: str, *, immediate: bool = False) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
     try:
         conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+        if immediate:
+            conn.execute("BEGIN IMMEDIATE")
         yield conn
     except Exception:
         conn.rollback()
@@ -116,21 +149,28 @@ def _reconcile_alpaca_managed_positions_for_db(
 def _prepare_asset_run(
     db_path: str,
     mode: str,
-    expected_combinations: int,
+    base_cfg: BacktestConfig,
     asset_symbol: str,
     signal_symbol: str,
+    buy_rsi_values: list[float],
+    profit_target_values: list[float],
 ) -> AssetRunPlan:
     with _state_connection(db_path) as conn:
         rebuild_asset = mode == "rebuild"
-        existing_count = expected_state_count(conn, asset_symbol, signal_symbol)
-        if mode == "update" and existing_count != expected_combinations:
+        if mode == "update" and not strategy_state_matches_config(
+            conn,
+            asset_symbol,
+            signal_symbol,
+            base_cfg,
+            buy_rsi_values,
+            profit_target_values,
+        ):
             rebuild_asset = True
 
-        start: Optional[str] = None
-        if not rebuild_asset:
-            last_date = earliest_state_date(conn, asset_symbol, signal_symbol)
-            if last_date is not None:
-                start = last_date
+        # Fetch canonical history even in update mode.  Auto-adjusted asset and
+        # benchmark series can revise old sessions; the state layer compares the
+        # complete input before deciding whether a compact resume is still safe.
+        start: str | None = None
 
     action = "Rebuilding" if rebuild_asset else "Updating"
     start_label = start if start is not None else "earliest overlapping history"
@@ -147,6 +187,9 @@ def _prepare_asset_run(
 def _process_asset_grid_for_db(
     db_path: str,
     data: pd.DataFrame,
+    asset_history: pd.DataFrame,
+    signal_history: pd.DataFrame,
+    risk_free_history: pd.DataFrame,
     base_cfg: BacktestConfig,
     asset_symbol: str,
     signal_symbol: str,
@@ -154,7 +197,10 @@ def _process_asset_grid_for_db(
     profit_target_values: list[float],
     rebuild: bool,
 ) -> None:
-    with _state_connection(db_path) as conn:
+    # This transaction covers market-data synchronization, global benchmark
+    # invalidation, and rebuilt state.  A second process waits here and then
+    # observes the new generation/config instead of writing a stale resume.
+    with _state_connection(db_path, immediate=True) as conn:
         process_asset_grid(
             conn,
             data,
@@ -164,6 +210,18 @@ def _process_asset_grid_for_db(
             buy_rsi_values,
             profit_target_values,
             rebuild=rebuild,
+            signal_history=signal_history,
+            authoritative_histories={
+                asset_symbol: asset_history,
+                signal_symbol: signal_history,
+                RISK_FREE_SYMBOL: risk_free_history,
+            },
+            commit=False,
+            strategy_fingerprint=strategy_config_fingerprint(
+                base_cfg,
+                buy_rsi_values,
+                profit_target_values,
+            ),
         )
 
 
@@ -171,9 +229,16 @@ def _build_reports_for_db(
     db_path: str,
     workflow_assets: pd.DataFrame,
     base_cfg: BacktestConfig,
+    processed_asset_pairs: set[tuple[str, str]],
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    report_assets = workflow_assets[
+        workflow_assets.apply(
+            lambda row: (str(row["symbol"]), str(row["rsi_symbol"])) in processed_asset_pairs,
+            axis=1,
+        )
+    ].copy()
     with _state_connection(db_path) as conn:
-        optimization_summary, curves = summarize_saved_results(conn, workflow_assets)
+        optimization_summary, curves = summarize_saved_results(conn, report_assets)
         buy_signals = build_buy_signal_report(
             conn,
             optimization_summary,
@@ -223,8 +288,7 @@ async def _process_workflow_asset(
     db_path: str,
     mode: str,
     base_cfg: BacktestConfig,
-    tradier_cfg: Optional[TradierMarketDataConfig],
-    expected_combinations: int,
+    tradier_cfg: TradierMarketDataConfig | None,
     workflow_idx: int,
     total_workflows: int,
     asset_symbol: str,
@@ -232,7 +296,11 @@ async def _process_workflow_asset(
     buy_rsi_values: list[float],
     profit_target_values: list[float],
     signal_locks: dict[str, asyncio.Lock],
-    asset_progress: Optional[AssetProgress] = None,
+    signal_histories: dict[str, pd.DataFrame],
+    risk_free_history_lock: asyncio.Lock,
+    risk_free_histories: dict[str, pd.DataFrame],
+    strategy_state_lock: asyncio.Lock,
+    asset_progress: AssetProgress | None = None,
 ) -> AssetRunResult:
     action = "Rebuilding" if mode == "rebuild" else "Updating"
     try:
@@ -240,13 +308,13 @@ async def _process_workflow_asset(
             _prepare_asset_run,
             db_path,
             mode,
-            expected_combinations,
+            base_cfg,
             asset_symbol,
             signal_symbol,
+            buy_rsi_values,
+            profit_target_values,
         )
         action = plan.action
-        if asset_progress is not None:
-            asset_progress.start_asset(asset=asset_symbol, signal=signal_symbol, action=plan.action)
         data = await asyncio.to_thread(
             load_strategy_data,
             asset_symbol=asset_symbol,
@@ -256,19 +324,73 @@ async def _process_workflow_asset(
             auto_adjust=base_cfg.auto_adjust,
             tradier_cfg=tradier_cfg,
         )
+        if data.empty:
+            if asset_progress is not None:
+                asset_progress.start_asset(asset=asset_symbol, signal=signal_symbol, action="skipping")
+            return AssetRunResult(
+                workflow_idx=workflow_idx,
+                asset_symbol=asset_symbol,
+                signal_symbol=signal_symbol,
+                action=plan.action,
+                rows_processed=0,
+                status="skipped",
+                message="No finalized daily market data is available yet.",
+            )
+        asset_history = await asyncio.to_thread(
+            load_symbol_history,
+            asset_symbol,
+            end=None,
+            auto_adjust=base_cfg.auto_adjust,
+            tradier_cfg=tradier_cfg,
+        )
+        if asset_history.empty:
+            raise RuntimeError(f"No settled daily asset history is available for {asset_symbol}.")
+        async with risk_free_history_lock:
+            risk_free_history = risk_free_histories.get(RISK_FREE_SYMBOL)
+            if risk_free_history is None:
+                risk_free_history = await asyncio.to_thread(
+                    load_risk_free_history,
+                    end=None,
+                    auto_adjust=base_cfg.auto_adjust,
+                    tradier_cfg=tradier_cfg,
+                )
+                if risk_free_history.empty:
+                    raise RuntimeError("No settled daily benchmark history is available for ^IRX.")
+                risk_free_histories[RISK_FREE_SYMBOL] = risk_free_history
+        if asset_progress is not None:
+            asset_progress.start_asset(asset=asset_symbol, signal=signal_symbol, action=plan.action)
         signal_lock = signal_locks.setdefault(signal_symbol, asyncio.Lock())
         async with signal_lock:
-            await asyncio.to_thread(
-                _process_asset_grid_for_db,
-                db_path,
-                data,
-                base_cfg,
-                asset_symbol,
-                signal_symbol,
-                buy_rsi_values,
-                profit_target_values,
-                plan.rebuild,
-            )
+            signal_history = signal_histories.get(signal_symbol)
+            if signal_history is None:
+                signal_history = await asyncio.to_thread(
+                    load_signal_history,
+                    signal_symbol,
+                    end=None,
+                    auto_adjust=base_cfg.auto_adjust,
+                    tradier_cfg=tradier_cfg,
+                )
+                if signal_history.empty:
+                    raise RuntimeError(f"No settled daily signal history is available for {signal_symbol}.")
+                signal_histories[signal_symbol] = signal_history
+            # A ^IRX correction invalidates every strategy.  State processing
+            # must therefore be one-at-a-time across *all* signal symbols; the
+            # surrounding downloads remain concurrent.
+            async with strategy_state_lock:
+                await asyncio.to_thread(
+                    _process_asset_grid_for_db,
+                    db_path,
+                    data,
+                    asset_history,
+                    signal_history,
+                    risk_free_history,
+                    base_cfg,
+                    asset_symbol,
+                    signal_symbol,
+                    buy_rsi_values,
+                    profit_target_values,
+                    plan.rebuild,
+                )
         return AssetRunResult(
             workflow_idx=workflow_idx,
             asset_symbol=asset_symbol,
@@ -306,9 +428,10 @@ async def run_resumable_optimizations_async(
     output_dir: str,
     workflow_concurrency: int = DEFAULT_WORKFLOW_CONCURRENCY,
     no_color: bool = False,
-    reporter: Optional[WorkflowReporter] = None,
-    tradier_cfg: Optional[TradierMarketDataConfig] = None,
+    reporter: WorkflowReporter | None = None,
+    tradier_cfg: TradierMarketDataConfig | None = None,
 ) -> None:
+    _validate_optimization_grids(buy_rsi_values, profit_target_values)
     concurrency = max(1, workflow_concurrency)
     universe_cfg = replace(universe_cfg, sqlite_db_path=db_path)
     reporter = reporter or WorkflowReporter(no_color=no_color)
@@ -316,20 +439,29 @@ async def run_resumable_optimizations_async(
     with reporter.status("Initializing workflow state"):
         await asyncio.to_thread(_initialize_state_db, db_path)
     with reporter.status("Reconciling Alpaca positions and loading workflow assets"):
-        reconciliation_task = asyncio.create_task(
-            asyncio.to_thread(_reconcile_alpaca_managed_positions_for_db, db_path, alpaca_cfg)
+        # Both steps write to the same SQLite database.  Keep startup writes
+        # serialized: universe discovery performs replace-table writes while
+        # reconciliation updates managed positions.
+        reconciliation_results = await asyncio.to_thread(
+            _reconcile_alpaca_managed_positions_for_db,
+            db_path,
+            alpaca_cfg,
         )
-        workflow_assets_task = asyncio.create_task(
-            asyncio.to_thread(_load_or_refresh_workflow_assets_for_db, db_path, universe_cfg)
+        workflow_assets = await asyncio.to_thread(
+            _load_or_refresh_workflow_assets_for_db,
+            db_path,
+            universe_cfg,
         )
-        reconciliation_results, workflow_assets = await asyncio.gather(reconciliation_task, workflow_assets_task)
 
     reporter.universe_assets(workflow_assets)
 
-    expected_combinations = len(buy_rsi_values) * len(profit_target_values)
     total_workflows = len(workflow_assets)
     semaphore = asyncio.Semaphore(concurrency)
     signal_locks: dict[str, asyncio.Lock] = {}
+    signal_histories: dict[str, pd.DataFrame] = {}
+    risk_free_history_lock = asyncio.Lock()
+    risk_free_histories: dict[str, pd.DataFrame] = {}
+    strategy_state_lock = asyncio.Lock()
 
     async def process_with_limit(
         workflow_idx: int,
@@ -343,7 +475,6 @@ async def run_resumable_optimizations_async(
                 mode=mode,
                 base_cfg=base_cfg,
                 tradier_cfg=tradier_cfg,
-                expected_combinations=expected_combinations,
                 workflow_idx=workflow_idx,
                 total_workflows=total_workflows,
                 asset_symbol=asset_symbol,
@@ -351,6 +482,10 @@ async def run_resumable_optimizations_async(
                 buy_rsi_values=buy_rsi_values,
                 profit_target_values=profit_target_values,
                 signal_locks=signal_locks,
+                signal_histories=signal_histories,
+                risk_free_history_lock=risk_free_history_lock,
+                risk_free_histories=risk_free_histories,
+                strategy_state_lock=strategy_state_lock,
                 asset_progress=asset_progress,
             )
 
@@ -367,7 +502,18 @@ async def run_resumable_optimizations_async(
             ]
         )
 
+    completed_runs = [result for result in asset_run_results if result.status == "done"]
+    if asset_run_results and not completed_runs:
+        details = "; ".join(
+            f"{result.asset_symbol}: {result.message}"
+            for result in asset_run_results
+        )
+        raise WorkflowRunError(f"No asset workflows completed successfully. {details}")
+
     with reporter.status("Building workflow reports"):
+        processed_asset_pairs = {
+            (result.asset_symbol, result.signal_symbol) for result in completed_runs
+        }
         (
             optimization_summary,
             curves,
@@ -375,13 +521,35 @@ async def run_resumable_optimizations_async(
             eligible_buy_signals,
             sell_signals,
             realized_pnl_summary,
-        ) = await asyncio.to_thread(_build_reports_for_db, db_path, workflow_assets, base_cfg)
+        ) = await asyncio.to_thread(
+            _build_reports_for_db,
+            db_path,
+            workflow_assets,
+            base_cfg,
+            processed_asset_pairs,
+        )
     with reporter.status("Preparing Alpaca order results"):
         order_results = await asyncio.to_thread(
             _submit_alpaca_paper_buy_orders_for_db,
             db_path,
             buy_signals,
             alpaca_cfg,
+        )
+    submitted_buy_results = (
+        order_results[order_results["Status"].isin({"submitted", "existing"})]
+        if "Status" in order_results
+        else pd.DataFrame()
+    )
+    if alpaca_cfg.enabled and not submitted_buy_results.empty:
+        with reporter.status("Reconciling newly submitted Alpaca buys"):
+            post_buy_reconciliation = await asyncio.to_thread(
+                _reconcile_alpaca_managed_positions_for_db,
+                db_path,
+                alpaca_cfg,
+            )
+        reconciliation_results = pd.concat(
+            [reconciliation_results, post_buy_reconciliation],
+            ignore_index=True,
         )
     with reporter.status("Loading managed Alpaca positions"):
         managed_positions = await asyncio.to_thread(_load_alpaca_managed_positions_for_db, db_path)
@@ -422,8 +590,8 @@ def run_resumable_optimizations(
     output_dir: str,
     workflow_concurrency: int = DEFAULT_WORKFLOW_CONCURRENCY,
     no_color: bool = False,
-    reporter: Optional[WorkflowReporter] = None,
-    tradier_cfg: Optional[TradierMarketDataConfig] = None,
+    reporter: WorkflowReporter | None = None,
+    tradier_cfg: TradierMarketDataConfig | None = None,
 ) -> None:
     asyncio.run(
         run_resumable_optimizations_async(

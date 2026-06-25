@@ -107,6 +107,64 @@ class ReportTests(unittest.TestCase):
 
         self.assertEqual(report["Asset"].tolist(), ["TQQQ"])
 
+    def test_signal_reports_allow_missing_sharpe_metrics(self) -> None:
+        save_strategy_state(
+            self.conn,
+            "TQQQ",
+            "QQQ",
+            30.0,
+            2.0,
+            {
+                "start_date": "2026-01-02",
+                "last_date": "2026-01-02",
+                "cash": 100000.0,
+                "shares": 0.0,
+                "in_position": False,
+                "entry_price": float("nan"),
+                "pending_action": "buy",
+                "prev_equity": 100000.0,
+                "trades_executed": 0,
+            },
+        )
+        summary = pd.DataFrame(
+            [
+                {
+                    "Asset": "TQQQ",
+                    "RSI Symbol": "QQQ",
+                    "Buy RSI": 30.0,
+                    "Sell Return Multiple": 2.0,
+                    "Trades Executed": 0,
+                    "Sharpe": None,
+                }
+            ]
+        )
+
+        buy_report = build_buy_signal_report(self.conn, summary, 14)
+
+        save_strategy_state(
+            self.conn,
+            "TQQQ",
+            "QQQ",
+            30.0,
+            2.0,
+            {
+                "start_date": "2026-01-02",
+                "last_date": "2026-01-02",
+                "cash": 0.0,
+                "shares": 10.0,
+                "in_position": True,
+                "entry_price": 100.0,
+                "pending_action": "sell",
+                "prev_equity": 100000.0,
+                "trades_executed": 0,
+            },
+        )
+        sell_report = build_sell_signal_report(self.conn, summary, 14)
+
+        self.assertTrue(buy_report.empty)
+        self.assertEqual(sell_report["Asset"].tolist(), ["TQQQ"])
+        self.assertTrue(pd.isna(sell_report.loc[0, "Sharpe"]))
+
     def test_realized_pnl_summary_uses_complete_closed_managed_positions(self) -> None:
         self.conn.executemany(
             """

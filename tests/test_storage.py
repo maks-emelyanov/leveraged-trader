@@ -7,8 +7,16 @@ import numpy as np
 import pandas as pd
 
 from leveraged_trader.backtest import performance_summary
-from leveraged_trader.config import BacktestConfig, RISK_FREE_SYMBOL
-from leveraged_trader.storage import init_state_db, process_asset_grid
+from leveraged_trader.config import RISK_FREE_SYMBOL, BacktestConfig
+from leveraged_trader.indicators import compute_rsi
+from leveraged_trader.storage import (
+    ensure_rsi_values,
+    init_state_db,
+    process_asset_grid,
+    strategy_config_fingerprint,
+    strategy_state_generation,
+    strategy_state_matches_config,
+)
 
 
 def sample_strategy_data(periods: int = 40) -> pd.DataFrame:
@@ -61,6 +69,14 @@ class StorageOptimizationTests(unittest.TestCase):
             profit_target_values=[1.05, 1.50],
             rebuild=rebuild,
         )
+
+    @staticmethod
+    def canonical_histories(data: pd.DataFrame, asset_symbol: str = "TQQQ") -> dict[str, pd.DataFrame]:
+        return {
+            asset_symbol: data[[column for column in data if column.startswith(f"{asset_symbol}_")]].copy(),
+            "QQQ": data[[column for column in data if column.startswith("QQQ_")]].copy(),
+            RISK_FREE_SYMBOL: data[[column for column in data if column.startswith(f"{RISK_FREE_SYMBOL}_")]].copy(),
+        }
 
     def test_process_asset_grid_stores_summaries_for_all_configs_and_only_best_equity(self) -> None:
         data = sample_strategy_data()
@@ -140,6 +156,489 @@ class StorageOptimizationTests(unittest.TestCase):
         self.assertEqual(end_dates, [(data.index[-1].date().isoformat(),)])
         self.assertEqual(equity_configs, 1)
         self.assertEqual(equity_rows, len(data))
+
+    def test_corrected_persisted_session_rebuilds_rsi_and_strategy_state(self) -> None:
+        data = sample_strategy_data()
+        self.process_grid(data, rebuild=True)
+        previous_rsi = self.conn.execute(
+            "SELECT rsi FROM rsi_values WHERE signal_symbol = 'QQQ' ORDER BY date DESC LIMIT 1"
+        ).fetchone()[0]
+
+        revision = data.iloc[-1:].copy()
+        revision.loc[:, "QQQ_Close"] = 200.0
+        self.process_grid(revision, rebuild=False)
+
+        stored_rsi = self.conn.execute(
+            "SELECT rsi FROM rsi_values WHERE signal_symbol = 'QQQ' ORDER BY date DESC LIMIT 1"
+        ).fetchone()[0]
+        expected_close = data["QQQ_Close"].copy()
+        expected_close.iloc[-1] = 200.0
+        expected_rsi = compute_rsi(expected_close, self.cfg.rsi_period).iloc[-1]
+        equity_rows = self.conn.execute("SELECT COUNT(*) FROM strategy_equity").fetchone()[0]
+
+        self.assertNotEqual(stored_rsi, previous_rsi)
+        self.assertAlmostEqual(stored_rsi, expected_rsi)
+        self.assertEqual(equity_rows, len(data))
+
+    def test_incremental_rsi_matches_neutral_flat_full_recompute(self) -> None:
+        close = pd.Series([100.0] * 10, index=pd.date_range("2026-01-02", periods=10, freq="B"))
+
+        ensure_rsi_values(self.conn, "QQQ", self.cfg.rsi_period, close.iloc[:5], rebuild=True)
+        incremental = ensure_rsi_values(self.conn, "QQQ", self.cfg.rsi_period, close, rebuild=False)
+        expected = compute_rsi(close, self.cfg.rsi_period)
+
+        self.assertEqual(float(incremental.dropna().iloc[-1]), 50.0)
+        pd.testing.assert_series_equal(incremental, expected, check_names=False)
+
+    def test_full_asset_history_correction_rebuilds_resumed_state(self) -> None:
+        data = sample_strategy_data()
+        self.process_grid(data, rebuild=True)
+
+        revision = data.copy()
+        revision.loc[revision.index[10], ["TQQQ_Open", "TQQQ_High", "TQQQ_Low", "TQQQ_Close"]] = [20, 21, 19, 20]
+        self.process_grid(revision, rebuild=False)
+
+        stored_close = self.conn.execute(
+            "SELECT close FROM market_data WHERE symbol = 'TQQQ' AND date = ?",
+            (revision.index[10].date().isoformat(),),
+        ).fetchone()[0]
+        summary_end_date = self.conn.execute(
+            "SELECT DISTINCT end_date FROM strategy_summary"
+        ).fetchone()[0]
+        self.assertEqual(stored_close, 20.0)
+        self.assertEqual(summary_end_date, revision.index[-1].date().isoformat())
+
+    def test_authoritative_asset_history_removes_deleted_session_and_rebuilds(self) -> None:
+        data = sample_strategy_data()
+        process_asset_grid(
+            self.conn,
+            data,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            [30.0],
+            [1.5],
+            rebuild=True,
+            authoritative_histories=self.canonical_histories(data),
+        )
+
+        removed_date = data.index[10]
+        reduced_data = data.drop(index=removed_date)
+        process_asset_grid(
+            self.conn,
+            reduced_data,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            [30.0],
+            [1.5],
+            rebuild=False,
+            authoritative_histories=self.canonical_histories(reduced_data),
+        )
+
+        persisted = self.conn.execute(
+            "SELECT COUNT(*) FROM market_data WHERE symbol = 'TQQQ' AND date = ?",
+            (removed_date.date().isoformat(),),
+        ).fetchone()[0]
+        equity_rows = self.conn.execute("SELECT COUNT(*) FROM strategy_equity").fetchone()[0]
+        self.assertEqual(persisted, 0)
+        self.assertEqual(equity_rows, len(reduced_data))
+
+    def test_authoritative_asset_history_backfill_rebuilds_from_the_missing_session(self) -> None:
+        data = sample_strategy_data()
+        backfilled_date = data.index[10]
+        incomplete_data = data.drop(index=backfilled_date)
+        process_asset_grid(
+            self.conn,
+            incomplete_data,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            [30.0],
+            [1.5],
+            rebuild=True,
+            authoritative_histories=self.canonical_histories(incomplete_data),
+        )
+
+        process_asset_grid(
+            self.conn,
+            data,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            [30.0],
+            [1.5],
+            rebuild=False,
+            authoritative_histories=self.canonical_histories(data),
+        )
+
+        equity_rows = self.conn.execute("SELECT COUNT(*) FROM strategy_equity").fetchone()[0]
+        self.assertEqual(equity_rows, len(data))
+
+    def test_authoritative_benchmark_history_removal_invalidates_other_assets(self) -> None:
+        data = sample_strategy_data()
+        fingerprint = strategy_config_fingerprint(self.cfg, [30.0], [1.5])
+        process_asset_grid(
+            self.conn,
+            data,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            [30.0],
+            [1.5],
+            rebuild=True,
+            authoritative_histories=self.canonical_histories(data),
+            strategy_fingerprint=fingerprint,
+        )
+        upro_data = data.rename(columns=lambda column: column.replace("TQQQ", "UPRO"))
+        process_asset_grid(
+            self.conn,
+            upro_data,
+            self.cfg,
+            "UPRO",
+            "QQQ",
+            [30.0],
+            [1.5],
+            rebuild=True,
+            authoritative_histories=self.canonical_histories(upro_data, "UPRO"),
+            strategy_fingerprint=fingerprint,
+        )
+
+        reduced_risk_free = data.drop(index=data.index[10])[
+            [column for column in data if column.startswith(f"{RISK_FREE_SYMBOL}_")]
+        ]
+        histories = self.canonical_histories(data)
+        histories[RISK_FREE_SYMBOL] = reduced_risk_free
+        process_asset_grid(
+            self.conn,
+            data.drop(index=data.index[10]),
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            [30.0],
+            [1.5],
+            rebuild=False,
+            authoritative_histories=histories,
+            strategy_fingerprint=fingerprint,
+        )
+
+        upro_state_count = self.conn.execute(
+            "SELECT COUNT(*) FROM strategy_state WHERE asset_symbol = 'UPRO'"
+        ).fetchone()[0]
+        self.assertEqual(upro_state_count, 0)
+
+    def test_authoritative_signal_history_removal_invalidates_all_signal_dependents(self) -> None:
+        data = sample_strategy_data()
+        fingerprint = strategy_config_fingerprint(self.cfg, [30.0], [1.5])
+        process_asset_grid(
+            self.conn,
+            data,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            [30.0],
+            [1.5],
+            rebuild=True,
+            authoritative_histories=self.canonical_histories(data),
+            strategy_fingerprint=fingerprint,
+        )
+        upro_data = data.rename(columns=lambda column: column.replace("TQQQ", "UPRO"))
+        process_asset_grid(
+            self.conn,
+            upro_data,
+            self.cfg,
+            "UPRO",
+            "QQQ",
+            [30.0],
+            [1.5],
+            rebuild=True,
+            authoritative_histories=self.canonical_histories(upro_data, "UPRO"),
+            strategy_fingerprint=fingerprint,
+        )
+
+        removed_date = data.index[10]
+        histories = self.canonical_histories(data)
+        histories["QQQ"] = histories["QQQ"].drop(index=removed_date)
+        process_asset_grid(
+            self.conn,
+            data.drop(index=removed_date),
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            [30.0],
+            [1.5],
+            rebuild=False,
+            authoritative_histories=histories,
+            strategy_fingerprint=fingerprint,
+        )
+
+        upro_state_count = self.conn.execute(
+            "SELECT COUNT(*) FROM strategy_state WHERE asset_symbol = 'UPRO' AND signal_symbol = 'QQQ'"
+        ).fetchone()[0]
+        persisted_signal = self.conn.execute(
+            "SELECT COUNT(*) FROM market_data WHERE symbol = 'QQQ' AND date = ?",
+            (removed_date.date().isoformat(),),
+        ).fetchone()[0]
+        self.assertEqual(upro_state_count, 0)
+        self.assertEqual(persisted_signal, 0)
+
+    def test_saved_best_curve_uses_the_same_forward_filled_benchmark_calendar(self) -> None:
+        data = sample_strategy_data()
+        missing_benchmark_date = data.index[10]
+        histories = self.canonical_histories(data)
+        histories[RISK_FREE_SYMBOL] = histories[RISK_FREE_SYMBOL].drop(index=missing_benchmark_date)
+
+        process_asset_grid(
+            self.conn,
+            data,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            [30.0],
+            [1.5],
+            rebuild=True,
+            authoritative_histories=histories,
+        )
+
+        equity_dates = {
+            row[0]
+            for row in self.conn.execute("SELECT date FROM strategy_equity").fetchall()
+        }
+        summary_trading_days = self.conn.execute(
+            "SELECT trading_days FROM strategy_summary"
+        ).fetchone()[0]
+
+        self.assertIn(missing_benchmark_date.date().isoformat(), equity_dates)
+        self.assertEqual(len(equity_dates), len(data))
+        self.assertEqual(summary_trading_days, len(data))
+
+    def test_benchmark_invalidation_advances_the_persisted_generation(self) -> None:
+        data = sample_strategy_data()
+        self.process_grid(data, rebuild=True)
+        before_generation = strategy_state_generation(self.conn)
+
+        revision = data.copy()
+        revision.loc[revision.index[10], f"{RISK_FREE_SYMBOL}_Close"] = 3.0
+        self.process_grid(revision, rebuild=False)
+
+        self.assertEqual(strategy_state_generation(self.conn), before_generation + 1)
+
+    def test_risk_free_history_correction_invalidates_other_assets(self) -> None:
+        data = sample_strategy_data()
+        fingerprint = strategy_config_fingerprint(self.cfg, [30.0], [1.5])
+        process_asset_grid(
+            self.conn,
+            data,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            [30.0],
+            [1.5],
+            rebuild=True,
+            strategy_fingerprint=fingerprint,
+        )
+        upro_data = data.rename(columns=lambda column: column.replace("TQQQ", "UPRO"))
+        process_asset_grid(
+            self.conn,
+            upro_data,
+            self.cfg,
+            "UPRO",
+            "QQQ",
+            [30.0],
+            [1.5],
+            rebuild=True,
+            strategy_fingerprint=fingerprint,
+        )
+
+        revision = data.copy()
+        revision.loc[revision.index[10], f"{RISK_FREE_SYMBOL}_Close"] = 3.0
+        process_asset_grid(
+            self.conn,
+            revision,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            [30.0],
+            [1.5],
+            rebuild=False,
+            strategy_fingerprint=fingerprint,
+        )
+
+        upro_state_count = self.conn.execute(
+            "SELECT COUNT(*) FROM strategy_state WHERE asset_symbol = 'UPRO'"
+        ).fetchone()[0]
+        self.assertEqual(upro_state_count, 0)
+
+    def test_signal_correction_invalidates_other_assets_using_that_signal(self) -> None:
+        data = sample_strategy_data()
+        fingerprint = strategy_config_fingerprint(self.cfg, [30.0, 70.0], [1.05, 1.50])
+        process_asset_grid(
+            self.conn,
+            data,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            [30.0, 70.0],
+            [1.05, 1.50],
+            rebuild=True,
+            strategy_fingerprint=fingerprint,
+        )
+        upro_data = data.rename(columns=lambda column: column.replace("TQQQ", "UPRO"))
+        process_asset_grid(
+            self.conn,
+            upro_data,
+            self.cfg,
+            "UPRO",
+            "QQQ",
+            [30.0, 70.0],
+            [1.05, 1.50],
+            rebuild=True,
+            strategy_fingerprint=fingerprint,
+        )
+
+        revision = data.iloc[-1:].copy()
+        revision.loc[:, "QQQ_Close"] = 200.0
+        process_asset_grid(
+            self.conn,
+            revision,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            [30.0, 70.0],
+            [1.05, 1.50],
+            rebuild=False,
+            strategy_fingerprint=fingerprint,
+        )
+
+        upro_states = self.conn.execute(
+            "SELECT COUNT(*) FROM strategy_state WHERE asset_symbol = 'UPRO' AND signal_symbol = 'QQQ'"
+        ).fetchone()[0]
+        self.assertEqual(upro_states, 0)
+
+        process_asset_grid(
+            self.conn,
+            upro_data.iloc[-1:],
+            self.cfg,
+            "UPRO",
+            "QQQ",
+            [30.0, 70.0],
+            [1.05, 1.50],
+            rebuild=False,
+            strategy_fingerprint=fingerprint,
+        )
+        self.assertTrue(
+            strategy_state_matches_config(
+                self.conn,
+                "UPRO",
+                "QQQ",
+                self.cfg,
+                [30.0, 70.0],
+                [1.05, 1.50],
+            )
+        )
+
+    def test_short_lived_asset_rebuild_preserves_canonical_signal_rsi_history(self) -> None:
+        data = sample_strategy_data()
+        signal_history = data[[column for column in data.columns if column.startswith("QQQ_")]].copy()
+        process_asset_grid(
+            self.conn,
+            data,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            [30.0],
+            [1.5],
+            rebuild=True,
+            signal_history=signal_history,
+        )
+        short_data = data.iloc[-12:].rename(columns=lambda column: column.replace("TQQQ", "UPRO"))
+        process_asset_grid(
+            self.conn,
+            short_data,
+            self.cfg,
+            "UPRO",
+            "QQQ",
+            [30.0],
+            [1.5],
+            rebuild=True,
+            signal_history=signal_history,
+        )
+
+        rsi_count = self.conn.execute(
+            "SELECT COUNT(*) FROM rsi_values WHERE signal_symbol = 'QQQ' AND rsi_period = ?",
+            (self.cfg.rsi_period,),
+        ).fetchone()[0]
+        self.assertEqual(rsi_count, len(signal_history))
+
+    def test_strategy_state_requires_exact_grid_and_backtest_fingerprint(self) -> None:
+        data = sample_strategy_data()
+        buy_rsi_values = [30.0, 70.0]
+        profit_target_values = [1.05, 1.50]
+        fingerprint = strategy_config_fingerprint(self.cfg, buy_rsi_values, profit_target_values)
+        process_asset_grid(
+            self.conn,
+            data,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            buy_rsi_values=buy_rsi_values,
+            profit_target_values=profit_target_values,
+            rebuild=True,
+            strategy_fingerprint=fingerprint,
+        )
+
+        self.assertTrue(
+            strategy_state_matches_config(
+                self.conn,
+                "TQQQ",
+                "QQQ",
+                self.cfg,
+                buy_rsi_values,
+                profit_target_values,
+            )
+        )
+        self.assertFalse(
+            strategy_state_matches_config(
+                self.conn,
+                "TQQQ",
+                "QQQ",
+                self.cfg,
+                [25.0, 65.0],
+                profit_target_values,
+            )
+        )
+
+        changed_grid = [25.0, 65.0]
+        process_asset_grid(
+            self.conn,
+            data.iloc[-1:],
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            buy_rsi_values=changed_grid,
+            profit_target_values=profit_target_values,
+            rebuild=False,
+        )
+        actual_pairs = {
+            (float(buy_rsi), float(profit_target_multiple))
+            for buy_rsi, profit_target_multiple in self.conn.execute(
+                "SELECT buy_rsi, profit_target_multiple FROM strategy_state"
+            ).fetchall()
+        }
+        self.assertEqual(
+            actual_pairs,
+            {(buy_rsi, target) for buy_rsi in changed_grid for target in profit_target_values},
+        )
+        self.assertFalse(
+            strategy_state_matches_config(
+                self.conn,
+                "TQQQ",
+                "QQQ",
+                BacktestConfig(rsi_period=4),
+                changed_grid,
+                profit_target_values,
+            )
+        )
 
 
 if __name__ == "__main__":

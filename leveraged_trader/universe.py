@@ -6,14 +6,12 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from html import unescape
-from typing import Optional
 
 import pandas as pd
 import requests
 
 from .config import ETF_DEFS_URL, UniverseConfig
 from .storage import save_table_to_sqlite
-
 
 NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
 OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
@@ -34,6 +32,68 @@ class UniverseSource:
     parser: str = "html"
     enabled: bool = True
     notes: str = ""
+
+
+class ActiveListedSymbols(set[str]):
+    """Active symbols plus the completeness of their exchange-source snapshot."""
+
+    def __init__(self, symbols: Iterable[str], source_status: list[dict[str, object]]) -> None:
+        super().__init__(symbols)
+        self.source_status = source_status
+
+    @property
+    def is_complete(self) -> bool:
+        return bool(self.source_status) and all(
+            status.get("status") == "loaded" for status in self.source_status
+        )
+
+
+WORKFLOW_SOURCE_STATUS_COLUMNS = [
+    "source",
+    "source_type",
+    "url",
+    "status",
+    "parsed_row_count",
+    "row_count",
+    "error",
+]
+
+
+def _workflow_source_status_row(
+    *,
+    source: str,
+    source_type: str,
+    url: str,
+    status: str,
+    parsed_row_count: int = 0,
+    row_count: int = 0,
+    error: str = "",
+) -> dict[str, object]:
+    return {
+        "source": source,
+        "source_type": source_type,
+        "url": url,
+        "status": status,
+        "parsed_row_count": parsed_row_count,
+        "row_count": row_count,
+        "error": error,
+    }
+
+
+def _workflow_source_status(df: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame(
+        df.attrs.get("workflow_source_status", []),
+        columns=WORKFLOW_SOURCE_STATUS_COLUMNS,
+    )
+
+
+def _workflow_source_parse_status(parsed_rows: pd.DataFrame, matched_rows: pd.DataFrame) -> tuple[str, str]:
+    """Classify a fetched source without mistaking zero matches for parser failure."""
+    if parsed_rows.empty:
+        return "parse_error", "No product rows could be parsed from a successful source response."
+    if matched_rows.empty:
+        return "loaded_zero_matches", ""
+    return "loaded", ""
 
 
 WORKFLOW_ISSUER_SOURCES = [
@@ -205,6 +265,8 @@ EXCLUDED_UNIVERSE_SYMBOLS = {
 }
 YAHOO_SYMBOL_ALIASES = {
     "BRKB": "BRK-B",
+    "BRK.B": "BRK-B",
+    "BRK.A": "BRK-A",
 }
 
 RSI_SYMBOL_PATTERNS = [
@@ -290,7 +352,7 @@ SEC_AUDIT_PRODUCT_CONTEXT_PATTERNS = [
 ]
 
 
-def normalize_yahoo_symbol(symbol: object) -> Optional[str]:
+def normalize_yahoo_symbol(symbol: object) -> str | None:
     if symbol is None or pd.isna(symbol):
         return None
     candidate = str(symbol).strip(" .,-").upper()
@@ -304,7 +366,7 @@ def normalize_yahoo_symbol(symbol: object) -> Optional[str]:
     return candidate
 
 
-def _normalize_symbol_candidate(symbol: str, known_symbols: Optional[set[str]] = None) -> Optional[str]:
+def _normalize_symbol_candidate(symbol: str, known_symbols: set[str] | None = None) -> str | None:
     candidate = normalize_yahoo_symbol(symbol)
     if candidate is None:
         return None
@@ -319,7 +381,7 @@ def _normalize_symbol_candidate(symbol: str, known_symbols: Optional[set[str]] =
     return candidate
 
 
-def infer_rsi_symbol(asset_symbol: str, fund_name: str, known_symbols: Optional[set[str]] = None) -> str:
+def infer_rsi_symbol(asset_symbol: str, fund_name: str, known_symbols: set[str] | None = None) -> str:
     """
     Infer the unleveraged signal ticker from a leveraged ETF name.
 
@@ -341,9 +403,9 @@ def infer_rsi_symbol(asset_symbol: str, fund_name: str, known_symbols: Optional[
     return asset_symbol
 
 
-def infer_leverage_and_direction(name: str) -> tuple[Optional[float], Optional[str]]:
+def infer_leverage_and_direction(name: str) -> tuple[float | None, str | None]:
     normalized_name = str(name).upper()
-    leverage: Optional[float] = None
+    leverage: float | None = None
 
     match = re.search(r"(?<![A-Z0-9])([+-]?\d+(?:\.\d+)?)\s*X(?![A-Z0-9])", normalized_name)
     if match:
@@ -352,19 +414,19 @@ def infer_leverage_and_direction(name: str) -> tuple[Optional[float], Optional[s
             leverage = None
     elif re.search(r"\b200%\b", normalized_name):
         leverage = 2.0
-    elif re.search(r"\b300%\b", normalized_name):
-        leverage = 3.0
-    elif re.search(r"\bULTRAPRO\b", normalized_name):
+    elif re.search(r"\b300%\b", normalized_name) or re.search(r"\bULTRAPRO\b", normalized_name):
         leverage = 3.0
     elif re.search(r"\b(?:ULTRA|ULTRASHORT)\b", normalized_name):
         leverage = 2.0
 
-    direction: Optional[str]
+    direction: str | None
     if any(re.search(pattern, normalized_name, re.I) for pattern in INVERSE_PATTERNS):
         direction = "inverse"
-    elif any(re.search(pattern, normalized_name, re.I) for pattern in LONG_DIRECTION_PATTERNS):
-        direction = "long"
-    elif leverage is not None and leverage > 1.0:
+    elif (
+        any(re.search(pattern, normalized_name, re.I) for pattern in LONG_DIRECTION_PATTERNS)
+        or leverage is not None
+        and leverage > 1.0
+    ):
         direction = "long"
     else:
         direction = None
@@ -395,17 +457,44 @@ def _read_nasdaq_symbol_file(url: str, timeout: int) -> pd.DataFrame:
 
 def load_active_listed_symbols(timeout: int = 30) -> set[str]:
     symbols: set[str] = set()
-    for url, symbol_col in [
-        (NASDAQ_LISTED_URL, "Symbol"),
-        (OTHER_LISTED_URL, "ACT Symbol"),
+    source_status: list[dict[str, object]] = []
+    for source_name, url, symbol_col in [
+        ("nasdaq_listed", NASDAQ_LISTED_URL, "Symbol"),
+        ("other_listed", OTHER_LISTED_URL, "ACT Symbol"),
     ]:
         try:
             listed = _read_nasdaq_symbol_file(url, timeout)
-        except Exception:
+            if symbol_col not in listed.columns:
+                raise ValueError(f"missing expected {symbol_col!r} column")
+            source_symbols = {
+                symbol
+                for raw_symbol in listed[symbol_col].dropna()
+                if (symbol := normalize_yahoo_symbol(raw_symbol)) is not None
+            }
+        except Exception as exc:
+            source_status.append(
+                {
+                    "source": source_name,
+                    "url": url,
+                    "symbol_column": symbol_col,
+                    "status": "error",
+                    "symbol_count": 0,
+                    "error": str(exc),
+                }
+            )
             continue
-        if symbol_col in listed.columns:
-            symbols.update(listed[symbol_col].dropna().astype(str).str.upper())
-    return symbols
+        symbols.update(source_symbols)
+        source_status.append(
+            {
+                "source": source_name,
+                "url": url,
+                "symbol_column": symbol_col,
+                "status": "loaded",
+                "symbol_count": len(source_symbols),
+                "error": "",
+            }
+        )
+    return ActiveListedSymbols(symbols, source_status)
 
 
 def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -414,7 +503,7 @@ def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _infer_column(columns: list[str], pattern: str) -> Optional[str]:
+def _infer_column(columns: list[str], pattern: str) -> str | None:
     regex = re.compile(pattern, re.I)
     for col in columns:
         if regex.search(col):
@@ -485,7 +574,7 @@ def is_long_leveraged_name(name: str) -> bool:
     return direction != "inverse"
 
 
-def _first_matching_column(columns: Iterable[object], patterns: list[str]) -> Optional[object]:
+def _first_matching_column(columns: Iterable[object], patterns: list[str]) -> object | None:
     normalized = [(column, str(column).strip()) for column in columns]
     for pattern in patterns:
         regex = re.compile(pattern, re.I)
@@ -617,7 +706,12 @@ def _html_cards_to_universe(
     )
 
 
-def _microsectors_html_to_universe(html: str, source: UniverseSource) -> pd.DataFrame:
+def _microsectors_html_to_universe(
+    html: str,
+    source: UniverseSource,
+    *,
+    require_leveraged: bool = True,
+) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     item_pattern = re.compile(
         r'<div class="item">\s*<a[^>]*>\s*<div class="suite-name">(?P<suite>.*?)</div>'
@@ -644,7 +738,7 @@ def _microsectors_html_to_universe(html: str, source: UniverseSource) -> pd.Data
         rows,
         source.name,
         source_label=f"{source.name} ETN issuer table",
-        require_leveraged=True,
+        require_leveraged=require_leveraged,
         product_type="ETN",
     )
 
@@ -657,7 +751,12 @@ def _normalize_hidden_url_symbol(symbol: str) -> str:
     return symbol
 
 
-def _etracs_leverage_table_to_universe(html: str, source: UniverseSource) -> pd.DataFrame:
+def _etracs_leverage_table_to_universe(
+    html: str,
+    source: UniverseSource,
+    *,
+    require_leveraged: bool = True,
+) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for table in _read_html_tables(html):
         table = _clean_columns(table)
@@ -677,7 +776,11 @@ def _etracs_leverage_table_to_universe(html: str, source: UniverseSource) -> pd.
             symbol = _normalize_hidden_url_symbol(symbol_match.group(1))
 
             leverage_text = str(row[leverage_col]) if leverage_col is not None else ""
-            if leverage_col is not None and not re.search(r"\d+(?:\.\d+)?\s*x", leverage_text, re.I):
+            if (
+                require_leveraged
+                and leverage_col is not None
+                and not re.search(r"\d+(?:\.\d+)?\s*x", leverage_text, re.I)
+            ):
                 continue
 
             rows.append({"symbol": symbol, "name": row[name_col]})
@@ -686,7 +789,7 @@ def _etracs_leverage_table_to_universe(html: str, source: UniverseSource) -> pd.
         rows,
         source.name,
         source_label=f"{source.name} ETN issuer table",
-        require_leveraged=True,
+        require_leveraged=require_leveraged,
         product_type="ETN",
     )
 
@@ -725,37 +828,85 @@ def _html_source_to_universe(
 
 def load_issuer_etf_universe(timeout: int = 30) -> pd.DataFrame:
     rows = []
+    status_rows = []
     for issuer, url in ISSUER_UNIVERSE_SOURCES:
         try:
             resp = requests.get(url, timeout=timeout, headers=REQUEST_HEADERS)
             resp.raise_for_status()
-        except Exception:
+        except Exception as exc:
+            status_rows.append(
+                _workflow_source_status_row(
+                    source=issuer,
+                    source_type="issuer_etf",
+                    url=url,
+                    status="source_error",
+                    error=f"{type(exc).__name__}: {exc}"[:250],
+                )
+            )
             continue
+        parsed_rows = _html_source_to_universe(
+            resp.text,
+            issuer,
+            source_label=f"{issuer} issuer table",
+            require_leveraged=False,
+        )
         issuer_rows = _html_source_to_universe(
             resp.text,
             issuer,
             source_label=f"{issuer} issuer table",
             require_leveraged=True,
         )
+        status, error = _workflow_source_parse_status(parsed_rows, issuer_rows)
         if not issuer_rows.empty:
             rows.append(issuer_rows)
+        status_rows.append(
+            _workflow_source_status_row(
+                source=issuer,
+                source_type="issuer_etf",
+                url=url,
+                status=status,
+                parsed_row_count=len(parsed_rows),
+                row_count=len(issuer_rows),
+                error=error,
+            )
+        )
 
     if not rows:
-        return pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
-    return pd.concat(rows, ignore_index=True).drop_duplicates("symbol").sort_values("symbol").reset_index(drop=True)
+        out = pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+    else:
+        out = pd.concat(rows, ignore_index=True).drop_duplicates("symbol").sort_values("symbol").reset_index(drop=True)
+    out.attrs["workflow_source_status"] = status_rows
+    return out
 
 
 def load_etn_universe(timeout: int = 30) -> pd.DataFrame:
     rows = []
+    status_rows = []
     for source in WORKFLOW_ETN_SOURCES:
         try:
             resp = requests.get(source.url, timeout=timeout, headers=REQUEST_HEADERS)
             resp.raise_for_status()
             if source.parser == "microsectors_html":
+                parsed_rows = _microsectors_html_to_universe(
+                    resp.text,
+                    source,
+                    require_leveraged=False,
+                )
                 source_rows = _microsectors_html_to_universe(resp.text, source)
             elif source.parser == "etracs_leverage_table":
+                parsed_rows = _etracs_leverage_table_to_universe(
+                    resp.text,
+                    source,
+                    require_leveraged=False,
+                )
                 source_rows = _etracs_leverage_table_to_universe(resp.text, source)
             else:
+                parsed_rows = _html_source_to_universe(
+                    resp.text,
+                    source.name,
+                    source_label=f"{source.name} ETN issuer table",
+                    require_leveraged=False,
+                )
                 source_rows = _html_source_to_universe(
                     resp.text,
                     source.name,
@@ -767,14 +918,38 @@ def load_etn_universe(timeout: int = 30) -> pd.DataFrame:
                     "ETN",
                     regex=True,
                 )
-        except Exception:
+        except Exception as exc:
+            status_rows.append(
+                _workflow_source_status_row(
+                    source=source.name,
+                    source_type="issuer_etn",
+                    url=source.url,
+                    status="source_error",
+                    error=f"{type(exc).__name__}: {exc}"[:250],
+                )
+            )
             continue
+        status, error = _workflow_source_parse_status(parsed_rows, source_rows)
         if not source_rows.empty:
             rows.append(source_rows)
+        status_rows.append(
+            _workflow_source_status_row(
+                source=source.name,
+                source_type="issuer_etn",
+                url=source.url,
+                status=status,
+                parsed_row_count=len(parsed_rows),
+                row_count=len(source_rows),
+                error=error,
+            )
+        )
 
     if not rows:
-        return pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
-    return pd.concat(rows, ignore_index=True).drop_duplicates("symbol").sort_values("symbol").reset_index(drop=True)
+        out = pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+    else:
+        out = pd.concat(rows, ignore_index=True).drop_duplicates("symbol").sort_values("symbol").reset_index(drop=True)
+    out.attrs["workflow_source_status"] = status_rows
+    return out
 
 
 def _cboe_symbol_csv_to_universe(csv_text: str, source: UniverseSource) -> pd.DataFrame:
@@ -821,7 +996,7 @@ def _sec_fields_data_json_to_rows(
     json_text: str,
     *,
     symbol_field: str,
-    name_field: Optional[str],
+    name_field: str | None,
 ) -> list[dict[str, object]]:
     try:
         payload = json.loads(json_text)
@@ -1040,13 +1215,16 @@ def _merge_universe_sources(nasdaq_df: pd.DataFrame, issuer_df: pd.DataFrame) ->
     combined = pd.concat([nasdaq, issuer_df], ignore_index=True, sort=False)
     if combined.empty:
         return combined
+    # Nasdaq is the current ETF authority for duplicate symbols.  Issuer rows
+    # still contribute issuer-only ETFs/ETNs, but cannot overwrite current
+    # official metadata for an ETF that Nasdaq lists.
     combined["source_rank"] = combined["source"].ne("Nasdaq ETF definitions").astype(int)
-    combined = combined.sort_values(["symbol", "source_rank"], ascending=[True, False])
+    combined = combined.sort_values(["symbol", "source_rank"], ascending=[True, True])
     combined = combined.drop_duplicates("symbol", keep="first")
     return combined.drop(columns=["source_rank"]).reset_index(drop=True)
 
 
-def _workflow_row_metadata(row: pd.Series, known_symbols: Optional[set[str]]) -> pd.Series:
+def _workflow_row_metadata(row: pd.Series, known_symbols: set[str] | None) -> pd.Series:
     leverage, direction = infer_leverage_and_direction(row["name"])
     rsi_symbol = infer_rsi_symbol(row["symbol"], row["name"], known_symbols=known_symbols)
     if rsi_symbol == row["symbol"]:
@@ -1080,8 +1258,12 @@ def select_universes(etf_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     single_stock = eligible[
         eligible["fund_type"].str.contains(r"ETF \(Single Stock\)", regex=True, na=False)
     ].copy()
-    single_stock_long = single_stock[single_stock["name"].apply(is_long_leveraged_name)].copy()
-    all_long_leveraged = eligible[eligible["name"].apply(is_long_leveraged_name)].copy()
+    single_stock_long = single_stock.loc[
+        single_stock["name"].map(is_long_leveraged_name).astype(bool)
+    ].copy()
+    all_long_leveraged = eligible.loc[
+        eligible["name"].map(is_long_leveraged_name).astype(bool)
+    ].copy()
 
     return (
         single_stock_long.sort_values("symbol").reset_index(drop=True),
@@ -1090,14 +1272,38 @@ def select_universes(etf_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def determine_workflow_assets(cfg: UniverseConfig) -> pd.DataFrame:
+    if cfg.top_n is not None and (
+        isinstance(cfg.top_n, bool) or not isinstance(cfg.top_n, int) or cfg.top_n <= 0
+    ):
+        raise ValueError(f"Universe top_n must be a positive integer or None; got {cfg.top_n!r}.")
+
     nasdaq_df = load_current_etf_universe(timeout=cfg.request_timeout_seconds)
     issuer_df = load_issuer_etf_universe(timeout=cfg.request_timeout_seconds)
     etn_df = load_etn_universe(timeout=cfg.request_timeout_seconds)
+    workflow_source_status = pd.concat(
+        [_workflow_source_status(issuer_df), _workflow_source_status(etn_df)],
+        ignore_index=True,
+    )
+    workflow_source_failures = workflow_source_status[
+        ~workflow_source_status["status"].isin({"loaded", "loaded_zero_matches"})
+    ].copy()
     discovered_df = pd.concat([issuer_df, etn_df], ignore_index=True, sort=False)
-    etf_df = _merge_universe_sources(nasdaq_df, discovered_df)
     active_symbols = load_active_listed_symbols(timeout=cfg.request_timeout_seconds)
-    known_symbols: Optional[set[str]]
-    if active_symbols:
+    active_listing_complete = bool(getattr(active_symbols, "is_complete", True))
+    active_listing_status = pd.DataFrame(
+        getattr(active_symbols, "source_status", []),
+        columns=["source", "url", "symbol_column", "status", "symbol_count", "error"],
+    )
+    inactive_discovered = pd.DataFrame(columns=[*discovered_df.columns, "inactive_reason"])
+    if active_symbols and active_listing_complete:
+        active_symbols = {str(symbol).upper() for symbol in active_symbols}
+        is_active = discovered_df["symbol"].astype(str).str.upper().isin(active_symbols)
+        inactive_discovered = discovered_df.loc[~is_active].copy()
+        inactive_discovered["inactive_reason"] = "not present in active Nasdaq symbol files"
+        discovered_df = discovered_df.loc[is_active].copy()
+    etf_df = _merge_universe_sources(nasdaq_df, discovered_df)
+    known_symbols: set[str] | None
+    if active_symbols and active_listing_complete:
         known_symbols = set(etf_df["symbol"].dropna().astype(str).str.upper())
         known_symbols.update(active_symbols)
     else:
@@ -1106,6 +1312,25 @@ def determine_workflow_assets(cfg: UniverseConfig) -> pd.DataFrame:
     single_stock_long, all_long_leveraged = select_universes(etf_df)
     nasdaq_universe = build_nasdaq_universe_table(etf_df)
     save_table_to_sqlite(nasdaq_universe, cfg.sqlite_db_path, "nasdaq_etf_universe")
+    save_table_to_sqlite(
+        inactive_discovered,
+        cfg.sqlite_db_path,
+        "universe_inactive_discovered_products",
+    )
+    save_table_to_sqlite(
+        active_listing_status,
+        cfg.sqlite_db_path,
+        "universe_active_listing_source_status",
+    )
+    save_table_to_sqlite(
+        workflow_source_status,
+        cfg.sqlite_db_path,
+        "universe_workflow_source_status",
+    )
+
+    if cfg.require_workflow_source_success and not workflow_source_failures.empty:
+        failed_sources = ", ".join(workflow_source_failures["source"].astype(str).tolist())
+        raise RuntimeError(f"Workflow universe sources were unusable: {failed_sources}.")
 
     if all_long_leveraged.empty:
         raise RuntimeError("Nasdaq ETF universe returned no current long leveraged ETFs.")
@@ -1147,6 +1372,12 @@ def determine_workflow_assets(cfg: UniverseConfig) -> pd.DataFrame:
         "Current ETFs in Nasdaq table": len(nasdaq_df),
         "Current issuer-discovered leveraged ETFs found": len(issuer_df),
         "Current issuer-discovered leveraged ETNs found": len(etn_df),
+        "Inactive issuer-discovered ETFs/ETNs skipped": len(inactive_discovered),
+        "Active listing sources loaded": int(
+            (active_listing_status["status"] == "loaded").sum()
+        ) if not active_listing_status.empty else 0,
+        "Active listing snapshot complete": active_listing_complete,
+        "Workflow universe sources failed": len(workflow_source_failures),
         "Merged current ETFs/ETNs": len(etf_df),
         "Current long single-stock leveraged ETFs found": len(single_stock_long),
         "Current long leveraged ETFs/ETNs found": len(all_long_leveraged),
@@ -1154,6 +1385,7 @@ def determine_workflow_assets(cfg: UniverseConfig) -> pd.DataFrame:
         "Audit rows parsed": len(audit_rows),
         "Audit leveraged candidates missing from merged universe": len(audit_report),
     }
+    out.attrs["universe_degraded"] = not workflow_source_failures.empty
     out.attrs["universe_db_path"] = cfg.sqlite_db_path
     return out
 
