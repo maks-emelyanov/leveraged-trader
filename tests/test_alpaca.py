@@ -13,6 +13,7 @@ from requests import HTTPError
 
 from leveraged_trader.alpaca import (
     AlpacaClient,
+    _alpaca_dynamic_batch_cash_fraction,
     reconcile_alpaca_managed_positions,
     submit_alpaca_paper_buy_orders,
     submit_alpaca_paper_sell_orders,
@@ -62,7 +63,7 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca._latest_market_price")
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
-    def test_buy_order_uses_10_percent_cash_whole_share_qty(
+    def test_buy_order_uses_5_percent_cash_for_one_eligible_signal(
         self,
         mock_get: Mock,
         mock_post: Mock,
@@ -89,13 +90,20 @@ class AlpacaTests(unittest.TestCase):
         )
 
         self.assertEqual(result.loc[0, "Status"], "submitted")
-        self.assertEqual(result.loc[0, "Notional"], 1155.0)
-        self.assertEqual(result.loc[0, "Qty"], 11)
+        self.assertEqual(result.loc[0, "Notional"], 525.0)
+        self.assertEqual(result.loc[0, "Qty"], 5)
         self.assertEqual(result.loc[0, "Limit Price"], 105.0)
-        self.assertEqual(mock_post.call_args.kwargs["json"]["qty"], "11")
+        self.assertEqual(mock_post.call_args.kwargs["json"]["qty"], "5")
         self.assertEqual(mock_post.call_args.kwargs["json"]["type"], "limit")
         self.assertEqual(mock_post.call_args.kwargs["json"]["limit_price"], "105")
         self.assertFalse(mock_post.call_args.kwargs["json"]["extended_hours"])
+
+    def test_dynamic_batch_cash_fraction_scales_with_eligible_signal_count(self) -> None:
+        self.assertEqual(_alpaca_dynamic_batch_cash_fraction(1), 0.05)
+        self.assertEqual(_alpaca_dynamic_batch_cash_fraction(2), 0.10)
+        self.assertEqual(_alpaca_dynamic_batch_cash_fraction(9), 0.45)
+        self.assertEqual(_alpaca_dynamic_batch_cash_fraction(10), 0.50)
+        self.assertEqual(_alpaca_dynamic_batch_cash_fraction(11), 0.50)
 
     def test_direct_sell_signal_submission_is_disabled(self) -> None:
         result = submit_alpaca_paper_sell_orders(
@@ -233,15 +241,15 @@ class AlpacaTests(unittest.TestCase):
         )
 
         self.assertEqual(result.loc[0, "Status"], "submitted")
-        self.assertEqual(result.loc[0, "Notional"], 1155.0)
-        self.assertEqual(result.loc[0, "Qty"], 11)
-        self.assertEqual(mock_post.call_args.kwargs["json"]["qty"], "11")
+        self.assertEqual(result.loc[0, "Notional"], 525.0)
+        self.assertEqual(result.loc[0, "Qty"], 5)
+        self.assertEqual(mock_post.call_args.kwargs["json"]["qty"], "5")
         self.assertEqual(mock_post.call_args.kwargs["json"]["type"], "limit")
 
     @patch("leveraged_trader.alpaca._latest_market_price", return_value=25.0)
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
-    def test_buy_batch_reserves_at_most_configured_cash_fraction(
+    def test_buy_batch_reserves_5_percent_cash_per_eligible_signal(
         self,
         mock_get: Mock,
         mock_post: Mock,
@@ -310,8 +318,8 @@ class AlpacaTests(unittest.TestCase):
         )
 
         self.assertEqual(result["Status"].tolist(), ["not_tradable", "submitted"])
-        self.assertEqual(result.loc[1, "Qty"], 3)
-        self.assertEqual(result.loc[1, "Notional"], 78.75)
+        self.assertEqual(result.loc[1, "Qty"], 1)
+        self.assertEqual(result.loc[1, "Notional"], 26.25)
 
     @patch("leveraged_trader.alpaca._latest_market_price", return_value=100.0)
     @patch("leveraged_trader.alpaca.requests.post")
@@ -427,7 +435,7 @@ class AlpacaTests(unittest.TestCase):
             response(200, {"symbol": "TQQQ", "status": "active", "tradable": True}),
             response(200, {"is_open": False, "timestamp": "2026-01-05T13:30:00Z", "next_open": "2026-01-05T14:30:00Z"}),
             response(200, [{"date": "2026-01-02"}, {"date": "2026-01-05"}]),
-            response(200, {"cash": "2000"}),
+            response(200, {"cash": "3000"}),
             response(200, {"id": "buy-1", "status": "accepted", "submitted_at": "2026-01-05T13:31:00Z"}),
         ]
         mock_post.side_effect = requests.Timeout("response lost after broker acceptance")
@@ -469,7 +477,7 @@ class AlpacaTests(unittest.TestCase):
             response(200, {"symbol": "TQQQ", "status": "active", "tradable": True}),
             response(200, {"is_open": False, "timestamp": "2026-01-05T13:30:00Z", "next_open": "2026-01-05T14:30:00Z"}),
             response(200, [{"date": "2026-01-02"}, {"date": "2026-01-05"}]),
-            response(200, {"cash": "2000"}),
+            response(200, {"cash": "3000"}),
             response(404, {}),
         ]
         mock_post.side_effect = requests.Timeout("response lost")
@@ -589,7 +597,7 @@ class AlpacaTests(unittest.TestCase):
             response(200, {"symbol": "TQQQ", "status": "active", "tradable": True}),
             response(200, {"is_open": False, "timestamp": "2026-01-05T13:30:00Z", "next_open": "2026-01-05T14:30:00Z"}),
             response(200, [{"date": "2026-01-02"}, {"date": "2026-01-05"}]),
-            response(200, {"cash": "2000"}),
+            response(200, {"cash": "3000"}),
         ]
         mock_post.return_value = response(200, {"id": "buy-retry", "status": "accepted"})
 
@@ -871,7 +879,7 @@ class AlpacaTests(unittest.TestCase):
             response(200, {"symbol": "TQQQ", "status": "active", "tradable": True}),
             response(200, {"is_open": False, "timestamp": "2026-01-05T13:30:00Z", "next_open": "2026-01-05T14:30:00Z"}),
             response(200, [{"date": "2026-01-02"}, {"date": "2026-01-05"}]),
-            response(200, {"cash": "2000"}),
+            response(200, {"cash": "3000"}),
             response(404, {}),
         ]
         mock_post.return_value = error_response(422, {"message": "client_order_id already exists"})
@@ -1432,7 +1440,7 @@ class AlpacaTests(unittest.TestCase):
                     {"is_open": False, "timestamp": "2026-01-05T13:30:00Z", "next_open": "2026-01-05T14:30:00Z"},
                 ),
                 response(200, [{"date": "2026-01-02"}, {"date": "2026-01-05"}]),
-                response(200, {"cash": "2000"}),
+                response(200, {"cash": "3000"}),
                 response(404, {}),
             ]
 

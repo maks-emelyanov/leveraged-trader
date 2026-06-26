@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 from leveraged_trader.alpaca import _alpaca_headers
+from leveraged_trader.cli import parse_args
 from leveraged_trader.config import AlpacaOrderConfig, load_dotenv
 
 
@@ -30,6 +33,28 @@ class ConfigTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "placeholder Alpaca credentials"):
             _alpaca_headers(cfg)
+
+    def test_removed_alpaca_batch_cash_fraction_env_is_rejected(self) -> None:
+        with (
+            patch.dict(os.environ, {"ALPACA_BATCH_CASH_FRACTION": "0.25"}, clear=False),
+            patch.object(sys, "argv", ["leveraged-trader"]),
+            patch("sys.stderr", new_callable=StringIO),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            parse_args()
+
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_removed_alpaca_batch_cash_fraction_cli_flag_is_rejected(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sys, "argv", ["leveraged-trader", "--alpaca-batch-cash-fraction", "0.25"]),
+            patch("sys.stderr", new_callable=StringIO),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            parse_args()
+
+        self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

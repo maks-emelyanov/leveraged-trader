@@ -18,6 +18,8 @@
 - Added a NumPy/Numba-backed optimization loop for faster parameter-grid processing.
 - Added active managed-position and open sell order guardrails for buy submissions.
 - Added managed-position, eligible-buy, and reconciliation CSV outputs.
+- Changed Alpaca buy batch sizing to reserve 5% of cash per eligible buy signal, capped at 50%.
+- Removed the obsolete fixed Alpaca batch cash fraction option and now reject the legacy environment variable.
 - Expanded README usage docs with a CLI reference and environment variable section.
 - Documented Alpaca timeout configuration and option discovery via `--help`.
 - Clarified `update` vs `rebuild` behavior and runtime config precedence in architecture docs.

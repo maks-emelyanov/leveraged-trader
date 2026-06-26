@@ -17,6 +17,13 @@ from .config import (
 )
 from .workflow import DEFAULT_WORKFLOW_CONCURRENCY, run_resumable_optimizations
 
+REMOVED_ENV_VARS = {
+    "ALPACA_BATCH_CASH_FRACTION": (
+        "Alpaca buy batches now reserve min(number_of_eligible_buy_signals * 0.05, 0.50) "
+        "of account cash; remove ALPACA_BATCH_CASH_FRACTION from the environment or .env."
+    ),
+}
+
 
 def _env_bool(name: str, default: bool) -> bool:
     value = os.environ.get(name)
@@ -106,12 +113,6 @@ def parse_args() -> argparse.Namespace:
         help="Timeout for Alpaca API requests.",
     )
     parser.add_argument(
-        "--alpaca-batch-cash-fraction",
-        type=float,
-        default=_env_float("ALPACA_BATCH_CASH_FRACTION", 0.10),
-        help="Maximum fraction of account cash reserved across one buy-order batch (default: 0.10).",
-    )
-    parser.add_argument(
         "--alpaca-buy-limit-buffer-bps",
         type=float,
         default=_env_float("ALPACA_BUY_LIMIT_BUFFER_BPS", 500.0),
@@ -187,7 +188,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable colored terminal output.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    for name, message in REMOVED_ENV_VARS.items():
+        if name in os.environ:
+            parser.error(message)
+    return args
 
 
 def main() -> None:
@@ -215,7 +220,6 @@ def main() -> None:
         api_key_id=args.alpaca_api_key_id,
         api_secret_key=args.alpaca_api_secret_key,
         base_url=args.alpaca_base_url,
-        batch_cash_fraction=args.alpaca_batch_cash_fraction,
         buy_limit_buffer_bps=args.alpaca_buy_limit_buffer_bps,
         timeout_seconds=args.alpaca_timeout_seconds,
         gtc_sell_renewal_enabled=args.alpaca_gtc_sell_renewal,

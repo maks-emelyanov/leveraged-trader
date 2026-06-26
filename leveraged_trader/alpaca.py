@@ -36,6 +36,8 @@ _MANAGED_QTY_TOLERANCE = 1e-8
 _BUY_SUBMISSION_VISIBILITY_LEASE = timedelta(minutes=5)
 _ALPACA_DOLLAR_PRICE_TICK = Decimal("0.01")
 _ALPACA_SUBDOLLAR_PRICE_TICK = Decimal("0.0001")
+_BUY_BATCH_CASH_FRACTION_PER_ELIGIBLE_SIGNAL = 0.05
+_BUY_BATCH_CASH_FRACTION_MAX = 0.50
 
 
 def _alpaca_headers(cfg: AlpacaOrderConfig) -> dict[str, str]:
@@ -118,7 +120,21 @@ def _is_whole_share_qty(value: float) -> bool:
     return qty == qty.to_integral_value()
 
 
-def _alpaca_cash_notional(cfg: AlpacaOrderConfig, headers: dict[str, str]) -> float:
+def _alpaca_dynamic_batch_cash_fraction(eligible_buy_signal_count: int) -> float:
+    if eligible_buy_signal_count < 1:
+        raise ValueError(f"Eligible buy signal count must be positive; got {eligible_buy_signal_count}.")
+    return min(
+        eligible_buy_signal_count * _BUY_BATCH_CASH_FRACTION_PER_ELIGIBLE_SIGNAL,
+        _BUY_BATCH_CASH_FRACTION_MAX,
+    )
+
+
+def _alpaca_cash_notional(
+    cfg: AlpacaOrderConfig,
+    headers: dict[str, str],
+    *,
+    eligible_buy_signal_count: int,
+) -> float:
     base_url = cfg.base_url.rstrip("/")
     account_resp = requests.get(
         f"{base_url}/v2/account",
@@ -128,9 +144,7 @@ def _alpaca_cash_notional(cfg: AlpacaOrderConfig, headers: dict[str, str]) -> fl
     account_resp.raise_for_status()
     account = account_resp.json()
     cash = float(account["cash"])
-    cash_fraction = cfg.batch_cash_fraction if cfg.batch_cash_fraction is not None else cfg.cash_fraction
-    if not 0 < cash_fraction <= 1:
-        raise ValueError(f"Alpaca batch cash fraction must be within (0, 1]; got {cash_fraction}.")
+    cash_fraction = _alpaca_dynamic_batch_cash_fraction(eligible_buy_signal_count)
     notional = round(cash * cash_fraction, 2)
     if notional <= 0:
         raise ValueError(f"Alpaca account cash must be positive to submit buy orders; got {cash}.")
@@ -489,8 +503,12 @@ class AlpacaClient:
             raise ValueError("Alpaca calendar returned an invalid response")
         return payload
 
-    def cash_notional(self) -> float:
-        return _alpaca_cash_notional(self.cfg, self.headers)
+    def cash_notional(self, *, eligible_buy_signal_count: int) -> float:
+        return _alpaca_cash_notional(
+            self.cfg,
+            self.headers,
+            eligible_buy_signal_count=eligible_buy_signal_count,
+        )
 
     def position_qty(self, symbol: str) -> float:
         return _alpaca_position_qty(symbol, self.cfg, self.headers)
@@ -2206,7 +2224,7 @@ def submit_alpaca_paper_buy_orders(
     if eligible_orders:
         assert client is not None
         try:
-            batch_notional = client.cash_notional()
+            batch_notional = client.cash_notional(eligible_buy_signal_count=len(eligible_orders))
         except HTTPError as exc:
             for order in eligible_orders:
                 append_preflight_result(

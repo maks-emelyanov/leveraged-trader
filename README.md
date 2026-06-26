@@ -35,7 +35,6 @@ Edit `.env` with Alpaca paper credentials before running the default Alpaca subm
 ALPACA_API_KEY_ID=your_alpaca_paper_api_key_id
 ALPACA_API_SECRET_KEY=your_alpaca_paper_api_secret_key
 ALPACA_BASE_URL=https://paper-api.alpaca.markets
-ALPACA_BATCH_CASH_FRACTION=0.10
 ALPACA_BUY_LIMIT_BUFFER_BPS=500
 ALPACA_GTC_SELL_RENEWAL_ENABLED=true
 ALPACA_GTC_SELL_RENEWAL_DAYS_BEFORE_EXPIRATION=7
@@ -111,7 +110,6 @@ Common options:
 - `--alpaca-api-secret-key VALUE`: override `ALPACA_API_SECRET_KEY`.
 - `--alpaca-base-url URL`: override `ALPACA_BASE_URL` (defaults to Alpaca paper endpoint).
 - `--alpaca-timeout-seconds INT`: Alpaca request timeout in seconds (default: `30`).
-- `--alpaca-batch-cash-fraction FLOAT`: maximum fraction of cash reserved across one buy batch (default: `0.10`).
 - `--alpaca-buy-limit-buffer-bps FLOAT`: price buffer for whole-share day buy limits in basis points (default: `500`).
 - `--alpaca-gtc-sell-renewal / --no-alpaca-gtc-sell-renewal`: renew managed Alpaca GTC sells before expiration.
 - `--alpaca-gtc-sell-renewal-days-before-expiration INT`: renewal window for managed GTC sells (default: `7`).
@@ -163,7 +161,6 @@ Supported environment variables:
 - `ALPACA_API_KEY_ID`
 - `ALPACA_API_SECRET_KEY`
 - `ALPACA_BASE_URL`
-- `ALPACA_BATCH_CASH_FRACTION`
 - `ALPACA_BUY_LIMIT_BUFFER_BPS`
 - `ALPACA_GTC_SELL_RENEWAL_ENABLED`
 - `ALPACA_GTC_SELL_RENEWAL_DAYS_BEFORE_EXPIRATION`
@@ -173,6 +170,8 @@ Supported environment variables:
 - `TRADIER_BASE_URL`
 - `TRADIER_FALLBACK_ENABLED`
 - `TRADIER_TIMEOUT_SECONDS`
+
+`ALPACA_BATCH_CASH_FRACTION` is intentionally no longer supported. Buy sizing is dynamic, so remove that legacy key from `.env` or the CLI will fail fast instead of silently ignoring it.
 
 If your environment has not installed project entry points yet, use the module entry point:
 
@@ -186,8 +185,8 @@ Alpaca submission is enabled by default. Use `--no-alpaca-submit-buy-orders` or 
 
 Buy orders:
 
-- Reserve at most the configured batch fraction of current Alpaca paper account cash across all submitted buys.
-- Split the batch budget equally across recommendations that pass all live preflight checks (including a quote) and size integer whole-share quantities.
+- Reserve `min(number_of_eligible_buy_signals * 0.05, 0.50)` of current Alpaca paper account cash across all submitted buys.
+- Split the dynamic batch budget equally across recommendations that pass all live preflight checks (including a quote) and size integer whole-share quantities.
 - Use regular-session day limit orders with a configurable price buffer; a gap beyond the limit safely leaves the order unfilled.
 - Serialize limit prices at Alpaca's valid tick: four decimals below `$1` and two at or above `$1`; buy caps round down and sell targets round up.
 - Are skipped if the allocated batch budget is below one whole share at the protected limit price.

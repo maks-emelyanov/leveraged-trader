@@ -37,8 +37,6 @@ class AlpacaOrderConfig:
     api_key_id: str | None = None
     api_secret_key: str | None = None
     base_url: str = ALPACA_PAPER_BASE_URL
-    cash_fraction: float = 0.10
-    batch_cash_fraction: float | None = None
     buy_limit_buffer_bps: float = 500.0
     timeout_seconds: int = 30
     gtc_sell_renewal_enabled: bool = True
