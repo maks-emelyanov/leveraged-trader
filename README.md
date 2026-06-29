@@ -154,7 +154,9 @@ partial universe caused by a fetch or parser failure is not acceptable.
 Terminal output is intentionally compact: concurrent asset work is shown as aggregate progress, then
 the final asset summary is sorted by workflow index. CSV files retain full order IDs and detail, while
 terminal Alpaca tables show the most useful fields with wrapped messages. A final workflow benchmark
-footer reports wall time, CPU time, memory use, processed assets, and processed rows.
+footer reports wall time, CPU time, memory use, processed assets, and processed rows. Redirected
+or cron-driven non-terminal output defaults to a 160-column layout so log tables stay readable, while
+interactive terminal output uses the terminal's current width.
 
 ## Environment Variables
 

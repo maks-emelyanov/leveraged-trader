@@ -15,6 +15,8 @@ from rich.text import Text
 
 from .benchmark import WorkflowBenchmark
 
+DEFAULT_NON_TERMINAL_WIDTH = 160
+
 STATUS_STYLES = {
     "accepted": "green",
     "batch_budget_exhausted": "yellow",
@@ -130,7 +132,7 @@ class AssetProgress:
 
 class WorkflowReporter:
     def __init__(self, *, console: Console | None = None, no_color: bool = False) -> None:
-        self.console = console or Console(no_color=no_color)
+        self.console = console or _default_console(no_color=no_color)
 
     @contextmanager
     def status(self, message: str) -> Iterator[None]:
@@ -456,6 +458,13 @@ def format_value(value: Any) -> str:
     if isinstance(value, float):
         return format_decimal(value, 4)
     return str(value)
+
+
+def _default_console(*, no_color: bool) -> Console:
+    console = Console(no_color=no_color)
+    if console.is_terminal:
+        return console
+    return Console(no_color=no_color, width=DEFAULT_NON_TERMINAL_WIDTH)
 
 
 def _grid_range_label(values: list[float], *, places: int, step_label: str) -> str:

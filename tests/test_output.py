@@ -3,15 +3,78 @@ from __future__ import annotations
 import io
 import unittest
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 import pandas as pd
 from rich.console import Console
 
 from leveraged_trader.benchmark import WorkflowBenchmark
-from leveraged_trader.output import WorkflowReporter
+from leveraged_trader.output import DEFAULT_NON_TERMINAL_WIDTH, WorkflowReporter
 
 
 class OutputTests(unittest.TestCase):
+    def test_default_reporter_uses_wide_width_for_non_terminal_output(self) -> None:
+        output_buffer = io.StringIO()
+        created_consoles: list[Console] = []
+
+        def console_factory(**kwargs: object) -> Console:
+            console = Console(file=output_buffer, record=True, color_system=None, **kwargs)
+            created_consoles.append(console)
+            return console
+
+        with patch("leveraged_trader.output.Console", side_effect=console_factory):
+            reporter = WorkflowReporter(no_color=True)
+
+        self.assertEqual(len(created_consoles), 2)
+        self.assertFalse(created_consoles[0].is_terminal)
+        self.assertEqual(reporter.console.width, DEFAULT_NON_TERMINAL_WIDTH)
+
+    def test_default_reporter_keeps_terminal_width_auto_sized(self) -> None:
+        terminal_console = Console(file=io.StringIO(), force_terminal=True, color_system=None, no_color=True)
+
+        with patch("leveraged_trader.output.Console", return_value=terminal_console) as mock_console:
+            reporter = WorkflowReporter(no_color=True)
+
+        mock_console.assert_called_once_with(no_color=True)
+        self.assertIs(reporter.console, terminal_console)
+
+    def test_injected_console_width_is_respected(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=120, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+
+        self.assertIs(reporter.console, console)
+        self.assertEqual(reporter.console.width, 120)
+
+    def test_default_non_terminal_width_keeps_table_output_readable(self) -> None:
+        output_buffer = io.StringIO()
+
+        def console_factory(**kwargs: object) -> Console:
+            return Console(file=output_buffer, record=True, color_system=None, **kwargs)
+
+        with patch("leveraged_trader.output.Console", side_effect=console_factory):
+            reporter = WorkflowReporter(no_color=True)
+
+        reporter.reconciliation(
+            pd.DataFrame(
+                [
+                    {
+                        "Position ID": 1,
+                        "Asset": "TQQQ",
+                        "Action": "sell",
+                        "Status": "submitted",
+                        "Qty": 2,
+                        "Limit Price": 150.0,
+                        "Message": "submitted one-time GTC limit sell at frozen target price",
+                    }
+                ]
+            )
+        )
+        output = reporter.console.export_text(styles=False)
+
+        self.assertIn("Submitted GTC limit sell at frozen target price", output)
+        for line in output.splitlines():
+            self.assertLessEqual(len(line), DEFAULT_NON_TERMINAL_WIDTH)
+
     def test_reconciliation_table_wraps_message_without_truncating(self) -> None:
         console = Console(file=io.StringIO(), record=True, width=80, color_system=None, no_color=True)
         reporter = WorkflowReporter(console=console)
