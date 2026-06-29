@@ -13,6 +13,8 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn
 from rich.table import Column, Table
 from rich.text import Text
 
+from .benchmark import WorkflowBenchmark
+
 STATUS_STYLES = {
     "accepted": "green",
     "batch_budget_exhausted": "yellow",
@@ -386,6 +388,31 @@ class WorkflowReporter:
             caption="Closed positions missing actual sell fill prices are excluded from realized P/L totals.",
         )
 
+    def benchmark_report(self, benchmark: WorkflowBenchmark) -> None:
+        self.section("Workflow Benchmark")
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style="bold", no_wrap=True)
+        table.add_column(ratio=1)
+        table.add_row("Status", benchmark.status)
+        table.add_row("Started UTC", format_timestamp(benchmark.started_at_utc))
+        table.add_row("Finished UTC", format_timestamp(benchmark.finished_at_utc))
+        table.add_row("Wall time", format_duration(benchmark.wall_seconds))
+        table.add_row("CPU time", format_duration(benchmark.cpu_seconds))
+        table.add_row("CPU utilization", format_percent_2(benchmark.cpu_utilization_percent))
+        table.add_row("Peak RSS", format_mb(benchmark.peak_rss_mb))
+        table.add_row("Current RSS", format_mb(benchmark.current_rss_mb))
+        table.add_row(
+            "Assets",
+            (
+                f"{format_int(benchmark.completed_asset_count)} completed / "
+                f"{format_int(benchmark.asset_count)} total; "
+                f"{format_int(benchmark.skipped_asset_count)} skipped"
+            ),
+        )
+        table.add_row("Rows processed", format_int(benchmark.rows_processed))
+        table.add_row("Workflow concurrency", format_int(benchmark.workflow_concurrency))
+        self.console.print(table)
+
     def _table(self, df: pd.DataFrame, columns: list[TableColumn], *, caption: str | None) -> Table:
         table = Table(
             box=box.SIMPLE_HEAVY,
@@ -476,6 +503,40 @@ def format_decimal_4(value: Any) -> str:
 def format_percent_2(value: Any) -> str:
     text = format_decimal(value, 2)
     return f"{text}%" if text else text
+
+
+def format_mb(value: Any) -> str:
+    text = format_decimal(value, 2)
+    return f"{text} MB" if text else "unavailable"
+
+
+def format_duration(value: Any) -> str:
+    if _is_empty(value):
+        return ""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if math.isnan(seconds):
+        return ""
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    minutes, remaining_seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {remaining_seconds:05.2f}s"
+    hours, remaining_minutes = divmod(minutes, 60)
+    return f"{int(hours)}h {int(remaining_minutes):02d}m {remaining_seconds:05.2f}s"
+
+
+def format_timestamp(value: Any) -> str:
+    if _is_empty(value):
+        return ""
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat(timespec="seconds")
+        except TypeError:
+            return value.isoformat()
+    return str(value)
 
 
 def format_decimal(value: Any, places: int, *, trim: bool = False) -> str:

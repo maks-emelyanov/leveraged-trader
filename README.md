@@ -135,6 +135,7 @@ CSV reports are written to `outputs/` by default:
 - `alpaca_reconciliation_results.csv`
 - `alpaca_order_results.csv`
 - `alpaca_sell_order_results.csv`
+- `workflow_benchmark.csv`
 
 Use `--output-dir` to choose a different location:
 
@@ -152,7 +153,8 @@ partial universe caused by a fetch or parser failure is not acceptable.
 
 Terminal output is intentionally compact: concurrent asset work is shown as aggregate progress, then
 the final asset summary is sorted by workflow index. CSV files retain full order IDs and detail, while
-terminal Alpaca tables show the most useful fields with wrapped messages.
+terminal Alpaca tables show the most useful fields with wrapped messages. A final workflow benchmark
+footer reports wall time, CPU time, memory use, processed assets, and processed rows.
 
 ## Environment Variables
 

@@ -12,6 +12,7 @@ from unittest.mock import patch
 import pandas as pd
 from rich.console import Console
 
+from leveraged_trader.benchmark import BenchmarkTracker
 from leveraged_trader.config import AlpacaOrderConfig, BacktestConfig, UniverseConfig
 from leveraged_trader.output import WorkflowReporter
 from leveraged_trader.storage import init_state_db
@@ -23,6 +24,7 @@ from leveraged_trader.workflow import (
     _prepare_asset_run,
     _process_workflow_asset,
     _state_connection,
+    _write_workflow_outputs,
     run_resumable_optimizations_async,
 )
 
@@ -487,6 +489,68 @@ class WorkflowAsyncTests(unittest.TestCase):
         mock_write_outputs.assert_called_once()
         asset_run_results = mock_write_outputs.call_args.kwargs["asset_run_results"]
         self.assertEqual([result.workflow_idx for result in asset_run_results], [1, 2, 3])
+
+    def test_write_workflow_outputs_writes_benchmark_csv(self) -> None:
+        asset_run_results = [
+            AssetRunResult(
+                workflow_idx=1,
+                asset_symbol="TQQQ",
+                signal_symbol="QQQ",
+                action="Updating",
+                rows_processed=12,
+                status="done",
+                message="Processed 12 rows",
+            ),
+            AssetRunResult(
+                workflow_idx=2,
+                asset_symbol="UPRO",
+                signal_symbol="SPY",
+                action="Updating",
+                rows_processed=None,
+                status="skipped",
+                message="No finalized daily market data is available yet.",
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "outputs"
+            output_buffer = io.StringIO()
+            reporter = WorkflowReporter(
+                console=Console(file=output_buffer, width=100, color_system=None, no_color=True)
+            )
+            _write_workflow_outputs(
+                mode="update",
+                db_path=str(Path(tmp) / "state.sqlite"),
+                base_cfg=BacktestConfig(),
+                buy_rsi_values=[30.0],
+                profit_target_values=[1.5],
+                alpaca_cfg=AlpacaOrderConfig(),
+                output_dir=str(output_dir),
+                workflow_concurrency=3,
+                reporter=reporter,
+                asset_run_results=asset_run_results,
+                optimization_summary=pd.DataFrame(),
+                curves=pd.DataFrame(),
+                buy_signals=pd.DataFrame(),
+                eligible_buy_signals=pd.DataFrame(),
+                sell_signals=pd.DataFrame(),
+                realized_pnl_summary=pd.DataFrame(),
+                managed_positions=pd.DataFrame(),
+                reconciliation_results=pd.DataFrame(columns=["Action"]),
+                sell_reconciliation_results=pd.DataFrame(),
+                order_results=pd.DataFrame(),
+                benchmark_tracker=BenchmarkTracker.start(),
+            )
+
+            benchmark = pd.read_csv(output_dir / "workflow_benchmark.csv").iloc[0].to_dict()
+
+        self.assertEqual(benchmark["status"], "completed")
+        self.assertEqual(benchmark["asset_count"], 2)
+        self.assertEqual(benchmark["completed_asset_count"], 1)
+        self.assertEqual(benchmark["skipped_asset_count"], 1)
+        self.assertEqual(benchmark["rows_processed"], 12)
+        self.assertEqual(benchmark["workflow_concurrency"], 3)
+        self.assertIn("Workflow Benchmark", output_buffer.getvalue())
 
 
 if __name__ == "__main__":

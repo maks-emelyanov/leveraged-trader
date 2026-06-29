@@ -10,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 
 from .alpaca import reconcile_alpaca_managed_positions, submit_alpaca_paper_buy_orders
+from .benchmark import BenchmarkTracker
 from .config import (
     RISK_FREE_SYMBOL,
     AlpacaOrderConfig,
@@ -435,6 +436,7 @@ async def run_resumable_optimizations_async(
     concurrency = max(1, workflow_concurrency)
     universe_cfg = replace(universe_cfg, sqlite_db_path=db_path)
     reporter = reporter or WorkflowReporter(no_color=no_color)
+    benchmark_tracker = BenchmarkTracker.start()
 
     with reporter.status("Initializing workflow state"):
         await asyncio.to_thread(_initialize_state_db, db_path)
@@ -576,6 +578,7 @@ async def run_resumable_optimizations_async(
         reconciliation_results=reconciliation_results,
         sell_reconciliation_results=sell_reconciliation_results,
         order_results=order_results,
+        benchmark_tracker=benchmark_tracker,
     )
 
 
@@ -633,6 +636,7 @@ def _write_workflow_outputs(
     reconciliation_results: pd.DataFrame,
     sell_reconciliation_results: pd.DataFrame,
     order_results: pd.DataFrame,
+    benchmark_tracker: BenchmarkTracker,
 ) -> None:
     reporter.settings(
         mode=mode,
@@ -674,3 +678,9 @@ def _write_workflow_outputs(
         reporter.reconciliation(reconciliation_results)
     reporter.realized_pnl_summary(realized_pnl_summary)
     sell_reconciliation_results.to_csv(output_path / "alpaca_sell_order_results.csv", index=False)
+    benchmark = benchmark_tracker.finish(
+        asset_run_results=asset_run_results,
+        workflow_concurrency=workflow_concurrency,
+    )
+    pd.DataFrame([benchmark.as_csv_row()]).to_csv(output_path / "workflow_benchmark.csv", index=False)
+    reporter.benchmark_report(benchmark)

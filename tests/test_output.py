@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import io
 import unittest
+from datetime import UTC, datetime
 
 import pandas as pd
 from rich.console import Console
 
+from leveraged_trader.benchmark import WorkflowBenchmark
 from leveraged_trader.output import WorkflowReporter
 
 
@@ -150,6 +152,37 @@ class OutputTests(unittest.TestCase):
         self.assertIn("Buy RSI values", output)
         self.assertIn("Sell return multiples", output)
         self.assertIn("none", output)
+
+    def test_benchmark_report_renders_runtime_and_memory_summary(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+
+        reporter.benchmark_report(
+            WorkflowBenchmark(
+                status="completed",
+                started_at_utc=datetime(2026, 1, 2, 14, 30, tzinfo=UTC),
+                finished_at_utc=datetime(2026, 1, 2, 14, 31, 5, tzinfo=UTC),
+                wall_seconds=65.25,
+                cpu_seconds=32.5,
+                cpu_utilization_percent=49.81,
+                peak_rss_mb=123.45,
+                current_rss_mb=120.25,
+                asset_count=2,
+                completed_asset_count=1,
+                skipped_asset_count=1,
+                rows_processed=10,
+                workflow_concurrency=4,
+            )
+        )
+        output = console.export_text(styles=False)
+
+        self.assertIn("Workflow Benchmark", output)
+        self.assertIn("1m 05.25s", output)
+        self.assertIn("49.81%", output)
+        self.assertIn("123.45 MB", output)
+        self.assertIn("1 completed / 2 total; 1 skipped", output)
+        for line in output.splitlines():
+            self.assertLessEqual(len(line), 100)
 
 
 if __name__ == "__main__":
