@@ -243,6 +243,8 @@ def build_pending_action_report(
         "Asset",
         "RSI Symbol",
         "Date",
+        "Start Date",
+        "Trading Days",
         "Latest RSI",
         "Buy RSI",
         "Sell Return Multiple",
@@ -301,6 +303,8 @@ def build_pending_action_report(
         in_position = bool(state["in_position"])
         pending_action = state["pending_action"]
         latest_rsi_value = float(latest_rsi[1])
+        start_date = summary_row.get("Start Date", state["start_date"])
+        trading_days = summary_row.get("Trading Days", pd.NA)
 
         should_include = (
             (pending_action_filter == "buy" and not in_position)
@@ -312,6 +316,8 @@ def build_pending_action_report(
                     "Asset": asset_symbol,
                     "RSI Symbol": signal_symbol,
                     "Date": latest_rsi[0],
+                    "Start Date": start_date,
+                    "Trading Days": trading_days,
                     "Latest RSI": latest_rsi_value,
                     "Buy RSI": buy_rsi,
                     "Sell Return Multiple": profit_target_multiple,

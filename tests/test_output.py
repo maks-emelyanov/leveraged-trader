@@ -9,7 +9,7 @@ import pandas as pd
 from rich.console import Console
 
 from leveraged_trader.benchmark import WorkflowBenchmark
-from leveraged_trader.output import DEFAULT_NON_TERMINAL_WIDTH, WorkflowReporter
+from leveraged_trader.output import DEFAULT_NON_TERMINAL_WIDTH, TableColumn, WorkflowReporter
 
 
 class OutputTests(unittest.TestCase):
@@ -44,6 +44,46 @@ class OutputTests(unittest.TestCase):
 
         self.assertIs(reporter.console, console)
         self.assertEqual(reporter.console.width, 120)
+
+    def test_run_header_renders_cron_friendly_run_context(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+
+        reporter.run_header(
+            started_at_utc=datetime(2026, 1, 2, 14, 30, tzinfo=UTC),
+            mode="update",
+            db_path="state.sqlite",
+            output_dir="outputs",
+            workflow_concurrency=4,
+        )
+        output = console.export_text(styles=False)
+
+        self.assertIn("Workflow Run", output)
+        self.assertIn("Started local", output)
+        self.assertIn("Started UTC", output)
+        self.assertIn("2026-01-02T14:30:00+00:00", output)
+        self.assertIn("state.sqlite", output)
+        self.assertIn("outputs", output)
+        self.assertIn("4", output)
+
+    def test_dataframe_caps_terminal_rows_with_caption(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+
+        reporter.dataframe(
+            "Limited Table",
+            pd.DataFrame({"Asset": ["AAA", "BBB", "CCC"]}),
+            [TableColumn("Asset", no_wrap=True)],
+            empty_message="empty",
+            max_rows=2,
+            truncated_detail="full data written to limited.csv",
+        )
+        output = console.export_text(styles=False)
+
+        self.assertIn("AAA", output)
+        self.assertIn("BBB", output)
+        self.assertNotIn("CCC", output)
+        self.assertIn("Showing 2 of 3 rows; full data written to limited.csv.", output)
 
     def test_default_non_terminal_width_keeps_table_output_readable(self) -> None:
         output_buffer = io.StringIO()
@@ -170,6 +210,223 @@ class OutputTests(unittest.TestCase):
         self.assertIn("QQQ", output)
         for line in output.splitlines():
             self.assertLessEqual(len(line), 100)
+
+    def test_universe_assets_renders_failed_source_details(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=120, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+        universe = pd.DataFrame(
+            [
+                {
+                    "symbol": "TQQQ",
+                    "name": "ProShares UltraPro QQQ",
+                    "rsi_symbol": "QQQ",
+                }
+            ]
+        )
+        universe.attrs["universe_degraded"] = True
+        universe.attrs["workflow_source_failures"] = [
+            {
+                "source": "Direxion",
+                "source_type": "issuer_etf",
+                "status": "source_error",
+                "error": "HTTPError: 403 Client Error: Forbidden",
+            }
+        ]
+
+        reporter.universe_assets(universe)
+        output = console.export_text(styles=False)
+
+        self.assertIn("Workflow universe is degraded", output)
+        self.assertIn("Failed Workflow Universe Sources", output)
+        self.assertIn("Direxion", output)
+        self.assertIn("source_error", output)
+        self.assertIn("HTTPError: 403", output)
+
+    def test_universe_assets_renders_active_listing_failure_details(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=120, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+        universe = pd.DataFrame(
+            [
+                {
+                    "symbol": "TQQQ",
+                    "name": "ProShares UltraPro QQQ",
+                    "rsi_symbol": "QQQ",
+                }
+            ]
+        )
+        universe.attrs["universe_degraded"] = True
+        universe.attrs["active_listing_source_failures"] = [
+            {
+                "source": "other_listed",
+                "status": "error",
+                "error": "offline",
+            }
+        ]
+
+        reporter.universe_assets(universe)
+        output = console.export_text(styles=False)
+
+        self.assertIn("Workflow universe is degraded", output)
+        self.assertIn("Failed Active Listing Sources", output)
+        self.assertIn("other_listed", output)
+        self.assertIn("Offline", output)
+
+    def test_universe_assets_renders_rsi_mapping_review_details(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=120, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+        universe = pd.DataFrame(
+            [
+                {
+                    "symbol": "FOOU",
+                    "name": "T-REX 2X Long ExampleCorp Daily Target ETF",
+                    "rsi_symbol": "FOOU",
+                }
+            ]
+        )
+        universe.attrs["rsi_mapping_review"] = [
+            {
+                "symbol": "FOOU",
+                "name": "T-REX 2X Long ExampleCorp Daily Target ETF",
+                "rsi_symbol": "FOOU",
+                "mapping_reason": "single-stock-style product did not expose a reliable underlying ticker",
+            }
+        ]
+
+        reporter.universe_assets(universe)
+        output = console.export_text(styles=False)
+
+        self.assertIn("Some RSI mappings need review", output)
+        self.assertIn("RSI Mappings Needing Review", output)
+        self.assertIn("FOOU", output)
+        self.assertIn("Single-stock-style product", output)
+
+    def test_optimization_summary_renders_zero_trade_metrics_as_na(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=120, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+
+        reporter.optimization_summary(
+            pd.DataFrame(
+                [
+                    {
+                        "Asset": "STXX",
+                        "RSI Symbol": "STX",
+                        "Start Date": "2026-01-02",
+                        "Trading Days": 44,
+                        "Buy RSI": 20.0,
+                        "Sell Return Multiple": 1.1,
+                        "Trades Executed": 0,
+                        "Total Return": 0.0,
+                        "CAGR": 0.0,
+                        "Sharpe": -1751.799,
+                        "Kelly Fraction": 0.0,
+                        "Max Drawdown": 0.0,
+                    }
+                ]
+            )
+        )
+        output = console.export_text(styles=False)
+
+        self.assertIn("STXX", output)
+        self.assertIn("N/A", output)
+        self.assertNotIn("-1751", output)
+
+    def test_signal_report_keeps_data_sufficiency_columns_when_wide(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=160, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+
+        reporter.signal_report(
+            "Buy Signals For Next Open",
+            pd.DataFrame(
+                [
+                    {
+                        "Asset": "ONX",
+                        "RSI Symbol": "ON",
+                        "Date": "2026-06-26",
+                        "Start Date": "2026-05-28",
+                        "Trading Days": 21,
+                        "Latest RSI": 37.25,
+                        "Buy RSI": 48.0,
+                        "Sell Return Multiple": 1.2,
+                        "Trades Executed": 2,
+                        "Sharpe": 5.7836,
+                        "In Position": False,
+                        "Pending Action": "buy",
+                    }
+                ]
+            ),
+            empty_message="empty",
+        )
+        output = console.export_text(styles=False)
+
+        self.assertIn("Start", output)
+        self.assertIn("Latest RSI", output)
+        self.assertIn("2026-05-28", output)
+        self.assertIn("37.25", output)
+
+    def test_signal_report_omits_some_columns_when_narrow(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+
+        reporter.signal_report(
+            "Buy Signals For Next Open",
+            pd.DataFrame(
+                [
+                    {
+                        "Asset": "ONX",
+                        "RSI Symbol": "ON",
+                        "Date": "2026-06-26",
+                        "Start Date": "2026-05-28",
+                        "Trading Days": 21,
+                        "Latest RSI": 37.25,
+                        "Buy RSI": 48.0,
+                        "Sell Return Multiple": 1.2,
+                        "Trades Executed": 2,
+                        "Sharpe": 5.7836,
+                        "In Position": False,
+                        "Pending Action": "buy",
+                    }
+                ]
+            ),
+            empty_message="empty",
+        )
+        output = console.export_text(styles=False)
+
+        self.assertNotIn("Start", output)
+        self.assertNotIn("Latest RSI", output)
+        self.assertNotIn("2026-05-28", output)
+        self.assertNotIn("37.25", output)
+        self.assertIn("Days", output)
+        self.assertIn("21", output)
+        for line in output.splitlines():
+            self.assertLessEqual(len(line), 100)
+
+    def test_buy_signal_eligibility_summary_counts_managed_and_live_skips(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+
+        reporter.buy_signal_eligibility_summary(
+            buy_signals=pd.DataFrame({"Asset": ["AAA", "BBB", "CCC"]}),
+            eligible_buy_signals=pd.DataFrame({"Asset": ["CCC"]}),
+            order_results=pd.DataFrame(
+                {
+                    "Asset": ["AAA", "BBB", "CCC"],
+                    "Status": ["managed", "held", "submitted"],
+                }
+            ),
+        )
+        output = console.export_text(styles=False)
+
+        self.assertIn("Buy Signal Eligibility", output)
+        self.assertIn("Buy signals", output)
+        self.assertIn("3", output)
+        self.assertIn("Eligible after active managed filter", output)
+        self.assertIn("Skipped: active managed position", output)
+        self.assertIn("Skipped by Alpaca/live preflight", output)
+        self.assertIn("Buy signals                           3", output)
+        self.assertIn("Eligible after active managed filter  1", output)
+        self.assertIn("Skipped: active managed position      2", output)
+        self.assertIn("Submitted or existing Alpaca buys     1", output)
+        self.assertIn("Skipped by Alpaca/live preflight      1", output)
 
     def test_realized_pnl_summary_renders_percentage(self) -> None:
         console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)

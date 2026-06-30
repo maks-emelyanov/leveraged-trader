@@ -179,8 +179,9 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Abort before running strategies if an issuer or ETN workflow-universe source fails. "
-            "Disabled by default; source failures are otherwise recorded as a degraded universe."
+            "Abort before running strategies if an enabled universe discovery or active listing "
+            "source fails. Disabled by default; source failures are otherwise recorded as a "
+            "degraded universe."
         ),
     )
     parser.add_argument(

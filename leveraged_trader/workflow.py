@@ -437,6 +437,13 @@ async def run_resumable_optimizations_async(
     universe_cfg = replace(universe_cfg, sqlite_db_path=db_path)
     reporter = reporter or WorkflowReporter(no_color=no_color)
     benchmark_tracker = BenchmarkTracker.start()
+    reporter.run_header(
+        started_at_utc=benchmark_tracker.started_at_utc,
+        mode=mode,
+        db_path=db_path,
+        output_dir=output_dir,
+        workflow_concurrency=concurrency,
+    )
 
     with reporter.status("Initializing workflow state"):
         await asyncio.to_thread(_initialize_state_db, db_path)
@@ -672,6 +679,11 @@ def _write_workflow_outputs(
     reconciliation_results.to_csv(output_path / "alpaca_reconciliation_results.csv", index=False)
     if alpaca_cfg.enabled:
         reporter.order_results(order_results)
+    reporter.buy_signal_eligibility_summary(
+        buy_signals=buy_signals,
+        eligible_buy_signals=eligible_buy_signals,
+        order_results=order_results,
+    )
     order_results.to_csv(output_path / "alpaca_order_results.csv", index=False)
 
     if alpaca_cfg.sell_enabled:

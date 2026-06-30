@@ -8,7 +8,8 @@ This project is intended for research and paper trading. It is not financial adv
 
 - Discovers current long leveraged ETFs/ETNs from Nasdaq ETF definitions plus best-effort issuer and ETN pages; source health distinguishes fetch/parser failures from healthy zero-match pages, and issuer-only products are filtered only when both active-listing sources load successfully.
 - Writes audit-only source checks for exchange directories, third-party ETF directories, and SEC EDGAR registry review.
-- Infers an RSI signal symbol from each leveraged ETF name.
+- Infers an RSI signal symbol from each leveraged ETF name, with curated proxy mappings,
+  explicit self-RSI fallbacks, and a review table for unresolved mappings.
 - Downloads daily Yahoo Finance OHLCV data, with optional Tradier fallback for skipped symbols.
 - Optimizes RSI buy thresholds and profit-target sell multiples.
 - Uses a NumPy/Numba-backed optimization loop for the parameter grid.
@@ -145,11 +146,16 @@ uv run leveraged-trader --output-dir outputs/dev
 
 The SQLite state database defaults to `strategy_state.sqlite`; use `--db` to override it. Universe
 generation also persists `nasdaq_etf_universe`, `universe_audit_rows`,
-`universe_audit_missing_candidates`, `universe_audit_source_status`, and
-`universe_workflow_source_status` tables for source review. A source failure or a successful response
-that cannot be parsed leaves the run marked as degraded in terminal output. A successfully parsed
-source with zero leveraged matches remains healthy; use `--require-workflow-source-success` when a
-partial universe caused by a fetch or parser failure is not acceptable.
+`universe_audit_missing_candidates`, `universe_audit_source_status`,
+`universe_workflow_source_status`, `universe_active_listing_source_status`, and
+`universe_rsi_mapping_review` tables for source and RSI-mapping review. Long leveraged rows whose RSI
+symbol cannot be mapped confidently are excluded from the executable workflow and saved to
+`universe_rsi_mapping_review`; curated proxy mappings and explicit self-RSI fallbacks remain
+executable and are annotated in `nasdaq_etf_universe`. A universe discovery or active listing source
+failure, or a successful response that cannot be parsed, leaves the run marked as degraded in terminal
+output. A successfully parsed source with zero leveraged matches remains healthy; use
+`--require-workflow-source-success` when a partial universe caused by a fetch or parser failure is not
+acceptable.
 
 Terminal output is intentionally compact: concurrent asset work is shown as aggregate progress, then
 the final asset summary is sorted by workflow index. CSV files retain full order IDs and detail, while
@@ -248,15 +254,14 @@ continue through the workflow.
 Useful checks:
 
 ```bash
-python3 -m compileall main.py leveraged_trader
-python3 -m unittest discover
+uv run python -m compileall main.py leveraged_trader
+uv run python -m unittest
 uv run leveraged-trader --help
 ```
 
-Ruff and pytest settings are included in `pyproject.toml` for teams that install those tools:
+Install development tooling with `uv sync --group dev`, then run:
 
 ```bash
-uv run ruff format .
 uv run ruff check .
 uv run pytest
 ```

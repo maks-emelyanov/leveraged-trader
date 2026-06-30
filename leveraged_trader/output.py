@@ -4,6 +4,7 @@ import math
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import pandas as pd
@@ -16,6 +17,8 @@ from rich.text import Text
 from .benchmark import WorkflowBenchmark
 
 DEFAULT_NON_TERMINAL_WIDTH = 160
+DEFAULT_UNIVERSE_TABLE_MAX_ROWS = 75
+DEFAULT_OPTIMIZATION_TABLE_MAX_ROWS = 100
 
 STATUS_STYLES = {
     "accepted": "green",
@@ -39,10 +42,17 @@ STATUS_STYLES = {
     "insufficient_notional": "yellow",
     "not_held": "yellow",
     "pending_cancel": "yellow",
+    "parse_error": "red",
     "skipped": "yellow",
+    "source_error": "red",
     "canceled": "red",
+    "deferred": "yellow",
     "error": "red",
     "expired": "red",
+    "held": "cyan",
+    "inactive": "red",
+    "not_tradable": "red",
+    "open_sell_order": "cyan",
     "rejected": "red",
     "stopped": "red",
     "suspended": "red",
@@ -164,6 +174,27 @@ class WorkflowReporter:
         self.console.print()
         self.console.print(Text(title, style="bold"))
 
+    def run_header(
+        self,
+        *,
+        started_at_utc: datetime,
+        mode: str,
+        db_path: str,
+        output_dir: str,
+        workflow_concurrency: int,
+    ) -> None:
+        self.section("Workflow Run")
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style="bold", no_wrap=True)
+        table.add_column(ratio=1)
+        table.add_row("Started local", format_timestamp(started_at_utc.astimezone()))
+        table.add_row("Started UTC", format_timestamp(started_at_utc))
+        table.add_row("Mode", mode)
+        table.add_row("SQLite database", db_path)
+        table.add_row("Output directory", output_dir)
+        table.add_row("Workflow concurrency", str(workflow_concurrency))
+        self.console.print(table)
+
     def settings(
         self,
         *,
@@ -198,18 +229,29 @@ class WorkflowReporter:
         *,
         empty_message: str,
         caption: str | None = None,
+        max_rows: int | None = None,
+        truncated_detail: str | None = None,
     ) -> None:
         self.section(title)
         if df.empty:
             self.console.print(Text(empty_message, style="dim"))
             return
-        self.console.print(self._table(df, columns, caption=caption))
+        display_df, table_caption = self._limited_dataframe(
+            df,
+            caption=caption,
+            max_rows=max_rows,
+            truncated_detail=truncated_detail,
+        )
+        self.console.print(self._table(display_df, columns, caption=table_caption))
 
     def universe_assets(self, df: pd.DataFrame) -> None:
         title = str(df.attrs.get("universe_title", "Workflow ETF Universe"))
         counts = df.attrs.get("universe_counts", {})
         db_path = df.attrs.get("universe_db_path")
         universe_degraded = bool(df.attrs.get("universe_degraded", False))
+        source_failures = pd.DataFrame(df.attrs.get("workflow_source_failures", []))
+        active_listing_failures = pd.DataFrame(df.attrs.get("active_listing_source_failures", []))
+        mapping_review = pd.DataFrame(df.attrs.get("rsi_mapping_review", []))
 
         self.section(title)
         if counts or db_path:
@@ -221,31 +263,85 @@ class WorkflowReporter:
             if db_path:
                 stats.add_row(
                     "Saved SQLite tables",
-                    f"{db_path}: nasdaq_etf_universe, universe_audit_*",
+                    f"{db_path}: nasdaq_etf_universe, universe_audit_*, universe_rsi_mapping_review",
                 )
             self.console.print(stats)
         if universe_degraded:
             self.console.print(
                 Text(
-                    "Workflow universe is degraded: one or more issuer/ETN sources failed. "
-                    "See universe_workflow_source_status in SQLite.",
+                    "Workflow universe is degraded: one or more universe source checks failed. "
+                    "See universe_workflow_source_status and universe_active_listing_source_status in SQLite.",
                     style="yellow",
                 )
+            )
+            if not source_failures.empty:
+                self.dataframe(
+                    "Failed Workflow Universe Sources",
+                    source_failures,
+                    [
+                        TableColumn("source", "Source", no_wrap=True),
+                        TableColumn("source_type", "Type", no_wrap=True),
+                        TableColumn("status", "Status", status=True, no_wrap=True),
+                        TableColumn("error", "Error", ratio=1, min_width=28, formatter=format_compact_message),
+                    ],
+                    empty_message="No failed workflow universe sources.",
+                    max_rows=12,
+                    truncated_detail="full source health saved in SQLite",
+                )
+            if not active_listing_failures.empty:
+                self.dataframe(
+                    "Failed Active Listing Sources",
+                    active_listing_failures,
+                    [
+                        TableColumn("source", "Source", no_wrap=True),
+                        TableColumn("status", "Status", status=True, no_wrap=True),
+                        TableColumn("error", "Error", ratio=1, min_width=28, formatter=format_compact_message),
+                    ],
+                    empty_message="No failed active listing sources.",
+                    max_rows=12,
+                    truncated_detail="full active listing health saved in SQLite",
+                )
+        if not mapping_review.empty:
+            self.console.print(
+                Text(
+                    "Some RSI mappings need review before relying on their signal proxy. "
+                    "See universe_rsi_mapping_review in SQLite.",
+                    style="yellow",
+                )
+            )
+            self.dataframe(
+                "RSI Mappings Needing Review",
+                mapping_review,
+                [
+                    TableColumn("symbol", "Asset", no_wrap=True),
+                    TableColumn("name", "Name", ratio=1, min_width=26),
+                    TableColumn("rsi_symbol", "RSI", no_wrap=True),
+                    TableColumn("mapping_reason", "Reason", ratio=1, min_width=28, formatter=format_compact_message),
+                ],
+                empty_message="No RSI mappings need review.",
+                max_rows=12,
+                truncated_detail="full RSI mapping review saved in SQLite",
             )
 
         if df.empty:
             self.console.print(Text("No long leveraged ETFs found.", style="dim"))
             return
 
+        display_df, table_caption = self._limited_dataframe(
+            df,
+            caption=None,
+            max_rows=DEFAULT_UNIVERSE_TABLE_MAX_ROWS,
+            truncated_detail="full universe saved in SQLite",
+        )
         self.console.print(
             self._table(
-                df,
+                display_df,
                 [
                     TableColumn("symbol", "Asset", no_wrap=True),
                     TableColumn("name", "Name", ratio=1, min_width=30),
                     TableColumn("rsi_symbol", "RSI", no_wrap=True),
                 ],
-                caption=None,
+                caption=table_caption,
             )
         )
 
@@ -270,6 +366,12 @@ class WorkflowReporter:
 
     def optimization_summary(self, df: pd.DataFrame) -> None:
         display_df = df.drop(columns=["End Date", "Annualized Vol", "Hit Rate"], errors="ignore")
+        if "Trades Executed" in display_df.columns:
+            no_trades = pd.to_numeric(display_df["Trades Executed"], errors="coerce").fillna(0).le(0)
+            for metric_column in ["Sharpe", "Kelly Fraction"]:
+                if metric_column in display_df.columns:
+                    display_df[metric_column] = display_df[metric_column].astype("object")
+                    display_df.loc[no_trades, metric_column] = pd.NA
         self.dataframe(
             "Best Sharpe Parameters By Asset",
             display_df,
@@ -289,37 +391,84 @@ class WorkflowReporter:
                 TableColumn("Trades Executed", "Trades", justify="right", formatter=format_int, no_wrap=True),
                 TableColumn("Total Return", justify="right", formatter=format_decimal_4, no_wrap=True),
                 TableColumn("CAGR", justify="right", formatter=format_decimal_4, no_wrap=True),
-                TableColumn("Sharpe", justify="right", formatter=format_decimal_4, no_wrap=True),
-                TableColumn("Kelly Fraction", "Kelly", justify="right", formatter=format_decimal_4, no_wrap=True),
+                TableColumn("Sharpe", justify="right", formatter=format_optional_decimal_4, no_wrap=True),
+                TableColumn(
+                    "Kelly Fraction",
+                    "Kelly",
+                    justify="right",
+                    formatter=format_optional_decimal_4,
+                    no_wrap=True,
+                ),
                 TableColumn("Max Drawdown", "Max DD", justify="right", formatter=format_decimal_4, no_wrap=True),
             ],
             empty_message="No strategies produced more than one executed trade.",
+            max_rows=DEFAULT_OPTIMIZATION_TABLE_MAX_ROWS,
+            truncated_detail="full data written to optimization_summary.csv",
         )
 
     def signal_report(self, title: str, df: pd.DataFrame, *, empty_message: str) -> None:
+        columns = [
+            TableColumn("Asset", no_wrap=True),
+            TableColumn("RSI Symbol", "RSI", no_wrap=True),
+            TableColumn("Date", no_wrap=True),
+            TableColumn("Start Date", "Start", no_wrap=True),
+            TableColumn("Trading Days", "Days", justify="right", formatter=format_int, no_wrap=True),
+            TableColumn("Latest RSI", justify="right", formatter=format_decimal_2, no_wrap=True),
+            TableColumn("Buy RSI", justify="right", formatter=format_decimal_2, no_wrap=True),
+            TableColumn(
+                "Sell Return Multiple",
+                "Sell x",
+                justify="right",
+                formatter=format_decimal_2,
+                no_wrap=True,
+            ),
+            TableColumn("Trades Executed", "Trades", justify="right", formatter=format_int, no_wrap=True),
+            TableColumn("Sharpe", justify="right", formatter=format_optional_decimal_4, no_wrap=True),
+            TableColumn("In Position", "Held", formatter=format_bool, no_wrap=True),
+            TableColumn("Pending Action", "Action", no_wrap=True),
+        ]
+        if self.console.width < 120:
+            columns = [
+                column
+                for column in columns
+                if column.source not in {"Start Date", "Latest RSI"}
+            ]
         self.dataframe(
             title,
             df,
-            [
-                TableColumn("Asset", no_wrap=True),
-                TableColumn("RSI Symbol", "RSI", no_wrap=True),
-                TableColumn("Date", no_wrap=True),
-                TableColumn("Latest RSI", justify="right", formatter=format_decimal_2, no_wrap=True),
-                TableColumn("Buy RSI", justify="right", formatter=format_decimal_2, no_wrap=True),
-                TableColumn(
-                    "Sell Return Multiple",
-                    "Sell x",
-                    justify="right",
-                    formatter=format_decimal_2,
-                    no_wrap=True,
-                ),
-                TableColumn("Trades Executed", "Trades", justify="right", formatter=format_int, no_wrap=True),
-                TableColumn("Sharpe", justify="right", formatter=format_decimal_4, no_wrap=True),
-                TableColumn("In Position", "Held", formatter=format_bool, no_wrap=True),
-                TableColumn("Pending Action", "Action", no_wrap=True),
-            ],
+            columns,
             empty_message=empty_message,
         )
+
+    def buy_signal_eligibility_summary(
+        self,
+        *,
+        buy_signals: pd.DataFrame,
+        eligible_buy_signals: pd.DataFrame,
+        order_results: pd.DataFrame,
+    ) -> None:
+        self.section("Buy Signal Eligibility")
+        total_buy_signals = len(buy_signals)
+        eligible_signals = len(eligible_buy_signals)
+        active_managed_skips = max(total_buy_signals - eligible_signals, 0)
+        submitted_or_existing = 0
+        live_preflight_skips = 0
+        if not order_results.empty and "Status" in order_results:
+            statuses = order_results["Status"].astype(str).str.lower()
+            submitted_or_existing = int(statuses.isin({"submitted", "existing"}).sum())
+            live_preflight_skips = int(
+                (~statuses.isin({"submitted", "existing", "managed"})).sum()
+            )
+
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style="bold", no_wrap=True)
+        table.add_column(justify="right", no_wrap=True)
+        table.add_row("Buy signals", format_int(total_buy_signals))
+        table.add_row("Eligible after active managed filter", format_int(eligible_signals))
+        table.add_row("Skipped: active managed position", format_int(active_managed_skips))
+        table.add_row("Submitted or existing Alpaca buys", format_int(submitted_or_existing))
+        table.add_row("Skipped by Alpaca/live preflight", format_int(live_preflight_skips))
+        self.console.print(table)
 
     def order_results(self, df: pd.DataFrame) -> None:
         self.dataframe(
@@ -440,6 +589,25 @@ class WorkflowReporter:
             table.add_row(*[self._cell(row.get(column.source), column) for column in available_columns])
         return table
 
+    def _limited_dataframe(
+        self,
+        df: pd.DataFrame,
+        *,
+        caption: str | None,
+        max_rows: int | None,
+        truncated_detail: str | None,
+    ) -> tuple[pd.DataFrame, str | None]:
+        if max_rows is None or len(df) <= max_rows:
+            return df, caption
+
+        shown_rows = max(max_rows, 0)
+        display_df = df.head(shown_rows)
+        limit_caption = f"Showing {format_int(shown_rows)} of {format_int(len(df))} rows"
+        if truncated_detail:
+            limit_caption = f"{limit_caption}; {truncated_detail}"
+        limit_caption = f"{limit_caption}."
+        return display_df, _combine_captions(caption, limit_caption)
+
     def _cell(self, value: Any, column: TableColumn) -> Text:
         formatter = column.formatter or format_value
         text = formatter(value)
@@ -482,6 +650,14 @@ def format_message(value: Any) -> str:
     return MESSAGE_ALIASES.get(message, _sentence_case(message))
 
 
+def format_compact_message(value: Any) -> str:
+    message = format_message(value)
+    max_length = 140
+    if len(message) <= max_length:
+        return message
+    return f"{message[: max_length - 3].rstrip()}..."
+
+
 def format_bool(value: Any) -> str:
     if _is_empty(value):
         return ""
@@ -506,6 +682,12 @@ def format_decimal_2(value: Any) -> str:
 
 
 def format_decimal_4(value: Any) -> str:
+    return format_decimal(value, 4)
+
+
+def format_optional_decimal_4(value: Any) -> str:
+    if _is_empty(value):
+        return "N/A"
     return format_decimal(value, 4)
 
 
@@ -567,6 +749,12 @@ def _sentence_case(value: str) -> str:
     if not value:
         return value
     return value[0].upper() + value[1:]
+
+
+def _combine_captions(caption: str | None, extra: str) -> str:
+    if not caption:
+        return extra
+    return f"{caption}\n{extra}"
 
 
 def _is_empty(value: Any) -> bool:

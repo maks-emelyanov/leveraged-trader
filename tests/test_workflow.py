@@ -552,6 +552,65 @@ class WorkflowAsyncTests(unittest.TestCase):
         self.assertEqual(benchmark["workflow_concurrency"], 3)
         self.assertIn("Workflow Benchmark", output_buffer.getvalue())
 
+    def test_write_workflow_outputs_keeps_full_csv_when_terminal_summary_is_capped(self) -> None:
+        optimization_summary = pd.DataFrame(
+            [
+                {
+                    "Asset": f"A{index:03d}",
+                    "RSI Symbol": f"R{index:03d}",
+                    "Start Date": "2026-01-02",
+                    "End Date": "2026-01-03",
+                    "Trading Days": 2,
+                    "Buy RSI": 30.0,
+                    "Sell Return Multiple": 1.5,
+                    "Trades Executed": 2,
+                    "Total Return": 0.1,
+                    "CAGR": 0.2,
+                    "Annualized Vol": 0.3,
+                    "Sharpe": 1.0,
+                    "Kelly Fraction": 0.4,
+                    "Max Drawdown": -0.1,
+                    "Hit Rate": 0.5,
+                }
+                for index in range(101)
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "outputs"
+            output_buffer = io.StringIO()
+            reporter = WorkflowReporter(
+                console=Console(file=output_buffer, width=120, color_system=None, no_color=True)
+            )
+            _write_workflow_outputs(
+                mode="update",
+                db_path=str(Path(tmp) / "state.sqlite"),
+                base_cfg=BacktestConfig(),
+                buy_rsi_values=[30.0],
+                profit_target_values=[1.5],
+                alpaca_cfg=AlpacaOrderConfig(),
+                output_dir=str(output_dir),
+                workflow_concurrency=1,
+                reporter=reporter,
+                asset_run_results=[],
+                optimization_summary=optimization_summary,
+                curves=pd.DataFrame(),
+                buy_signals=pd.DataFrame(),
+                eligible_buy_signals=pd.DataFrame(),
+                sell_signals=pd.DataFrame(),
+                realized_pnl_summary=pd.DataFrame(),
+                managed_positions=pd.DataFrame(),
+                reconciliation_results=pd.DataFrame(columns=["Action"]),
+                sell_reconciliation_results=pd.DataFrame(),
+                order_results=pd.DataFrame(),
+                benchmark_tracker=BenchmarkTracker.start(),
+            )
+
+            written_summary = pd.read_csv(output_dir / "optimization_summary.csv")
+
+        self.assertEqual(len(written_summary), 101)
+        self.assertIn("Showing 100 of 101 rows", output_buffer.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

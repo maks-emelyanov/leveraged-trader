@@ -59,6 +59,8 @@ class ReportTests(unittest.TestCase):
                 {
                     "Asset": "TQQQ",
                     "RSI Symbol": "QQQ",
+                    "Start Date": "2026-01-01",
+                    "Trading Days": 2,
                     "Buy RSI": 30.0,
                     "Sell Return Multiple": 2.0,
                     "Trades Executed": 2,
@@ -70,6 +72,8 @@ class ReportTests(unittest.TestCase):
         report = build_buy_signal_report(self.conn, summary, 14)
 
         self.assertEqual(report["Asset"].tolist(), ["TQQQ"])
+        self.assertEqual(report["Start Date"].tolist(), ["2026-01-01"])
+        self.assertEqual(report["Trading Days"].tolist(), [2])
 
     def test_sell_report_does_not_require_multiple_trades_or_min_sharpe(self) -> None:
         save_strategy_state(
