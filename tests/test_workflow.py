@@ -491,20 +491,21 @@ class WorkflowAsyncTests(unittest.TestCase):
         asset_run_results = mock_write_outputs.call_args.kwargs["asset_run_results"]
         self.assertEqual([result.workflow_idx for result in asset_run_results], [1, 2, 3])
 
-    def test_terminal_alpaca_display_results_assigns_dense_shared_ids(self) -> None:
+    def test_terminal_alpaca_display_results_preserves_closed_position_id_gaps(self) -> None:
         managed_positions = pd.DataFrame(
             [
                 {"id": 2, "symbol": "KLAG", "buy_client_order_id": "buy-KLAG"},
-                {"id": 3, "symbol": "SATG", "buy_client_order_id": "buy-SATG"},
-                {"id": 5, "symbol": "AXTU", "buy_client_order_id": "buy-AXTU"},
-                {"id": 8, "symbol": "IDLE", "buy_client_order_id": "buy-IDLE"},
+                {"id": 3, "symbol": "MPG", "buy_client_order_id": "buy-MPG", "closed_at": "2026-01-03"},
+                {"id": 5, "symbol": "SATG", "buy_client_order_id": "buy-SATG"},
+                {"id": 8, "symbol": "LULG", "buy_client_order_id": "buy-LULG", "closed_at": "2026-01-04"},
+                {"id": 9, "symbol": "AXTU", "buy_client_order_id": "buy-AXTU"},
             ]
         )
         reconciliation_results = pd.DataFrame(
             [
                 {"Position ID": 2, "Asset": "KLAG", "Action": "sell"},
-                {"Position ID": 3, "Asset": "SATG", "Action": "sell"},
-                {"Position ID": 5, "Asset": "AXTU", "Action": "sell"},
+                {"Position ID": 5, "Asset": "SATG", "Action": "sell"},
+                {"Position ID": 9, "Asset": "AXTU", "Action": "sell"},
             ]
         )
         order_results = pd.DataFrame(
@@ -520,14 +521,15 @@ class WorkflowAsyncTests(unittest.TestCase):
             order_results=order_results,
         )
 
-        self.assertEqual(display_reconciliation["Display ID"].tolist(), [1, 2, 3])
-        self.assertEqual(display_orders.loc[0, "Display ID"], 3)
+        self.assertEqual(display_reconciliation["Display ID"].tolist(), [1, 3, 5])
+        self.assertEqual(display_orders.loc[0, "Display ID"], 5)
         self.assertTrue(pd.isna(display_orders.loc[1, "Display ID"]))
 
     def test_write_workflow_outputs_uses_terminal_display_ids_for_alpaca_tables(self) -> None:
         managed_positions = pd.DataFrame(
             [
                 {"id": 2, "symbol": "KLAG", "buy_client_order_id": "buy-KLAG"},
+                {"id": 3, "symbol": "MPG", "buy_client_order_id": "buy-MPG", "closed_at": "2026-01-03"},
                 {"id": 5, "symbol": "AXTU", "buy_client_order_id": "buy-AXTU"},
             ]
         )
@@ -611,7 +613,7 @@ class WorkflowAsyncTests(unittest.TestCase):
         axtu_lines = [line for line in output.splitlines() if "AXTU" in line]
         self.assertEqual(len(axtu_lines), 2)
         for line in axtu_lines:
-            self.assertRegex(line, r"^\s*2\s+AXTU\b")
+            self.assertRegex(line, r"^\s*3\s+AXTU\b")
         self.assertEqual(written_reconciliation["Position ID"].tolist(), [2, 5])
         self.assertNotIn("Display ID", written_reconciliation.columns)
         self.assertNotIn("Display ID", written_orders.columns)

@@ -706,11 +706,7 @@ def _terminal_alpaca_display_results(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     display_order_results = order_results.copy()
     display_reconciliation_results = reconciliation_results.copy()
-    display_id_by_position, display_id_by_buy_client_order_id = _managed_position_display_id_maps(
-        managed_positions=managed_positions,
-        reconciliation_results=reconciliation_results,
-        order_results=order_results,
-    )
+    display_id_by_position, display_id_by_buy_client_order_id = _managed_position_display_id_maps(managed_positions)
 
     if display_id_by_buy_client_order_id and "Client Order ID" in display_order_results.columns:
         display_order_results["Display ID"] = (
@@ -723,12 +719,7 @@ def _terminal_alpaca_display_results(
     return display_order_results, display_reconciliation_results
 
 
-def _managed_position_display_id_maps(
-    *,
-    managed_positions: pd.DataFrame,
-    reconciliation_results: pd.DataFrame,
-    order_results: pd.DataFrame,
-) -> tuple[dict[int, int], dict[str, int]]:
+def _managed_position_display_id_maps(managed_positions: pd.DataFrame) -> tuple[dict[int, int], dict[str, int]]:
     if managed_positions.empty or not {"id", "buy_client_order_id"}.issubset(managed_positions.columns):
         return {}, {}
 
@@ -739,35 +730,18 @@ def _managed_position_display_id_maps(
         return {}, {}
 
     managed["id"] = managed["id"].astype(int)
-    managed_ids = set(managed["id"].tolist())
+    managed = managed.sort_values("id", kind="stable")
+    display_id_by_position = {
+        position_id: display_id
+        for display_id, position_id in enumerate(managed["id"].tolist(), start=1)
+    }
     position_id_by_buy_client_order_id = {
         str(row["buy_client_order_id"]): int(row["id"])
         for row in managed.to_dict("records")
         if not pd.isna(row["buy_client_order_id"])
     }
-    relevant_position_ids: set[int] = set()
-
-    if "Position ID" in reconciliation_results.columns:
-        reconciliation_position_ids = pd.to_numeric(reconciliation_results["Position ID"], errors="coerce")
-        relevant_position_ids.update(
-            int(position_id)
-            for position_id in reconciliation_position_ids.dropna()
-            if int(position_id) in managed_ids
-        )
-    if "Client Order ID" in order_results.columns:
-        relevant_position_ids.update(
-            position_id_by_buy_client_order_id[client_order_id]
-            for client_order_id in order_results["Client Order ID"].dropna().astype(str)
-            if client_order_id in position_id_by_buy_client_order_id
-        )
-
-    display_id_by_position = {
-        position_id: display_id
-        for display_id, position_id in enumerate(sorted(relevant_position_ids), start=1)
-    }
     display_id_by_buy_client_order_id = {
         client_order_id: display_id_by_position[position_id]
         for client_order_id, position_id in position_id_by_buy_client_order_id.items()
-        if position_id in display_id_by_position
     }
     return display_id_by_position, display_id_by_buy_client_order_id
