@@ -12,7 +12,7 @@ from unittest.mock import patch
 import pandas as pd
 from rich.console import Console
 
-from leveraged_trader.benchmark import BenchmarkTracker
+from leveraged_trader.benchmark import WorkflowTimer
 from leveraged_trader.config import AlpacaOrderConfig, BacktestConfig, UniverseConfig
 from leveraged_trader.output import WorkflowReporter
 from leveraged_trader.storage import init_state_db
@@ -24,6 +24,7 @@ from leveraged_trader.workflow import (
     _prepare_asset_run,
     _process_workflow_asset,
     _state_connection,
+    _terminal_alpaca_display_results,
     _write_workflow_outputs,
     run_resumable_optimizations_async,
 )
@@ -490,7 +491,132 @@ class WorkflowAsyncTests(unittest.TestCase):
         asset_run_results = mock_write_outputs.call_args.kwargs["asset_run_results"]
         self.assertEqual([result.workflow_idx for result in asset_run_results], [1, 2, 3])
 
-    def test_write_workflow_outputs_writes_benchmark_csv(self) -> None:
+    def test_terminal_alpaca_display_results_assigns_dense_shared_ids(self) -> None:
+        managed_positions = pd.DataFrame(
+            [
+                {"id": 2, "symbol": "KLAG", "buy_client_order_id": "buy-KLAG"},
+                {"id": 3, "symbol": "SATG", "buy_client_order_id": "buy-SATG"},
+                {"id": 5, "symbol": "AXTU", "buy_client_order_id": "buy-AXTU"},
+                {"id": 8, "symbol": "IDLE", "buy_client_order_id": "buy-IDLE"},
+            ]
+        )
+        reconciliation_results = pd.DataFrame(
+            [
+                {"Position ID": 2, "Asset": "KLAG", "Action": "sell"},
+                {"Position ID": 3, "Asset": "SATG", "Action": "sell"},
+                {"Position ID": 5, "Asset": "AXTU", "Action": "sell"},
+            ]
+        )
+        order_results = pd.DataFrame(
+            [
+                {"Asset": "AXTU", "Client Order ID": "buy-AXTU", "Status": "submitted"},
+                {"Asset": "UNMG", "Client Order ID": "buy-UNMG", "Status": "submitted"},
+            ]
+        )
+
+        display_orders, display_reconciliation = _terminal_alpaca_display_results(
+            managed_positions=managed_positions,
+            reconciliation_results=reconciliation_results,
+            order_results=order_results,
+        )
+
+        self.assertEqual(display_reconciliation["Display ID"].tolist(), [1, 2, 3])
+        self.assertEqual(display_orders.loc[0, "Display ID"], 3)
+        self.assertTrue(pd.isna(display_orders.loc[1, "Display ID"]))
+
+    def test_write_workflow_outputs_uses_terminal_display_ids_for_alpaca_tables(self) -> None:
+        managed_positions = pd.DataFrame(
+            [
+                {"id": 2, "symbol": "KLAG", "buy_client_order_id": "buy-KLAG"},
+                {"id": 5, "symbol": "AXTU", "buy_client_order_id": "buy-AXTU"},
+            ]
+        )
+        reconciliation_results = pd.DataFrame(
+            [
+                {
+                    "Position ID": 2,
+                    "Asset": "KLAG",
+                    "Action": "sell",
+                    "Status": "new",
+                    "Buy Client Order ID": "buy-KLAG",
+                    "Sell Client Order ID": "sell-KLAG",
+                    "Qty": 15,
+                    "Limit Price": 77.69,
+                    "Alpaca Order ID": "alpaca-sell-KLAG",
+                    "Message": "managed sell already submitted",
+                },
+                {
+                    "Position ID": 5,
+                    "Asset": "AXTU",
+                    "Action": "sell",
+                    "Status": "new",
+                    "Buy Client Order ID": "buy-AXTU",
+                    "Sell Client Order ID": "sell-AXTU",
+                    "Qty": 8,
+                    "Limit Price": 9.57,
+                    "Alpaca Order ID": "alpaca-sell-AXTU",
+                    "Message": "managed sell already submitted",
+                },
+            ]
+        )
+        order_results = pd.DataFrame(
+            [
+                {
+                    "Asset": "AXTU",
+                    "Date": "2026-01-02",
+                    "Client Order ID": "buy-AXTU",
+                    "Notional": 100.0,
+                    "Qty": 8,
+                    "Limit Price": 9.57,
+                    "Status": "submitted",
+                    "Alpaca Order ID": "alpaca-buy-AXTU",
+                    "Message": "submitted",
+                }
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "outputs"
+            output_buffer = io.StringIO()
+            reporter = WorkflowReporter(
+                console=Console(file=output_buffer, width=140, color_system=None, no_color=True)
+            )
+            _write_workflow_outputs(
+                mode="update",
+                db_path=str(Path(tmp) / "state.sqlite"),
+                base_cfg=BacktestConfig(),
+                buy_rsi_values=[30.0],
+                profit_target_values=[1.5],
+                alpaca_cfg=AlpacaOrderConfig(enabled=True, sell_enabled=True),
+                output_dir=str(output_dir),
+                workflow_concurrency=1,
+                reporter=reporter,
+                asset_run_results=[],
+                optimization_summary=pd.DataFrame(),
+                curves=pd.DataFrame(),
+                buy_signals=pd.DataFrame(),
+                eligible_buy_signals=pd.DataFrame(),
+                sell_signals=pd.DataFrame(),
+                realized_pnl_summary=pd.DataFrame(),
+                managed_positions=managed_positions,
+                reconciliation_results=reconciliation_results,
+                sell_reconciliation_results=reconciliation_results,
+                order_results=order_results,
+                workflow_timer=WorkflowTimer.start(),
+            )
+            written_reconciliation = pd.read_csv(output_dir / "alpaca_reconciliation_results.csv")
+            written_orders = pd.read_csv(output_dir / "alpaca_order_results.csv")
+            output = output_buffer.getvalue()
+
+        axtu_lines = [line for line in output.splitlines() if "AXTU" in line]
+        self.assertEqual(len(axtu_lines), 2)
+        for line in axtu_lines:
+            self.assertRegex(line, r"^\s*2\s+AXTU\b")
+        self.assertEqual(written_reconciliation["Position ID"].tolist(), [2, 5])
+        self.assertNotIn("Display ID", written_reconciliation.columns)
+        self.assertNotIn("Display ID", written_orders.columns)
+
+    def test_write_workflow_outputs_prints_footer_without_benchmark_csv(self) -> None:
         asset_run_results = [
             AssetRunResult(
                 workflow_idx=1,
@@ -539,20 +665,17 @@ class WorkflowAsyncTests(unittest.TestCase):
                 reconciliation_results=pd.DataFrame(columns=["Action"]),
                 sell_reconciliation_results=pd.DataFrame(),
                 order_results=pd.DataFrame(),
-                benchmark_tracker=BenchmarkTracker.start(),
+                workflow_timer=WorkflowTimer.start(),
             )
+            benchmark_csv_exists = (output_dir / "workflow_benchmark.csv").exists()
+            output = output_buffer.getvalue()
 
-            benchmark = pd.read_csv(output_dir / "workflow_benchmark.csv").iloc[0].to_dict()
+        self.assertFalse(benchmark_csv_exists)
+        self.assertIn("Workflow finished in", output)
+        self.assertNotIn("Workflow Benchmark", output)
+        self.assertEqual(output.rstrip().splitlines()[-1], "\u2500" * 100)
 
-        self.assertEqual(benchmark["status"], "completed")
-        self.assertEqual(benchmark["asset_count"], 2)
-        self.assertEqual(benchmark["completed_asset_count"], 1)
-        self.assertEqual(benchmark["skipped_asset_count"], 1)
-        self.assertEqual(benchmark["rows_processed"], 12)
-        self.assertEqual(benchmark["workflow_concurrency"], 3)
-        self.assertIn("Workflow Benchmark", output_buffer.getvalue())
-
-    def test_write_workflow_outputs_keeps_full_csv_when_terminal_summary_is_capped(self) -> None:
+    def test_write_workflow_outputs_keeps_full_csv_and_filters_terminal_summary_rows(self) -> None:
         optimization_summary = pd.DataFrame(
             [
                 {
@@ -563,11 +686,11 @@ class WorkflowAsyncTests(unittest.TestCase):
                     "Trading Days": 2,
                     "Buy RSI": 30.0,
                     "Sell Return Multiple": 1.5,
-                    "Trades Executed": 2,
+                    "Trades Executed": 1 if index == 100 else 2,
                     "Total Return": 0.1,
                     "CAGR": 0.2,
                     "Annualized Vol": 0.3,
-                    "Sharpe": 1.0,
+                    "Sharpe": 5.0 if index == 100 else (1.2 if index == 0 else 0.9),
                     "Kelly Fraction": 0.4,
                     "Max Drawdown": -0.1,
                     "Hit Rate": 0.5,
@@ -603,13 +726,17 @@ class WorkflowAsyncTests(unittest.TestCase):
                 reconciliation_results=pd.DataFrame(columns=["Action"]),
                 sell_reconciliation_results=pd.DataFrame(),
                 order_results=pd.DataFrame(),
-                benchmark_tracker=BenchmarkTracker.start(),
+                workflow_timer=WorkflowTimer.start(),
             )
 
             written_summary = pd.read_csv(output_dir / "optimization_summary.csv")
 
         self.assertEqual(len(written_summary), 101)
-        self.assertIn("Showing 100 of 101 rows", output_buffer.getvalue())
+        output = output_buffer.getvalue()
+        self.assertIn("A000", output)
+        self.assertNotIn("A100", output)
+        self.assertNotIn("A099", output)
+        self.assertNotIn("Showing 100 of 101 rows", output)
 
 
 if __name__ == "__main__":

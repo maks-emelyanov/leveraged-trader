@@ -8,7 +8,6 @@ from unittest.mock import patch
 import pandas as pd
 from rich.console import Console
 
-from leveraged_trader.benchmark import WorkflowBenchmark
 from leveraged_trader.output import DEFAULT_NON_TERMINAL_WIDTH, TableColumn, WorkflowReporter
 
 
@@ -48,23 +47,27 @@ class OutputTests(unittest.TestCase):
     def test_run_header_renders_cron_friendly_run_context(self) -> None:
         console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)
         reporter = WorkflowReporter(console=console)
+        started_at_utc = datetime(2026, 1, 2, 14, 30, tzinfo=UTC)
 
         reporter.run_header(
-            started_at_utc=datetime(2026, 1, 2, 14, 30, tzinfo=UTC),
+            started_at_utc=started_at_utc,
             mode="update",
             db_path="state.sqlite",
             output_dir="outputs",
             workflow_concurrency=4,
         )
         output = console.export_text(styles=False)
+        lines = output.splitlines()
+        expected_started_local = started_at_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
-        self.assertIn("Workflow Run", output)
-        self.assertIn("Started local", output)
-        self.assertIn("Started UTC", output)
-        self.assertIn("2026-01-02T14:30:00+00:00", output)
+        self.assertIn(f"Workflow Run: {expected_started_local}", output)
+        self.assertNotIn("Started local", output)
+        self.assertNotIn("Started UTC", output)
+        self.assertNotIn("2026-01-02T14:30:00+00:00", output)
         self.assertIn("state.sqlite", output)
         self.assertIn("outputs", output)
         self.assertIn("4", output)
+        self.assertEqual(lines[-1], "\u2500" * 100)
 
     def test_dataframe_caps_terminal_rows_with_caption(self) -> None:
         console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)
@@ -121,7 +124,8 @@ class OutputTests(unittest.TestCase):
         reconciliation = pd.DataFrame(
             [
                 {
-                    "Position ID": 1,
+                    "Position ID": 99,
+                    "Display ID": 1,
                     "Asset": "TQQQ",
                     "Action": "sell",
                     "Status": "submitted",
@@ -144,6 +148,7 @@ class OutputTests(unittest.TestCase):
         self.assertNotIn("rsi-buy-TQQQ", output)
         self.assertNotIn("rsi-exit-TQQQ", output)
         self.assertNotIn("alpaca-sell-order-1", output)
+        self.assertNotIn("99", output)
         for line in output.splitlines():
             self.assertLessEqual(len(line), 80)
 
@@ -192,7 +197,11 @@ class OutputTests(unittest.TestCase):
         universe.attrs["universe_title"] = "All Long Leveraged ETFs From Nasdaq Universe"
         universe.attrs["universe_counts"] = {
             "Current ETFs in Nasdaq table": 1,
-            "Current long leveraged ETFs found": 1,
+            "Merged current ETFs/ETNs": 1,
+            "Current long leveraged ETFs/ETNs found": 1,
+            "Executable long leveraged ETFs/ETNs selected": 1,
+            "RSI mappings needing review": 0,
+            "Audit rows parsed": 10,
         }
         universe.attrs["universe_db_path"] = "state.sqlite"
 
@@ -200,8 +209,13 @@ class OutputTests(unittest.TestCase):
         output = console.export_text(styles=False)
 
         self.assertIn("All Long Leveraged ETFs From Nasdaq Universe", output)
-        self.assertIn("Current ETFs in Nasdaq table", output)
-        self.assertIn("Saved SQLite tables", output)
+        self.assertIn("Current long leveraged ETFs/ETNs found", output)
+        self.assertIn("Executable long leveraged ETFs/ETNs selected", output)
+        self.assertIn("RSI mappings needing review", output)
+        self.assertNotIn("Current ETFs in Nasdaq table", output)
+        self.assertNotIn("Merged current ETFs/ETNs", output)
+        self.assertNotIn("Audit rows parsed", output)
+        self.assertNotIn("Saved SQLite tables", output)
         self.assertIn("Asset", output)
         self.assertIn("Name", output)
         self.assertIn("RSI", output)
@@ -210,6 +224,28 @@ class OutputTests(unittest.TestCase):
         self.assertIn("QQQ", output)
         for line in output.splitlines():
             self.assertLessEqual(len(line), 100)
+
+    def test_universe_assets_renders_all_rows(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=120, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+        universe = pd.DataFrame(
+            [
+                {
+                    "symbol": f"A{index:03d}",
+                    "name": f"Leveraged ETF {index:03d}",
+                    "rsi_symbol": f"R{index:03d}",
+                }
+                for index in range(76)
+            ]
+        )
+
+        reporter.universe_assets(universe)
+        output = console.export_text(styles=False)
+
+        self.assertIn("A000", output)
+        self.assertIn("A074", output)
+        self.assertIn("A075", output)
+        self.assertNotIn("Showing 75 of 76 rows", output)
 
     def test_universe_assets_renders_failed_source_details(self) -> None:
         console = Console(file=io.StringIO(), record=True, width=120, color_system=None, no_color=True)
@@ -300,7 +336,7 @@ class OutputTests(unittest.TestCase):
         self.assertIn("FOOU", output)
         self.assertIn("Single-stock-style product", output)
 
-    def test_optimization_summary_renders_zero_trade_metrics_as_na(self) -> None:
+    def test_optimization_summary_excludes_rows_below_trade_and_sharpe_thresholds(self) -> None:
         console = Console(file=io.StringIO(), record=True, width=120, color_system=None, no_color=True)
         reporter = WorkflowReporter(console=console)
 
@@ -326,9 +362,101 @@ class OutputTests(unittest.TestCase):
         )
         output = console.export_text(styles=False)
 
-        self.assertIn("STXX", output)
-        self.assertIn("N/A", output)
+        self.assertIn("No strategies with at least 2 trades and Sharpe >= 1.0.", output)
+        self.assertNotIn("STXX", output)
+        self.assertNotIn("N/A", output)
         self.assertNotIn("-1751", output)
+
+    def test_optimization_summary_shows_only_rows_with_enough_trades_and_sharpe(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=160, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+        rows = [
+            {
+                "Asset": "GOOD",
+                "RSI Symbol": "GD",
+                "Start Date": "2026-01-02",
+                "Trading Days": 2,
+                "Buy RSI": 30.0,
+                "Sell Return Multiple": 1.5,
+                "Trades Executed": 2,
+                "Total Return": 0.1,
+                "CAGR": 0.2,
+                "Sharpe": 1.0,
+                "Kelly Fraction": 0.4,
+                "Max Drawdown": -0.1,
+            },
+            {
+                "Asset": "GREAT",
+                "RSI Symbol": "GT",
+                "Start Date": "2026-01-02",
+                "Trading Days": 2,
+                "Buy RSI": 30.0,
+                "Sell Return Multiple": 1.5,
+                "Trades Executed": 2,
+                "Total Return": 0.2,
+                "CAGR": 0.3,
+                "Sharpe": 1.25,
+                "Kelly Fraction": 0.5,
+                "Max Drawdown": -0.1,
+            },
+            {
+                "Asset": "LOW",
+                "RSI Symbol": "LW",
+                "Start Date": "2026-01-02",
+                "Trading Days": 2,
+                "Buy RSI": 30.0,
+                "Sell Return Multiple": 1.5,
+                "Trades Executed": 2,
+                "Total Return": 0.1,
+                "CAGR": 0.2,
+                "Sharpe": 0.9999,
+                "Kelly Fraction": 0.4,
+                "Max Drawdown": -0.1,
+            },
+            {
+                "Asset": "ONE",
+                "RSI Symbol": "ON",
+                "Start Date": "2026-01-02",
+                "Trading Days": 2,
+                "Buy RSI": 30.0,
+                "Sell Return Multiple": 1.5,
+                "Trades Executed": 1,
+                "Total Return": 0.1,
+                "CAGR": 0.2,
+                "Sharpe": 5.0,
+                "Kelly Fraction": 0.4,
+                "Max Drawdown": -0.1,
+            },
+        ]
+        rows.extend(
+            [
+                {
+                    "Asset": f"A{index:03d}",
+                    "RSI Symbol": f"R{index:03d}",
+                    "Start Date": "2026-01-02",
+                    "Trading Days": 2,
+                    "Buy RSI": 30.0,
+                    "Sell Return Multiple": 1.5,
+                    "Trades Executed": 2,
+                    "Total Return": 0.1,
+                    "CAGR": 0.2,
+                    "Sharpe": 0.8,
+                    "Kelly Fraction": 0.4,
+                    "Max Drawdown": -0.1,
+                }
+                for index in range(76)
+            ]
+        )
+
+        reporter.optimization_summary(pd.DataFrame(rows))
+        output = console.export_text(styles=False)
+
+        self.assertIn("GOOD", output)
+        self.assertIn("GREAT", output)
+        self.assertNotIn("LOW", output)
+        self.assertNotIn("ONE", output)
+        self.assertNotIn("A075", output)
+        self.assertNotIn("Showing", output)
 
     def test_signal_report_keeps_data_sufficiency_columns_when_wide(self) -> None:
         console = Console(file=io.StringIO(), record=True, width=160, color_system=None, no_color=True)
@@ -417,16 +545,31 @@ class OutputTests(unittest.TestCase):
         output = console.export_text(styles=False)
 
         self.assertIn("Buy Signal Eligibility", output)
-        self.assertIn("Buy signals", output)
-        self.assertIn("3", output)
-        self.assertIn("Eligible after active managed filter", output)
-        self.assertIn("Skipped: active managed position", output)
-        self.assertIn("Skipped by Alpaca/live preflight", output)
-        self.assertIn("Buy signals                           3", output)
-        self.assertIn("Eligible after active managed filter  1", output)
-        self.assertIn("Skipped: active managed position      2", output)
-        self.assertIn("Submitted or existing Alpaca buys     1", output)
-        self.assertIn("Skipped by Alpaca/live preflight      1", output)
+        self.assertIn("Eligible buy signals", output)
+        self.assertIn("1 / 3", output)
+        self.assertIn("Submitted/existing buys", output)
+        self.assertIn("Skipped: active managed", output)
+        self.assertIn("Skipped: Alpaca/live preflight", output)
+        self.assertNotIn("Eligible after active managed filter", output)
+        self.assertNotIn("Submitted or existing Alpaca buys", output)
+        self.assertNotIn("Skipped by Alpaca/live preflight", output)
+
+    def test_buy_signal_eligibility_summary_omits_zero_detail_rows(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+
+        reporter.buy_signal_eligibility_summary(
+            buy_signals=pd.DataFrame(),
+            eligible_buy_signals=pd.DataFrame(),
+            order_results=pd.DataFrame(),
+        )
+        output = console.export_text(styles=False)
+
+        self.assertIn("Eligible buy signals", output)
+        self.assertIn("0 / 0", output)
+        self.assertNotIn("Submitted/existing buys", output)
+        self.assertNotIn("Skipped: active managed", output)
+        self.assertNotIn("Skipped: Alpaca/live preflight", output)
 
     def test_realized_pnl_summary_renders_percentage(self) -> None:
         console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)
@@ -469,38 +612,26 @@ class OutputTests(unittest.TestCase):
         )
         output = console.export_text(styles=False)
 
+        self.assertNotIn("Mode", output)
+        self.assertNotIn("SQLite database", output)
+        self.assertNotIn("Workflow concurrency", output)
         self.assertIn("Buy RSI values", output)
         self.assertIn("Sell return multiples", output)
         self.assertIn("none", output)
 
-    def test_benchmark_report_renders_runtime_and_memory_summary(self) -> None:
+    def test_workflow_footer_renders_elapsed_time_and_divider(self) -> None:
         console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)
         reporter = WorkflowReporter(console=console)
 
-        reporter.benchmark_report(
-            WorkflowBenchmark(
-                status="completed",
-                started_at_utc=datetime(2026, 1, 2, 14, 30, tzinfo=UTC),
-                finished_at_utc=datetime(2026, 1, 2, 14, 31, 5, tzinfo=UTC),
-                wall_seconds=65.25,
-                cpu_seconds=32.5,
-                cpu_utilization_percent=49.81,
-                peak_rss_mb=123.45,
-                current_rss_mb=120.25,
-                asset_count=2,
-                completed_asset_count=1,
-                skipped_asset_count=1,
-                rows_processed=10,
-                workflow_concurrency=4,
-            )
-        )
+        reporter.workflow_footer(65.25)
         output = console.export_text(styles=False)
+        lines = output.splitlines()
 
-        self.assertIn("Workflow Benchmark", output)
-        self.assertIn("1m 05.25s", output)
-        self.assertIn("49.81%", output)
-        self.assertIn("123.45 MB", output)
-        self.assertIn("1 completed / 2 total; 1 skipped", output)
+        self.assertIn("Workflow finished in 1m 05.25s.", output)
+        self.assertNotIn("Workflow Benchmark", output)
+        self.assertNotIn("CPU", output)
+        self.assertNotIn("Peak RSS", output)
+        self.assertEqual(lines[-1], "\u2500" * 100)
         for line in output.splitlines():
             self.assertLessEqual(len(line), 100)
 

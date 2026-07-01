@@ -14,11 +14,19 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn
 from rich.table import Column, Table
 from rich.text import Text
 
-from .benchmark import WorkflowBenchmark
+DEFAULT_NON_TERMINAL_WIDTH = 156
 
-DEFAULT_NON_TERMINAL_WIDTH = 160
-DEFAULT_UNIVERSE_TABLE_MAX_ROWS = 75
-DEFAULT_OPTIMIZATION_TABLE_MAX_ROWS = 100
+UNIVERSE_SUMMARY_COUNT_LABELS = (
+    "Current long leveraged ETFs/ETNs found",
+    "Executable long leveraged ETFs/ETNs selected",
+    "RSI mappings needing review",
+)
+UNIVERSE_SUMMARY_NONZERO_COUNT_LABELS = (
+    "RSI mappings excluded pending review",
+    "Workflow universe sources failed",
+    "Active listing sources failed",
+    "Audit long leveraged candidates missing from merged universe",
+)
 
 STATUS_STYLES = {
     "accepted": "green",
@@ -183,17 +191,17 @@ class WorkflowReporter:
         output_dir: str,
         workflow_concurrency: int,
     ) -> None:
-        self.section("Workflow Run")
+        started_local = started_at_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        self.section(f"Workflow Run: {started_local}")
         table = Table.grid(padding=(0, 2))
         table.add_column(style="bold", no_wrap=True)
         table.add_column(ratio=1)
-        table.add_row("Started local", format_timestamp(started_at_utc.astimezone()))
-        table.add_row("Started UTC", format_timestamp(started_at_utc))
         table.add_row("Mode", mode)
         table.add_row("SQLite database", db_path)
         table.add_row("Output directory", output_dir)
         table.add_row("Workflow concurrency", str(workflow_concurrency))
         self.console.print(table)
+        self.console.rule(style="dim")
 
     def settings(
         self,
@@ -209,9 +217,6 @@ class WorkflowReporter:
         table = Table.grid(padding=(0, 2))
         table.add_column(style="bold", no_wrap=True)
         table.add_column(ratio=1)
-        table.add_row("Mode", mode)
-        table.add_row("SQLite database", db_path)
-        table.add_row("Workflow concurrency", str(workflow_concurrency))
         table.add_row("Start date", "Earliest overlapping history for each leveraged asset and RSI symbol")
         table.add_row("Sharpe benchmark", f"{risk_free_symbol} 13-week U.S. Treasury bill")
         table.add_row("Buy RSI values", _grid_range_label(buy_rsi_values, places=0, step_label="1"))
@@ -247,24 +252,19 @@ class WorkflowReporter:
     def universe_assets(self, df: pd.DataFrame) -> None:
         title = str(df.attrs.get("universe_title", "Workflow ETF Universe"))
         counts = df.attrs.get("universe_counts", {})
-        db_path = df.attrs.get("universe_db_path")
         universe_degraded = bool(df.attrs.get("universe_degraded", False))
         source_failures = pd.DataFrame(df.attrs.get("workflow_source_failures", []))
         active_listing_failures = pd.DataFrame(df.attrs.get("active_listing_source_failures", []))
         mapping_review = pd.DataFrame(df.attrs.get("rsi_mapping_review", []))
 
         self.section(title)
-        if counts or db_path:
+        summary_counts = _universe_summary_counts(counts)
+        if summary_counts:
             stats = Table.grid(padding=(0, 2))
             stats.add_column(style="bold", no_wrap=True)
             stats.add_column(ratio=1)
-            for label, value in counts.items():
-                stats.add_row(str(label), format_int(value))
-            if db_path:
-                stats.add_row(
-                    "Saved SQLite tables",
-                    f"{db_path}: nasdaq_etf_universe, universe_audit_*, universe_rsi_mapping_review",
-                )
+            for label, value in summary_counts:
+                stats.add_row(label, format_int(value))
             self.console.print(stats)
         if universe_degraded:
             self.console.print(
@@ -327,21 +327,15 @@ class WorkflowReporter:
             self.console.print(Text("No long leveraged ETFs found.", style="dim"))
             return
 
-        display_df, table_caption = self._limited_dataframe(
-            df,
-            caption=None,
-            max_rows=DEFAULT_UNIVERSE_TABLE_MAX_ROWS,
-            truncated_detail="full universe saved in SQLite",
-        )
         self.console.print(
             self._table(
-                display_df,
+                df,
                 [
                     TableColumn("symbol", "Asset", no_wrap=True),
                     TableColumn("name", "Name", ratio=1, min_width=30),
                     TableColumn("rsi_symbol", "RSI", no_wrap=True),
                 ],
-                caption=table_caption,
+                caption=None,
             )
         )
 
@@ -367,11 +361,15 @@ class WorkflowReporter:
     def optimization_summary(self, df: pd.DataFrame) -> None:
         display_df = df.drop(columns=["End Date", "Annualized Vol", "Hit Rate"], errors="ignore")
         if "Trades Executed" in display_df.columns:
-            no_trades = pd.to_numeric(display_df["Trades Executed"], errors="coerce").fillna(0).le(0)
+            trades = pd.to_numeric(display_df["Trades Executed"], errors="coerce").fillna(0)
+            no_trades = trades.le(0)
             for metric_column in ["Sharpe", "Kelly Fraction"]:
                 if metric_column in display_df.columns:
                     display_df[metric_column] = display_df[metric_column].astype("object")
                     display_df.loc[no_trades, metric_column] = pd.NA
+            display_df = display_df[trades.ge(2)]
+        if "Sharpe" in display_df.columns:
+            display_df = display_df[pd.to_numeric(display_df["Sharpe"], errors="coerce").ge(1.0)]
         self.dataframe(
             "Best Sharpe Parameters By Asset",
             display_df,
@@ -401,9 +399,7 @@ class WorkflowReporter:
                 ),
                 TableColumn("Max Drawdown", "Max DD", justify="right", formatter=format_decimal_4, no_wrap=True),
             ],
-            empty_message="No strategies produced more than one executed trade.",
-            max_rows=DEFAULT_OPTIMIZATION_TABLE_MAX_ROWS,
-            truncated_detail="full data written to optimization_summary.csv",
+            empty_message="No strategies with at least 2 trades and Sharpe >= 1.0.",
         )
 
     def signal_report(self, title: str, df: pd.DataFrame, *, empty_message: str) -> None:
@@ -463,17 +459,20 @@ class WorkflowReporter:
         table = Table.grid(padding=(0, 2))
         table.add_column(style="bold", no_wrap=True)
         table.add_column(justify="right", no_wrap=True)
-        table.add_row("Buy signals", format_int(total_buy_signals))
-        table.add_row("Eligible after active managed filter", format_int(eligible_signals))
-        table.add_row("Skipped: active managed position", format_int(active_managed_skips))
-        table.add_row("Submitted or existing Alpaca buys", format_int(submitted_or_existing))
-        table.add_row("Skipped by Alpaca/live preflight", format_int(live_preflight_skips))
+        table.add_row("Eligible buy signals", f"{format_int(eligible_signals)} / {format_int(total_buy_signals)}")
+        if submitted_or_existing:
+            table.add_row("Submitted/existing buys", format_int(submitted_or_existing))
+        if active_managed_skips:
+            table.add_row("Skipped: active managed", format_int(active_managed_skips))
+        if live_preflight_skips:
+            table.add_row("Skipped: Alpaca/live preflight", format_int(live_preflight_skips))
         self.console.print(table)
 
     def order_results(self, df: pd.DataFrame) -> None:
-        self.dataframe(
-            "Alpaca Paper Order Results",
-            df,
+        columns = []
+        if "Display ID" in df.columns:
+            columns.append(TableColumn("Display ID", "ID", justify="right", formatter=format_int, no_wrap=True))
+        columns.extend(
             [
                 TableColumn("Asset", no_wrap=True),
                 TableColumn("Date", no_wrap=True),
@@ -482,17 +481,23 @@ class WorkflowReporter:
                 TableColumn("Limit Price", "Limit", justify="right", formatter=format_decimal_2, no_wrap=True),
                 TableColumn("Status", status=True, no_wrap=True),
                 TableColumn("Message", ratio=1, min_width=24, formatter=format_message),
-            ],
+            ]
+        )
+        self.dataframe(
+            "Alpaca Paper Order Results",
+            df,
+            columns,
             empty_message="No buy signals to submit.",
             caption="Full client and Alpaca order IDs are written to alpaca_order_results.csv.",
         )
 
     def reconciliation(self, df: pd.DataFrame) -> None:
+        id_column = "Display ID" if "Display ID" in df.columns else "Position ID"
         self.dataframe(
             "Alpaca Managed Position Reconciliation",
             df,
             [
-                TableColumn("Position ID", "ID", justify="right", formatter=format_int, no_wrap=True),
+                TableColumn(id_column, "ID", justify="right", formatter=format_int, no_wrap=True),
                 TableColumn("Asset", no_wrap=True),
                 TableColumn("Action", no_wrap=True),
                 TableColumn("Status", status=True, no_wrap=True),
@@ -539,30 +544,10 @@ class WorkflowReporter:
             caption="Closed positions missing actual sell fill prices are excluded from realized P/L totals.",
         )
 
-    def benchmark_report(self, benchmark: WorkflowBenchmark) -> None:
-        self.section("Workflow Benchmark")
-        table = Table.grid(padding=(0, 2))
-        table.add_column(style="bold", no_wrap=True)
-        table.add_column(ratio=1)
-        table.add_row("Status", benchmark.status)
-        table.add_row("Started UTC", format_timestamp(benchmark.started_at_utc))
-        table.add_row("Finished UTC", format_timestamp(benchmark.finished_at_utc))
-        table.add_row("Wall time", format_duration(benchmark.wall_seconds))
-        table.add_row("CPU time", format_duration(benchmark.cpu_seconds))
-        table.add_row("CPU utilization", format_percent_2(benchmark.cpu_utilization_percent))
-        table.add_row("Peak RSS", format_mb(benchmark.peak_rss_mb))
-        table.add_row("Current RSS", format_mb(benchmark.current_rss_mb))
-        table.add_row(
-            "Assets",
-            (
-                f"{format_int(benchmark.completed_asset_count)} completed / "
-                f"{format_int(benchmark.asset_count)} total; "
-                f"{format_int(benchmark.skipped_asset_count)} skipped"
-            ),
-        )
-        table.add_row("Rows processed", format_int(benchmark.rows_processed))
-        table.add_row("Workflow concurrency", format_int(benchmark.workflow_concurrency))
-        self.console.print(table)
+    def workflow_footer(self, elapsed_seconds: float) -> None:
+        self.console.print()
+        self.console.print(f"Workflow finished in {format_duration(elapsed_seconds)}.")
+        self.console.rule(style="dim")
 
     def _table(self, df: pd.DataFrame, columns: list[TableColumn], *, caption: str | None) -> Table:
         table = Table(
@@ -696,11 +681,6 @@ def format_percent_2(value: Any) -> str:
     return f"{text}%" if text else text
 
 
-def format_mb(value: Any) -> str:
-    text = format_decimal(value, 2)
-    return f"{text} MB" if text else "unavailable"
-
-
 def format_duration(value: Any) -> str:
     if _is_empty(value):
         return ""
@@ -749,6 +729,23 @@ def _sentence_case(value: str) -> str:
     if not value:
         return value
     return value[0].upper() + value[1:]
+
+
+def _universe_summary_counts(counts: Mapping[object, object]) -> list[tuple[str, object]]:
+    rows = [(label, counts[label]) for label in UNIVERSE_SUMMARY_COUNT_LABELS if label in counts]
+    rows.extend(
+        (label, counts[label])
+        for label in UNIVERSE_SUMMARY_NONZERO_COUNT_LABELS
+        if label in counts and _is_nonzero_count(counts[label])
+    )
+    return rows
+
+
+def _is_nonzero_count(value: object) -> bool:
+    try:
+        return int(value) != 0
+    except (TypeError, ValueError):
+        return bool(value)
 
 
 def _combine_captions(caption: str | None, extra: str) -> str:

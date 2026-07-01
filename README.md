@@ -136,7 +136,6 @@ CSV reports are written to `outputs/` by default:
 - `alpaca_reconciliation_results.csv`
 - `alpaca_order_results.csv`
 - `alpaca_sell_order_results.csv`
-- `workflow_benchmark.csv`
 
 Use `--output-dir` to choose a different location:
 
@@ -158,10 +157,12 @@ output. A successfully parsed source with zero leveraged matches remains healthy
 acceptable.
 
 Terminal output is intentionally compact: concurrent asset work is shown as aggregate progress, then
-the final asset summary is sorted by workflow index. CSV files retain full order IDs and detail, while
-terminal Alpaca tables show the most useful fields with wrapped messages. A final workflow benchmark
-footer reports wall time, CPU time, memory use, processed assets, and processed rows. Redirected
-or cron-driven non-terminal output defaults to a 160-column layout so log tables stay readable, while
+the final asset summary is sorted by workflow index. The terminal Best Sharpe table shows only
+strategies with at least two executed trades and Sharpe of 1.0 or greater; `optimization_summary.csv`
+retains the full per-asset summary. CSV files retain full order IDs and detail, while terminal Alpaca
+tables show dense display IDs and the most useful fields with wrapped messages. A final workflow
+footer reports total elapsed time and ends with a divider for appended logs. Redirected or
+cron-driven non-terminal output defaults to a 156-column layout so log tables stay readable, while
 interactive terminal output uses the terminal's current width.
 
 ## Environment Variables
