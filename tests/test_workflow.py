@@ -618,6 +618,54 @@ class WorkflowAsyncTests(unittest.TestCase):
         self.assertNotIn("Display ID", written_reconciliation.columns)
         self.assertNotIn("Display ID", written_orders.columns)
 
+    def test_write_workflow_outputs_omits_sell_signal_table_but_writes_csv(self) -> None:
+        sell_signals = pd.DataFrame(
+            [
+                {
+                    "Asset": "ZZSELL",
+                    "RSI Symbol": "ZZRSI",
+                    "Date": "2026-01-02",
+                    "Pending Action": "sell",
+                }
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "outputs"
+            output_buffer = io.StringIO()
+            reporter = WorkflowReporter(
+                console=Console(file=output_buffer, width=100, color_system=None, no_color=True)
+            )
+            _write_workflow_outputs(
+                mode="update",
+                db_path=str(Path(tmp) / "state.sqlite"),
+                base_cfg=BacktestConfig(),
+                buy_rsi_values=[30.0],
+                profit_target_values=[1.5],
+                alpaca_cfg=AlpacaOrderConfig(),
+                output_dir=str(output_dir),
+                workflow_concurrency=1,
+                reporter=reporter,
+                asset_run_results=[],
+                optimization_summary=pd.DataFrame(),
+                curves=pd.DataFrame(),
+                buy_signals=pd.DataFrame(),
+                eligible_buy_signals=pd.DataFrame(),
+                sell_signals=sell_signals,
+                realized_pnl_summary=pd.DataFrame(),
+                managed_positions=pd.DataFrame(),
+                reconciliation_results=pd.DataFrame(columns=["Action"]),
+                sell_reconciliation_results=pd.DataFrame(),
+                order_results=pd.DataFrame(),
+                workflow_timer=WorkflowTimer.start(),
+            )
+            output = output_buffer.getvalue()
+            written_sell_signals = pd.read_csv(output_dir / "sell_signals.csv")
+
+        self.assertNotIn("Sell Signals For Next Open", output)
+        self.assertNotIn("ZZSELL", output)
+        self.assertEqual(written_sell_signals["Asset"].tolist(), ["ZZSELL"])
+
     def test_write_workflow_outputs_prints_footer_without_benchmark_csv(self) -> None:
         asset_run_results = [
             AssetRunResult(

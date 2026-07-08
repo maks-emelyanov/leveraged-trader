@@ -665,11 +665,6 @@ def _write_workflow_outputs(
         buy_signals,
         empty_message="No optimized assets with more than one trade and Sharpe >= 1.0 have a pending buy signal.",
     )
-    reporter.signal_report(
-        "Sell Signals For Next Open",
-        sell_signals,
-        empty_message="No optimized assets have a pending sell signal.",
-    )
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)

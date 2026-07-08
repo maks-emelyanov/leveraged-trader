@@ -10,6 +10,7 @@ from typing import Any
 import pandas as pd
 from rich import box
 from rich.console import Console
+from rich.panel import Panel
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Column, Table
 from rich.text import Text
@@ -192,7 +193,6 @@ class WorkflowReporter:
         workflow_concurrency: int,
     ) -> None:
         started_local = started_at_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-        self.section(f"Workflow Run: {started_local}")
         table = Table.grid(padding=(0, 2))
         table.add_column(style="bold", no_wrap=True)
         table.add_column(ratio=1)
@@ -200,8 +200,17 @@ class WorkflowReporter:
         table.add_row("SQLite database", db_path)
         table.add_row("Output directory", output_dir)
         table.add_row("Workflow concurrency", str(workflow_concurrency))
-        self.console.print(table)
-        self.console.rule(style="dim")
+        self.console.print()
+        self.console.print(
+            Panel(
+                table,
+                title=Text(f"Workflow Run: {started_local}", style="bold"),
+                title_align="left",
+                border_style="dim",
+                box=box.ROUNDED,
+                padding=(0, 1),
+            )
+        )
 
     def settings(
         self,

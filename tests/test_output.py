@@ -57,7 +57,7 @@ class OutputTests(unittest.TestCase):
             workflow_concurrency=4,
         )
         output = console.export_text(styles=False)
-        lines = output.splitlines()
+        lines = [line for line in output.splitlines() if line]
         expected_started_local = started_at_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
         self.assertIn(f"Workflow Run: {expected_started_local}", output)
@@ -67,7 +67,11 @@ class OutputTests(unittest.TestCase):
         self.assertIn("state.sqlite", output)
         self.assertIn("outputs", output)
         self.assertIn("4", output)
-        self.assertEqual(lines[-1], "\u2500" * 100)
+        self.assertTrue(lines[0].startswith("\u256d\u2500 Workflow Run: "))
+        self.assertIn("\u2502 Workflow concurrency  4", output)
+        self.assertTrue(lines[-1].startswith("\u2570"))
+        self.assertTrue(lines[-1].endswith("\u256f"))
+        self.assertNotEqual(lines[-1], "\u2500" * 100)
 
     def test_dataframe_caps_terminal_rows_with_caption(self) -> None:
         console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)
