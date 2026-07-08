@@ -253,9 +253,15 @@ The risk-free benchmark is forward-filled onto the common asset/signal trading c
 live processing and when SQLite data is rebuilt into an equity curve. This keeps reported strategy
 days and benchmark returns consistent when the benchmark source has a missing session.
 
-Strategy-state updates use a SQLite immediate transaction and a persisted generation counter. A
-benchmark invalidation and the dependent asset/config updates therefore commit as one serialized
-operation even if two workflow processes use the same database.
+Canonical market histories are compared with their persisted symbols in one bulk read, and SQLite
+writes are limited to new, changed, or removed sessions. Cached signal and risk-free histories are
+synchronized once per workflow while their downloaded frames remain unchanged. A commit from another
+database connection discards that run-local synchronization cache before the next asset is processed.
+
+Strategy-state updates use a thread-confined SQLite connection with a separate immediate transaction
+and persisted generation check for every asset. A benchmark invalidation and the dependent
+asset/config updates therefore commit as one serialized operation even if two workflow processes use
+the same database. Failed transactions do not populate the shared-history synchronization cache.
 
 If every asset workflow fails, the command exits with an error before it writes reports or submits
 new buys. Partial asset failures remain visible in the final asset summary while successful assets

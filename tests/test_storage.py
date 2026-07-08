@@ -11,6 +11,7 @@ from leveraged_trader.backtest import performance_summary
 from leveraged_trader.config import RISK_FREE_SYMBOL, BacktestConfig
 from leveraged_trader.indicators import compute_rsi
 from leveraged_trader.storage import (
+    _synchronize_market_data_history,
     ensure_rsi_values,
     init_state_db,
     process_asset_grid,
@@ -70,6 +71,160 @@ class StorageOptimizationTests(unittest.TestCase):
             profit_target_values=[1.05, 1.50],
             rebuild=rebuild,
         )
+
+    def test_authoritative_history_identical_sync_reads_once_without_writes(self) -> None:
+        history = self.canonical_histories(sample_strategy_data())["TQQQ"]
+
+        self.assertFalse(_synchronize_market_data_history(self.conn, history, "TQQQ"))
+        changes_before = self.conn.total_changes
+        statements: list[str] = []
+        self.conn.set_trace_callback(statements.append)
+        try:
+            revised = _synchronize_market_data_history(self.conn, history, "TQQQ")
+        finally:
+            self.conn.set_trace_callback(None)
+
+        market_statements = [
+            statement.upper()
+            for statement in statements
+            if "MARKET_DATA" in statement.upper()
+        ]
+        self.assertFalse(revised)
+        self.assertEqual(self.conn.total_changes, changes_before)
+        self.assertEqual(
+            sum(statement.lstrip().startswith("SELECT") for statement in market_statements),
+            1,
+        )
+        self.assertFalse(
+            any(
+                statement.lstrip().startswith(("INSERT", "UPDATE", "DELETE"))
+                for statement in market_statements
+            )
+        )
+
+    def test_authoritative_history_tail_append_writes_only_new_session(self) -> None:
+        history = self.canonical_histories(sample_strategy_data())["TQQQ"]
+        self.assertFalse(_synchronize_market_data_history(self.conn, history.iloc[:-1], "TQQQ"))
+        changes_before = self.conn.total_changes
+
+        revised = _synchronize_market_data_history(self.conn, history, "TQQQ")
+
+        self.assertFalse(revised)
+        self.assertEqual(self.conn.total_changes - changes_before, 1)
+
+    def test_authoritative_history_correction_updates_only_changed_session(self) -> None:
+        history = self.canonical_histories(sample_strategy_data())["TQQQ"]
+        self.assertFalse(_synchronize_market_data_history(self.conn, history, "TQQQ"))
+        revision = history.copy()
+        revision.loc[revision.index[10], "TQQQ_Close"] = 123.45
+        changes_before = self.conn.total_changes
+
+        revised = _synchronize_market_data_history(self.conn, revision, "TQQQ")
+
+        self.assertTrue(revised)
+        self.assertEqual(self.conn.total_changes - changes_before, 1)
+
+    def test_authoritative_history_preserves_float_comparison_tolerance(self) -> None:
+        history = self.canonical_histories(sample_strategy_data())["TQQQ"]
+        self.assertFalse(_synchronize_market_data_history(self.conn, history, "TQQQ"))
+        revision = history.copy()
+        revision.loc[revision.index[10], "TQQQ_Close"] += 5e-11
+        changes_before = self.conn.total_changes
+
+        self.assertFalse(_synchronize_market_data_history(self.conn, revision, "TQQQ"))
+        self.assertEqual(self.conn.total_changes, changes_before)
+
+        revision.loc[revision.index[10], "TQQQ_Close"] += 1e-8
+        self.assertTrue(_synchronize_market_data_history(self.conn, revision, "TQQQ"))
+        self.assertEqual(self.conn.total_changes - changes_before, 1)
+
+    def test_authoritative_history_removal_and_backfill_are_revisions(self) -> None:
+        history = self.canonical_histories(sample_strategy_data())["TQQQ"]
+        removed_date = history.index[10]
+        self.assertFalse(_synchronize_market_data_history(self.conn, history, "TQQQ"))
+        changes_before = self.conn.total_changes
+
+        revised_removal = _synchronize_market_data_history(
+            self.conn,
+            history.drop(index=removed_date),
+            "TQQQ",
+        )
+
+        self.assertTrue(revised_removal)
+        self.assertEqual(self.conn.total_changes - changes_before, 1)
+        changes_before = self.conn.total_changes
+
+        revised_backfill = _synchronize_market_data_history(self.conn, history, "TQQQ")
+
+        self.assertTrue(revised_backfill)
+        self.assertEqual(self.conn.total_changes - changes_before, 1)
+
+    def test_authoritative_history_null_values_do_not_create_false_corrections(self) -> None:
+        history = self.canonical_histories(sample_strategy_data())["TQQQ"]
+        history.loc[history.index[10], "TQQQ_Volume"] = np.nan
+        self.assertFalse(_synchronize_market_data_history(self.conn, history, "TQQQ"))
+        changes_before = self.conn.total_changes
+
+        revised = _synchronize_market_data_history(self.conn, history, "TQQQ")
+
+        self.assertFalse(revised)
+        self.assertEqual(self.conn.total_changes, changes_before)
+
+    def test_authoritative_history_missing_columns_fails_before_writing(self) -> None:
+        history = self.canonical_histories(sample_strategy_data())["TQQQ"].drop(
+            columns="TQQQ_Volume"
+        )
+        changes_before = self.conn.total_changes
+
+        with self.assertRaisesRegex(ValueError, "TQQQ_Volume"):
+            _synchronize_market_data_history(self.conn, history, "TQQQ")
+
+        self.assertEqual(self.conn.total_changes, changes_before)
+
+    def test_presynchronized_authoritative_histories_skip_only_their_sync_calls(self) -> None:
+        data = sample_strategy_data()
+        histories = self.canonical_histories(data)
+        _synchronize_market_data_history(self.conn, histories["QQQ"], "QQQ")
+        _synchronize_market_data_history(self.conn, histories[RISK_FREE_SYMBOL], RISK_FREE_SYMBOL)
+
+        with patch(
+            "leveraged_trader.storage._synchronize_market_data_history",
+            wraps=_synchronize_market_data_history,
+        ) as synchronize:
+            process_asset_grid(
+                self.conn,
+                data,
+                self.cfg,
+                "TQQQ",
+                "QQQ",
+                [30.0],
+                [1.5],
+                rebuild=True,
+                authoritative_histories=histories,
+                presynchronized_authoritative_symbols={"QQQ", RISK_FREE_SYMBOL},
+            )
+
+        self.assertEqual(
+            [call.args[2] for call in synchronize.call_args_list],
+            ["TQQQ"],
+        )
+
+    def test_presynchronized_symbol_must_have_an_authoritative_history(self) -> None:
+        data = sample_strategy_data()
+
+        with self.assertRaisesRegex(ValueError, "Presynchronized market symbols"):
+            process_asset_grid(
+                self.conn,
+                data,
+                self.cfg,
+                "TQQQ",
+                "QQQ",
+                [30.0],
+                [1.5],
+                rebuild=True,
+                authoritative_histories=self.canonical_histories(data),
+                presynchronized_authoritative_symbols={"SPY"},
+            )
 
     @staticmethod
     def canonical_histories(data: pd.DataFrame, asset_symbol: str = "TQQQ") -> dict[str, pd.DataFrame]:

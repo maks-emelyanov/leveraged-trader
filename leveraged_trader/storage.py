@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import time
 from collections.abc import Callable
@@ -356,7 +357,13 @@ def _market_values_differ(existing: object, incoming: object) -> bool:
         return incoming is not None and not pd.isna(incoming)
     if incoming is None or pd.isna(incoming):
         return True
-    return not bool(np.isclose(float(existing), float(incoming), rtol=1e-12, atol=1e-12))
+    existing_value = float(existing)
+    incoming_value = float(incoming)
+    if existing_value == incoming_value:
+        return False
+    if not math.isfinite(existing_value) or not math.isfinite(incoming_value):
+        return True
+    return abs(existing_value - incoming_value) > 1e-12 + 1e-12 * abs(incoming_value)
 
 
 def _revised_market_symbols(
@@ -415,6 +422,21 @@ def save_market_data(conn: sqlite3.Connection, data: pd.DataFrame, symbols: list
     )
 
 
+def _market_history_values(
+    data: pd.DataFrame,
+    symbol: str,
+) -> dict[str, tuple[object, ...]]:
+    columns = [f"{symbol}_{field}" for field in _MARKET_DATA_FIELDS]
+    values_by_date: dict[str, tuple[object, ...]] = {}
+    for date, values in zip(
+        data.index,
+        data.loc[:, columns].itertuples(index=False, name=None),
+        strict=True,
+    ):
+        values_by_date[_date_str(date)] = values
+    return values_by_date
+
+
 def _synchronize_market_data_history(
     conn: sqlite3.Connection,
     data: pd.DataFrame,
@@ -435,32 +457,68 @@ def _synchronize_market_data_history(
         missing = ", ".join(sorted(missing_columns))
         raise ValueError(f"Authoritative {symbol} history is missing required columns: {missing}.")
 
-    existing_dates = {
-        str(row[0])
+    existing_by_date = {
+        str(row[0]): row[1:]
         for row in conn.execute(
-            "SELECT date FROM market_data WHERE symbol = ?",
+            """
+            SELECT date, open, high, low, close, volume
+            FROM market_data
+            WHERE symbol = ?
+            """,
             (symbol,),
         ).fetchall()
     }
-    revised = bool(_revised_market_symbols(conn, data, [symbol]))
-    incoming_dates = {_date_str(date) for date in data.index}
+    incoming_by_date = _market_history_values(data, symbol)
+    existing_dates = set(existing_by_date)
+    incoming_dates = set(incoming_by_date)
+    changed_dates = {
+        date
+        for date in existing_dates.intersection(incoming_dates)
+        if any(
+            _market_values_differ(existing, incoming)
+            for existing, incoming in zip(
+                existing_by_date[date],
+                incoming_by_date[date],
+                strict=True,
+            )
+        )
+    }
+    new_dates = incoming_dates.difference(existing_dates)
     removed_dates = existing_dates.difference(incoming_dates)
     # A new tail date is a normal incremental update.  A newly discovered date
     # at or before the prior tail changes historical inputs and needs replay.
     prior_tail = max(existing_dates) if existing_dates else None
     historical_additions = {
-        date
-        for date in incoming_dates.difference(existing_dates)
-        if prior_tail is not None and date <= prior_tail
+        date for date in new_dates if prior_tail is not None and date <= prior_tail
     }
     if removed_dates:
         conn.executemany(
             "DELETE FROM market_data WHERE symbol = ? AND date = ?",
-            [(symbol, date) for date in removed_dates],
+            [(symbol, date) for date in sorted(removed_dates)],
         )
 
-    save_market_data(conn, data, [symbol])
-    return revised or bool(removed_dates) or bool(historical_additions)
+    dates_to_write = new_dates.union(changed_dates)
+    if dates_to_write:
+        conn.executemany(
+            """
+            INSERT INTO market_data
+            (symbol, date, open, high, low, close, volume)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol, date) DO UPDATE SET
+                open = excluded.open,
+                high = excluded.high,
+                low = excluded.low,
+                close = excluded.close,
+                volume = excluded.volume
+            """,
+            [
+                (symbol, date, *values)
+                for date, values in incoming_by_date.items()
+                if date in dates_to_write
+            ],
+        )
+
+    return bool(changed_dates or removed_dates or historical_additions)
 
 
 def save_rsi_values(
@@ -2061,6 +2119,7 @@ def process_asset_grid(
     signal_history: pd.DataFrame | None = None,
     strategy_fingerprint: str | None = None,
     authoritative_histories: dict[str, pd.DataFrame] | None = None,
+    presynchronized_authoritative_symbols: set[str] | None = None,
     commit: bool = True,
     grid_compute_observer: Callable[[float], None] | None = None,
 ) -> None:
@@ -2077,15 +2136,22 @@ def process_asset_grid(
         signal_symbol,
         strategy_fingerprint,
     )
+    presynchronized_symbols = presynchronized_authoritative_symbols or set()
     if authoritative_histories is not None:
         authoritative_symbols = set(authoritative_histories)
         unexpected_symbols = authoritative_symbols.difference(symbols)
         if unexpected_symbols:
             unexpected = ", ".join(sorted(unexpected_symbols))
             raise ValueError(f"Unexpected authoritative market symbols: {unexpected}.")
+        unexpected_presynchronized = presynchronized_symbols.difference(authoritative_symbols)
+        if unexpected_presynchronized:
+            unexpected = ", ".join(sorted(unexpected_presynchronized))
+            raise ValueError(f"Presynchronized market symbols lack authoritative histories: {unexpected}.")
 
         revised_symbols = set()
         for symbol, history in authoritative_histories.items():
+            if symbol in presynchronized_symbols:
+                continue
             if _synchronize_market_data_history(conn, history, symbol) and not rebuild:
                 revised_symbols.add(symbol)
 
@@ -2096,6 +2162,9 @@ def process_asset_grid(
             save_market_data(conn, data, fallback_symbols)
         signal_history_revisions = set()
     else:
+        if presynchronized_symbols:
+            unexpected = ", ".join(sorted(presynchronized_symbols))
+            raise ValueError(f"Presynchronized market symbols lack authoritative histories: {unexpected}.")
         revised_symbols = set() if rebuild else _revised_market_symbols(conn, data, symbols)
         signal_history_revisions = (
             set()

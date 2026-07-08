@@ -15,7 +15,7 @@ from rich.console import Console
 from leveraged_trader.benchmark import WorkflowPhaseTimings, WorkflowTimer
 from leveraged_trader.config import AlpacaOrderConfig, BacktestConfig, UniverseConfig
 from leveraged_trader.output import WorkflowReporter
-from leveraged_trader.storage import init_state_db
+from leveraged_trader.storage import _synchronize_market_data_history, init_state_db
 from leveraged_trader.workflow import (
     AssetRunJob,
     AssetRunPlan,
@@ -29,12 +29,53 @@ from leveraged_trader.workflow import (
     _run_asset_pipeline,
     _state_connection,
     _terminal_alpaca_display_results,
+    _WorkflowStrategySession,
     _write_workflow_outputs,
     run_resumable_optimizations_async,
 )
 
 
 class WorkflowAsyncTests(unittest.TestCase):
+    @staticmethod
+    def _symbol_history(symbol: str, offset: float = 0.0) -> pd.DataFrame:
+        dates = pd.date_range("2026-01-02", periods=20, freq="B")
+        close = [100.0 + offset + index for index in range(len(dates))]
+        return pd.DataFrame(
+            {
+                f"{symbol}_Open": close,
+                f"{symbol}_High": [value + 1.0 for value in close],
+                f"{symbol}_Low": [value - 1.0 for value in close],
+                f"{symbol}_Close": close,
+                f"{symbol}_Volume": [1_000_000.0] * len(dates),
+            },
+            index=dates,
+        )
+
+    def _process_session_asset(
+        self,
+        session: _WorkflowStrategySession,
+        db_path: str,
+        asset_symbol: str,
+        signal_symbol: str,
+        asset_history: pd.DataFrame,
+        signal_history: pd.DataFrame,
+        risk_free_history: pd.DataFrame,
+    ) -> None:
+        _process_asset_grid_for_db(
+            db_path,
+            pd.concat([asset_history, signal_history, risk_free_history], axis=1),
+            asset_history,
+            signal_history,
+            risk_free_history,
+            BacktestConfig(rsi_period=3),
+            asset_symbol,
+            signal_symbol,
+            [30.0],
+            [1.5],
+            False,
+            strategy_session=session,
+        )
+
     def _run_workflow_with_grids(
         self,
         *,
@@ -130,6 +171,254 @@ class WorkflowAsyncTests(unittest.TestCase):
         self.assertEqual(snapshot.grid_compute_seconds, 2.0)
         self.assertEqual(snapshot.db_sync_seconds, 3.0)
 
+    def test_strategy_session_synchronizes_shared_history_instances_once(self) -> None:
+        signal_history = self._symbol_history("QQQ", 10.0)
+        risk_free_history = self._symbol_history("^IRX", -95.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "state.sqlite")
+            with sqlite3.connect(db_path) as conn:
+                init_state_db(conn)
+            session = _WorkflowStrategySession(db_path)
+            try:
+                with patch(
+                    "leveraged_trader.storage._synchronize_market_data_history",
+                    wraps=_synchronize_market_data_history,
+                ) as synchronize:
+                    self._process_session_asset(
+                        session,
+                        db_path,
+                        "TQQQ",
+                        "QQQ",
+                        self._symbol_history("TQQQ"),
+                        signal_history,
+                        risk_free_history,
+                    )
+                    self._process_session_asset(
+                        session,
+                        db_path,
+                        "UPRO",
+                        "QQQ",
+                        self._symbol_history("UPRO", 20.0),
+                        signal_history,
+                        risk_free_history,
+                    )
+            finally:
+                session.close()
+
+        self.assertEqual(
+            [call.args[2] for call in synchronize.call_args_list],
+            ["TQQQ", "QQQ", "^IRX", "UPRO"],
+        )
+
+    def test_strategy_session_resynchronizes_a_different_history_instance(self) -> None:
+        signal_history = self._symbol_history("QQQ", 10.0)
+        risk_free_history = self._symbol_history("^IRX", -95.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "state.sqlite")
+            with sqlite3.connect(db_path) as conn:
+                init_state_db(conn)
+            session = _WorkflowStrategySession(db_path)
+            try:
+                self._process_session_asset(
+                    session,
+                    db_path,
+                    "TQQQ",
+                    "QQQ",
+                    self._symbol_history("TQQQ"),
+                    signal_history,
+                    risk_free_history,
+                )
+                with patch(
+                    "leveraged_trader.storage._synchronize_market_data_history",
+                    wraps=_synchronize_market_data_history,
+                ) as synchronize:
+                    self._process_session_asset(
+                        session,
+                        db_path,
+                        "UPRO",
+                        "QQQ",
+                        self._symbol_history("UPRO", 20.0),
+                        signal_history.copy(),
+                        risk_free_history,
+                    )
+            finally:
+                session.close()
+
+        self.assertEqual(
+            [call.args[2] for call in synchronize.call_args_list],
+            ["UPRO", "QQQ"],
+        )
+
+    def test_strategy_session_external_commit_invalidates_shared_history_cache(self) -> None:
+        signal_history = self._symbol_history("QQQ", 10.0)
+        risk_free_history = self._symbol_history("^IRX", -95.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "state.sqlite")
+            with sqlite3.connect(db_path) as conn:
+                init_state_db(conn)
+            session = _WorkflowStrategySession(db_path)
+            try:
+                self._process_session_asset(
+                    session,
+                    db_path,
+                    "TQQQ",
+                    "QQQ",
+                    self._symbol_history("TQQQ"),
+                    signal_history,
+                    risk_free_history,
+                )
+                with sqlite3.connect(db_path) as external:
+                    external.execute(
+                        "UPDATE strategy_state_generation SET generation = generation + 1 WHERE id = 1"
+                    )
+                with patch(
+                    "leveraged_trader.storage._synchronize_market_data_history",
+                    wraps=_synchronize_market_data_history,
+                ) as synchronize:
+                    self._process_session_asset(
+                        session,
+                        db_path,
+                        "UPRO",
+                        "QQQ",
+                        self._symbol_history("UPRO", 20.0),
+                        signal_history,
+                        risk_free_history,
+                    )
+            finally:
+                session.close()
+
+        self.assertEqual(
+            [call.args[2] for call in synchronize.call_args_list],
+            ["UPRO", "QQQ", "^IRX"],
+        )
+
+    def test_strategy_session_does_not_cache_rolled_back_histories(self) -> None:
+        asset_history = self._symbol_history("TQQQ")
+        signal_history = self._symbol_history("QQQ", 10.0)
+        risk_free_history = self._symbol_history("^IRX", -95.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "state.sqlite")
+            with sqlite3.connect(db_path) as conn:
+                init_state_db(conn)
+            session = _WorkflowStrategySession(db_path)
+            try:
+                with (
+                    patch(
+                        "leveraged_trader.storage._synchronize_market_data_history",
+                        wraps=_synchronize_market_data_history,
+                    ) as synchronize,
+                    patch(
+                        "leveraged_trader.storage.run_grid_summary",
+                        side_effect=RuntimeError("grid failed"),
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "grid failed"),
+                ):
+                    self._process_session_asset(
+                        session,
+                        db_path,
+                        "TQQQ",
+                        "QQQ",
+                        asset_history,
+                        signal_history,
+                        risk_free_history,
+                    )
+
+                with patch(
+                    "leveraged_trader.storage._synchronize_market_data_history",
+                    wraps=_synchronize_market_data_history,
+                ) as retry_synchronize:
+                    self._process_session_asset(
+                        session,
+                        db_path,
+                        "TQQQ",
+                        "QQQ",
+                        asset_history,
+                        signal_history,
+                        risk_free_history,
+                    )
+            finally:
+                session.close()
+
+        self.assertEqual(len(synchronize.call_args_list), 3)
+        self.assertEqual(
+            [call.args[2] for call in retry_synchronize.call_args_list],
+            ["TQQQ", "QQQ", "^IRX"],
+        )
+
+    def test_cached_signal_correction_still_rebuilds_later_dependents(self) -> None:
+        tqqq_history = self._symbol_history("TQQQ")
+        upro_history = self._symbol_history("UPRO", 20.0)
+        signal_history = self._symbol_history("QQQ", 10.0)
+        risk_free_history = self._symbol_history("^IRX", -95.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "state.sqlite")
+            with sqlite3.connect(db_path) as conn:
+                init_state_db(conn)
+            session = _WorkflowStrategySession(db_path)
+            try:
+                self._process_session_asset(
+                    session,
+                    db_path,
+                    "TQQQ",
+                    "QQQ",
+                    tqqq_history,
+                    signal_history,
+                    risk_free_history,
+                )
+                self._process_session_asset(
+                    session,
+                    db_path,
+                    "UPRO",
+                    "QQQ",
+                    upro_history,
+                    signal_history,
+                    risk_free_history,
+                )
+                corrected_signal = signal_history.copy()
+                corrected_signal.loc[corrected_signal.index[10], "QQQ_Close"] += 5.0
+                with patch(
+                    "leveraged_trader.storage._synchronize_market_data_history",
+                    wraps=_synchronize_market_data_history,
+                ) as synchronize:
+                    self._process_session_asset(
+                        session,
+                        db_path,
+                        "TQQQ",
+                        "QQQ",
+                        tqqq_history.copy(),
+                        corrected_signal,
+                        risk_free_history,
+                    )
+                    self._process_session_asset(
+                        session,
+                        db_path,
+                        "UPRO",
+                        "QQQ",
+                        upro_history.copy(),
+                        corrected_signal,
+                        risk_free_history,
+                    )
+            finally:
+                session.close()
+
+            with sqlite3.connect(db_path) as conn:
+                states = conn.execute(
+                    """
+                    SELECT asset_symbol
+                    FROM strategy_state
+                    WHERE signal_symbol = 'QQQ'
+                    ORDER BY asset_symbol
+                    """
+                ).fetchall()
+
+        self.assertEqual([call.args[2] for call in synchronize.call_args_list].count("QQQ"), 1)
+        self.assertEqual(states, [("TQQQ",), ("UPRO",)])
+
     def test_download_executor_is_isolated_and_state_processing_is_serialized(self) -> None:
         state_active = 0
         max_state_active = 0
@@ -214,7 +503,7 @@ class WorkflowAsyncTests(unittest.TestCase):
         self.assertTrue(download_threads)
         self.assertTrue(all(name.startswith("workflow-download") for name in download_threads))
         self.assertTrue(state_threads)
-        self.assertTrue(all(not name.startswith("workflow-download") for name in state_threads))
+        self.assertTrue(all(name.startswith("workflow-strategy") for name in state_threads))
         self.assertEqual(mock_signal.call_count, 2)
         self.assertEqual(mock_risk_free.call_count, 1)
         self.assertEqual([result.status for result in results], ["done", "done"])
@@ -573,6 +862,54 @@ class WorkflowAsyncTests(unittest.TestCase):
             )
 
         self.assertEqual(events, ["prepare-1", "complete-1", "prepare-2", "complete-2"])
+
+    def test_asset_pipeline_closes_strategy_session_after_unexpected_failure(self) -> None:
+        jobs = [AssetRunJob(1, "AAA", "AAA"), AssetRunJob(2, "BBB", "BBB")]
+        close_threads: list[str] = []
+        original_close = _WorkflowStrategySession.close
+
+        async def fake_prepare(**kwargs: object) -> AssetRunResult:
+            job = kwargs["job"]
+            return AssetRunResult(
+                workflow_idx=job.workflow_idx,
+                asset_symbol=job.asset_symbol,
+                signal_symbol=job.signal_symbol,
+                action="Updating",
+                rows_processed=0,
+                status="skipped",
+                message="prepared",
+            )
+
+        async def fail_complete(*_args: object, **_kwargs: object) -> AssetRunResult:
+            raise RuntimeError("consumer failed")
+
+        def record_close(session: _WorkflowStrategySession) -> None:
+            close_threads.append(threading.current_thread().name)
+            original_close(session)
+
+        with (
+            patch("leveraged_trader.workflow._prepare_workflow_asset", new=fake_prepare),
+            patch("leveraged_trader.workflow._complete_workflow_asset", new=fail_complete),
+            patch.object(_WorkflowStrategySession, "close", new=record_close),
+            self.assertRaises(ExceptionGroup),
+        ):
+            asyncio.run(
+                _run_asset_pipeline(
+                    jobs=jobs,
+                    concurrency=2,
+                    db_path="unused.sqlite",
+                    mode="update",
+                    base_cfg=BacktestConfig(),
+                    tradier_cfg=None,
+                    buy_rsi_values=[30.0],
+                    profit_target_values=[1.5],
+                    asset_progress=None,
+                    phase_timings=WorkflowPhaseTimings(),
+                )
+            )
+
+        self.assertEqual(len(close_threads), 1)
+        self.assertTrue(close_threads[0].startswith("workflow-strategy"))
 
     def test_asset_preparation_returns_skipped_result_for_empty_market_data(self) -> None:
         job = AssetRunJob(1, "TQQQ", "QQQ")

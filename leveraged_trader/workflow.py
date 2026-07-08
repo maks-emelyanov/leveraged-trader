@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 import sqlite3
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Executor, ThreadPoolExecutor
@@ -128,6 +129,71 @@ class PreparedAssetRun:
     risk_free_history: pd.DataFrame
 
 
+class _WorkflowStrategySession:
+    def __init__(self, db_path: str) -> None:
+        self._db_path = db_path
+        self._conn: sqlite3.Connection | None = None
+        self._owner_thread_id: int | None = None
+        self._data_version: int | None = None
+        self._synchronized_histories: dict[str, pd.DataFrame] = {}
+
+    def _connection(self) -> sqlite3.Connection:
+        thread_id = threading.get_ident()
+        if self._owner_thread_id is None:
+            self._owner_thread_id = thread_id
+        elif self._owner_thread_id != thread_id:
+            raise RuntimeError("Workflow strategy session used from multiple threads.")
+        if self._conn is None:
+            self._conn = sqlite3.connect(
+                self._db_path,
+                timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+            )
+            self._conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+        return self._conn
+
+    @contextmanager
+    def immediate_transaction(self) -> sqlite3.Connection:
+        conn = self._connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            data_version = int(conn.execute("PRAGMA data_version").fetchone()[0])
+            if self._data_version is None:
+                self._data_version = data_version
+            elif data_version != self._data_version:
+                self._synchronized_histories.clear()
+                self._data_version = data_version
+            yield conn
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+
+    def presynchronized_symbols(
+        self,
+        authoritative_histories: dict[str, pd.DataFrame],
+    ) -> set[str]:
+        return {
+            symbol
+            for symbol, history in authoritative_histories.items()
+            if self._synchronized_histories.get(symbol) is history
+        }
+
+    def mark_synchronized(
+        self,
+        authoritative_histories: dict[str, pd.DataFrame],
+    ) -> None:
+        self._synchronized_histories.update(authoritative_histories)
+
+    def close(self) -> None:
+        if self._conn is not None:
+            self._connection().close()
+        self._conn = None
+        self._owner_thread_id = None
+        self._data_version = None
+        self._synchronized_histories.clear()
+
+
 @contextmanager
 def _state_connection(db_path: str, *, immediate: bool = False) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
@@ -251,6 +317,7 @@ def _process_asset_grid_for_db(
     profit_target_values: list[float],
     rebuild: bool,
     phase_timings: WorkflowPhaseTimings | None = None,
+    strategy_session: _WorkflowStrategySession | None = None,
 ) -> None:
     # This transaction covers market-data synchronization, global benchmark
     # invalidation, and rebuilt state.  A second process waits here and then
@@ -264,8 +331,22 @@ def _process_asset_grid_for_db(
             phase_timings.add("grid_compute", elapsed_seconds)
 
     transaction_started = time.perf_counter()
+    authoritative_histories = {
+        asset_symbol: asset_history,
+        signal_symbol: signal_history,
+        RISK_FREE_SYMBOL: risk_free_history,
+    }
+    shared_histories = {
+        signal_symbol: signal_history,
+        RISK_FREE_SYMBOL: risk_free_history,
+    }
+    transaction = (
+        strategy_session.immediate_transaction()
+        if strategy_session is not None
+        else _state_connection(db_path, immediate=True)
+    )
     try:
-        with _state_connection(db_path, immediate=True) as conn:
+        with transaction as conn:
             process_asset_grid(
                 conn,
                 data,
@@ -276,11 +357,12 @@ def _process_asset_grid_for_db(
                 profit_target_values,
                 rebuild=rebuild,
                 signal_history=signal_history,
-                authoritative_histories={
-                    asset_symbol: asset_history,
-                    signal_symbol: signal_history,
-                    RISK_FREE_SYMBOL: risk_free_history,
-                },
+                authoritative_histories=authoritative_histories,
+                presynchronized_authoritative_symbols=(
+                    strategy_session.presynchronized_symbols(shared_histories)
+                    if strategy_session is not None
+                    else None
+                ),
                 commit=False,
                 strategy_fingerprint=strategy_config_fingerprint(
                     base_cfg,
@@ -289,6 +371,8 @@ def _process_asset_grid_for_db(
                 ),
                 grid_compute_observer=observe_grid_compute if phase_timings is not None else None,
             )
+        if strategy_session is not None:
+            strategy_session.mark_synchronized(shared_histories)
     finally:
         if phase_timings is not None:
             transaction_seconds = max(0.0, time.perf_counter() - transaction_started)
@@ -501,13 +585,16 @@ async def _complete_workflow_asset(
     profit_target_values: list[float],
     asset_progress: AssetProgress | None = None,
     phase_timings: WorkflowPhaseTimings | None = None,
+    strategy_executor: Executor | None = None,
+    strategy_session: _WorkflowStrategySession | None = None,
 ) -> AssetRunResult:
     try:
         if isinstance(outcome, AssetRunResult):
             return outcome
 
         try:
-            await asyncio.to_thread(
+            await _run_blocking(
+                strategy_executor,
                 _process_asset_grid_for_db,
                 db_path,
                 outcome.data,
@@ -521,6 +608,7 @@ async def _complete_workflow_asset(
                 profit_target_values,
                 outcome.plan.rebuild,
                 phase_timings,
+                strategy_session,
             )
         except Exception as exc:
             if asset_progress is not None:
@@ -573,6 +661,7 @@ async def _run_asset_pipeline(
     signal_histories: dict[str, pd.DataFrame] = {}
     risk_free_history_lock = asyncio.Lock()
     risk_free_histories: dict[str, pd.DataFrame] = {}
+    strategy_session = _WorkflowStrategySession(db_path)
 
     async def prepare(
         job: AssetRunJob,
@@ -597,6 +686,7 @@ async def _run_asset_pipeline(
 
     async def complete(
         outcome: PreparedAssetRun | AssetRunResult,
+        strategy_executor: Executor,
     ) -> AssetRunResult:
         return await _complete_workflow_asset(
             outcome,
@@ -606,44 +696,56 @@ async def _run_asset_pipeline(
             profit_target_values=profit_target_values,
             asset_progress=asset_progress,
             phase_timings=phase_timings,
+            strategy_executor=strategy_executor,
+            strategy_session=strategy_session,
         )
 
-    if concurrency <= 1:
-        results = [await complete(await prepare(job)) for job in jobs]
-        return sorted(results, key=lambda result: result.workflow_idx)
-
-    worker_count = min(max(1, concurrency), len(jobs))
-    job_queue: asyncio.Queue[AssetRunJob | None] = asyncio.Queue()
-    prepared_queue: asyncio.Queue[PreparedAssetRun | AssetRunResult] = asyncio.Queue(maxsize=1)
-    for job in jobs:
-        job_queue.put_nowait(job)
-    for _ in range(worker_count):
-        job_queue.put_nowait(None)
-
-    async def download_worker(download_executor: Executor) -> None:
-        while True:
-            job = await job_queue.get()
-            if job is None:
-                return
-            await prepared_queue.put(await prepare(job, download_executor))
-
-    async def strategy_consumer() -> list[AssetRunResult]:
-        results: list[AssetRunResult] = []
-        for _ in jobs:
-            outcome = await prepared_queue.get()
-            results.append(await complete(outcome))
-        return sorted(results, key=lambda result: result.workflow_idx)
-
     with ThreadPoolExecutor(
-        max_workers=worker_count,
-        thread_name_prefix="workflow-download",
-    ) as download_executor:
-        async with asyncio.TaskGroup() as task_group:
-            consumer_task = task_group.create_task(strategy_consumer())
-            for _ in range(worker_count):
-                task_group.create_task(download_worker(download_executor))
+        max_workers=1,
+        thread_name_prefix="workflow-strategy",
+    ) as strategy_executor:
+        try:
+            if concurrency <= 1:
+                results = [
+                    await complete(await prepare(job), strategy_executor)
+                    for job in jobs
+                ]
+                return sorted(results, key=lambda result: result.workflow_idx)
 
-    return consumer_task.result()
+            worker_count = min(max(1, concurrency), len(jobs))
+            job_queue: asyncio.Queue[AssetRunJob | None] = asyncio.Queue()
+            prepared_queue: asyncio.Queue[PreparedAssetRun | AssetRunResult] = asyncio.Queue(maxsize=1)
+            for job in jobs:
+                job_queue.put_nowait(job)
+            for _ in range(worker_count):
+                job_queue.put_nowait(None)
+
+            async def download_worker(download_executor: Executor) -> None:
+                while True:
+                    job = await job_queue.get()
+                    if job is None:
+                        return
+                    await prepared_queue.put(await prepare(job, download_executor))
+
+            async def strategy_consumer() -> list[AssetRunResult]:
+                results: list[AssetRunResult] = []
+                for _ in jobs:
+                    outcome = await prepared_queue.get()
+                    results.append(await complete(outcome, strategy_executor))
+                return sorted(results, key=lambda result: result.workflow_idx)
+
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="workflow-download",
+            ) as download_executor:
+                async with asyncio.TaskGroup() as task_group:
+                    consumer_task = task_group.create_task(strategy_consumer())
+                    for _ in range(worker_count):
+                        task_group.create_task(download_worker(download_executor))
+
+            return consumer_task.result()
+        finally:
+            await _run_blocking(strategy_executor, strategy_session.close)
 
 
 async def run_resumable_optimizations_async(
