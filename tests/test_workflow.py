@@ -130,10 +130,12 @@ class WorkflowAsyncTests(unittest.TestCase):
         self.assertEqual(snapshot.grid_compute_seconds, 2.0)
         self.assertEqual(snapshot.db_sync_seconds, 3.0)
 
-    def test_state_processing_is_serialized_across_different_signal_symbols(self) -> None:
+    def test_download_executor_is_isolated_and_state_processing_is_serialized(self) -> None:
         state_active = 0
         max_state_active = 0
         phase_timings = WorkflowPhaseTimings()
+        download_threads: set[str] = set()
+        state_threads: set[str] = set()
 
         def history(symbol: str) -> pd.DataFrame:
             index = pd.to_datetime(["2026-01-02"])
@@ -148,33 +150,35 @@ class WorkflowAsyncTests(unittest.TestCase):
                 index=index,
             )
 
-        async def fake_to_thread(func: object, /, *args: object, **kwargs: object) -> object:
+        def fake_prepare_asset_run(*args: object, **_kwargs: object) -> AssetRunPlan:
+            download_threads.add(threading.current_thread().name)
+            return AssetRunPlan(
+                asset_symbol=str(args[3]),
+                signal_symbol=str(args[4]),
+                rebuild=False,
+                start=None,
+                action="Updating",
+                start_label="earliest overlapping history",
+            )
+
+        def fake_load_strategy_data(**kwargs: object) -> pd.DataFrame:
+            download_threads.add(threading.current_thread().name)
+            return history(str(kwargs["asset_symbol"]))
+
+        def fake_load_symbol_history(symbol: str, **_kwargs: object) -> pd.DataFrame:
+            download_threads.add(threading.current_thread().name)
+            return history(symbol)
+
+        def fake_load_risk_free_history(**_kwargs: object) -> pd.DataFrame:
+            download_threads.add(threading.current_thread().name)
+            return history("^IRX")
+
+        def fake_process_asset_grid(*_args: object, **_kwargs: object) -> None:
             nonlocal state_active, max_state_active
-            name = getattr(func, "__name__", "")
-            if name == "_prepare_asset_run":
-                return AssetRunPlan(
-                    asset_symbol=str(args[3]),
-                    signal_symbol=str(args[4]),
-                    rebuild=False,
-                    start=None,
-                    action="Updating",
-                    start_label="earliest overlapping history",
-                )
-            if name == "load_strategy_data":
-                return history(str(kwargs["asset_symbol"]))
-            if name == "load_symbol_history":
-                return history(str(args[0]))
-            if name == "load_signal_history":
-                return history(str(args[0]))
-            if name == "load_risk_free_history":
-                return history("^IRX")
-            if name == "_process_asset_grid_for_db":
-                state_active += 1
-                max_state_active = max(max_state_active, state_active)
-                await asyncio.sleep(0.01)
-                state_active -= 1
-                return None
-            raise AssertionError(f"unexpected worker call: {name}")
+            state_threads.add(threading.current_thread().name)
+            state_active += 1
+            max_state_active = max(max_state_active, state_active)
+            state_active -= 1
 
         async def run() -> list[AssetRunResult]:
             return await _run_asset_pipeline(
@@ -194,14 +198,25 @@ class WorkflowAsyncTests(unittest.TestCase):
             )
 
         with (
-            patch("leveraged_trader.workflow.asyncio.to_thread", new=fake_to_thread),
-            patch("leveraged_trader.workflow.time") as mock_time,
+            patch("leveraged_trader.workflow._prepare_asset_run", side_effect=fake_prepare_asset_run),
+            patch("leveraged_trader.workflow.load_strategy_data", side_effect=fake_load_strategy_data),
+            patch("leveraged_trader.workflow.load_symbol_history", side_effect=fake_load_symbol_history),
+            patch("leveraged_trader.workflow.load_signal_history", side_effect=fake_load_symbol_history) as mock_signal,
+            patch(
+                "leveraged_trader.workflow.load_risk_free_history",
+                side_effect=fake_load_risk_free_history,
+            ) as mock_risk_free,
+            patch("leveraged_trader.workflow._process_asset_grid_for_db", side_effect=fake_process_asset_grid),
         ):
-            mock_time.perf_counter.side_effect = [float(value) for value in range(1, 15)]
             results = asyncio.run(run())
 
         self.assertEqual(max_state_active, 1)
-        self.assertEqual(phase_timings.snapshot().download_seconds, 7.0)
+        self.assertTrue(download_threads)
+        self.assertTrue(all(name.startswith("workflow-download") for name in download_threads))
+        self.assertTrue(state_threads)
+        self.assertTrue(all(not name.startswith("workflow-download") for name in state_threads))
+        self.assertEqual(mock_signal.call_count, 2)
+        self.assertEqual(mock_risk_free.call_count, 1)
         self.assertEqual([result.status for result in results], ["done", "done"])
 
     def test_startup_serializes_reconciliation_before_universe_writes(self) -> None:

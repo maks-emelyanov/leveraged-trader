@@ -5,8 +5,10 @@ import math
 import sqlite3
 import time
 from collections.abc import Callable
+from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -149,21 +151,35 @@ def _initialize_state_db(db_path: str) -> None:
         init_state_db(conn)
 
 
-async def _timed_to_thread(
+async def _timed_run_blocking(
     phase_timings: WorkflowPhaseTimings | None,
     phase: WorkflowPhase,
     func: Callable[..., Any],
     /,
     *args: object,
+    executor: Executor | None = None,
     **kwargs: object,
 ) -> Any:
     if phase_timings is None:
-        return await asyncio.to_thread(func, *args, **kwargs)
+        return await _run_blocking(executor, func, *args, **kwargs)
     started = time.perf_counter()
     try:
-        return await asyncio.to_thread(func, *args, **kwargs)
+        return await _run_blocking(executor, func, *args, **kwargs)
     finally:
         phase_timings.add(phase, time.perf_counter() - started)
+
+
+async def _run_blocking(
+    executor: Executor | None,
+    func: Callable[..., Any],
+    /,
+    *args: object,
+    **kwargs: object,
+) -> Any:
+    if executor is None:
+        return await asyncio.to_thread(func, *args, **kwargs)
+    call = partial(func, *args, **kwargs)
+    return await asyncio.get_running_loop().run_in_executor(executor, call)
 
 
 def _load_or_refresh_workflow_assets_for_db(
@@ -352,10 +368,12 @@ async def _prepare_workflow_asset(
     risk_free_histories: dict[str, pd.DataFrame],
     asset_progress: AssetProgress | None = None,
     phase_timings: WorkflowPhaseTimings | None = None,
+    download_executor: Executor | None = None,
 ) -> PreparedAssetRun | AssetRunResult:
     action = "Rebuilding" if mode == "rebuild" else "Updating"
     try:
-        plan = await asyncio.to_thread(
+        plan = await _run_blocking(
+            download_executor,
             _prepare_asset_run,
             db_path,
             mode,
@@ -372,7 +390,7 @@ async def _prepare_workflow_asset(
                 signal=job.signal_symbol,
                 action=plan.action,
             )
-        data = await _timed_to_thread(
+        data = await _timed_run_blocking(
             phase_timings,
             "download",
             load_strategy_data,
@@ -382,6 +400,7 @@ async def _prepare_workflow_asset(
             end=None,
             auto_adjust=base_cfg.auto_adjust,
             tradier_cfg=tradier_cfg,
+            executor=download_executor,
         )
         if data.empty:
             if asset_progress is not None:
@@ -399,7 +418,7 @@ async def _prepare_workflow_asset(
                 status="skipped",
                 message="No finalized daily market data is available yet.",
             )
-        asset_history = await _timed_to_thread(
+        asset_history = await _timed_run_blocking(
             phase_timings,
             "download",
             load_symbol_history,
@@ -407,6 +426,7 @@ async def _prepare_workflow_asset(
             end=None,
             auto_adjust=base_cfg.auto_adjust,
             tradier_cfg=tradier_cfg,
+            executor=download_executor,
         )
         if asset_history.empty:
             raise RuntimeError(
@@ -415,13 +435,14 @@ async def _prepare_workflow_asset(
         async with risk_free_history_lock:
             risk_free_history = risk_free_histories.get(RISK_FREE_SYMBOL)
             if risk_free_history is None:
-                risk_free_history = await _timed_to_thread(
+                risk_free_history = await _timed_run_blocking(
                     phase_timings,
                     "download",
                     load_risk_free_history,
                     end=None,
                     auto_adjust=base_cfg.auto_adjust,
                     tradier_cfg=tradier_cfg,
+                    executor=download_executor,
                 )
                 if risk_free_history.empty:
                     raise RuntimeError("No settled daily benchmark history is available for ^IRX.")
@@ -430,7 +451,7 @@ async def _prepare_workflow_asset(
         async with signal_lock:
             signal_history = signal_histories.get(job.signal_symbol)
             if signal_history is None:
-                signal_history = await _timed_to_thread(
+                signal_history = await _timed_run_blocking(
                     phase_timings,
                     "download",
                     load_signal_history,
@@ -438,6 +459,7 @@ async def _prepare_workflow_asset(
                     end=None,
                     auto_adjust=base_cfg.auto_adjust,
                     tradier_cfg=tradier_cfg,
+                    executor=download_executor,
                 )
                 if signal_history.empty:
                     raise RuntimeError(
@@ -552,7 +574,10 @@ async def _run_asset_pipeline(
     risk_free_history_lock = asyncio.Lock()
     risk_free_histories: dict[str, pd.DataFrame] = {}
 
-    async def prepare(job: AssetRunJob) -> PreparedAssetRun | AssetRunResult:
+    async def prepare(
+        job: AssetRunJob,
+        download_executor: Executor | None = None,
+    ) -> PreparedAssetRun | AssetRunResult:
         return await _prepare_workflow_asset(
             db_path=db_path,
             mode=mode,
@@ -567,6 +592,7 @@ async def _run_asset_pipeline(
             risk_free_histories=risk_free_histories,
             asset_progress=asset_progress,
             phase_timings=phase_timings,
+            download_executor=download_executor,
         )
 
     async def complete(
@@ -594,12 +620,12 @@ async def _run_asset_pipeline(
     for _ in range(worker_count):
         job_queue.put_nowait(None)
 
-    async def download_worker() -> None:
+    async def download_worker(download_executor: Executor) -> None:
         while True:
             job = await job_queue.get()
             if job is None:
                 return
-            await prepared_queue.put(await prepare(job))
+            await prepared_queue.put(await prepare(job, download_executor))
 
     async def strategy_consumer() -> list[AssetRunResult]:
         results: list[AssetRunResult] = []
@@ -608,10 +634,14 @@ async def _run_asset_pipeline(
             results.append(await complete(outcome))
         return sorted(results, key=lambda result: result.workflow_idx)
 
-    async with asyncio.TaskGroup() as task_group:
-        consumer_task = task_group.create_task(strategy_consumer())
-        for _ in range(worker_count):
-            task_group.create_task(download_worker())
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="workflow-download",
+    ) as download_executor:
+        async with asyncio.TaskGroup() as task_group:
+            consumer_task = task_group.create_task(strategy_consumer())
+            for _ in range(worker_count):
+                task_group.create_task(download_worker(download_executor))
 
     return consumer_task.result()
 
@@ -650,7 +680,7 @@ async def run_resumable_optimizations_async(
         # Both steps write to the same SQLite database.  Keep startup writes
         # serialized: universe discovery performs replace-table writes while
         # reconciliation updates managed positions.
-        reconciliation_results = await _timed_to_thread(
+        reconciliation_results = await _timed_run_blocking(
             phase_timings,
             "alpaca",
             _reconcile_alpaca_managed_positions_for_db,
@@ -710,7 +740,7 @@ async def run_resumable_optimizations_async(
             eligible_buy_signals,
             sell_signals,
             realized_pnl_summary,
-        ) = await _timed_to_thread(
+        ) = await _timed_run_blocking(
             phase_timings,
             "report_generation",
             _build_reports_for_db,
@@ -720,7 +750,7 @@ async def run_resumable_optimizations_async(
             processed_asset_pairs,
         )
     with reporter.status("Preparing Alpaca order results"):
-        order_results = await _timed_to_thread(
+        order_results = await _timed_run_blocking(
             phase_timings,
             "alpaca",
             _submit_alpaca_paper_buy_orders_for_db,
@@ -735,7 +765,7 @@ async def run_resumable_optimizations_async(
     )
     if alpaca_cfg.enabled and not submitted_buy_results.empty:
         with reporter.status("Reconciling newly submitted Alpaca buys"):
-            post_buy_reconciliation = await _timed_to_thread(
+            post_buy_reconciliation = await _timed_run_blocking(
                 phase_timings,
                 "alpaca",
                 _reconcile_alpaca_managed_positions_for_db,
