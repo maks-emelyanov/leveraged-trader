@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -101,6 +102,24 @@ class StorageOptimizationTests(unittest.TestCase):
         self.assertEqual(equity_configs, 1)
         self.assertEqual(equity_rows, len(data))
 
+    def test_process_asset_grid_reports_exact_grid_compute_duration(self) -> None:
+        observed: list[float] = []
+        with patch("leveraged_trader.storage.time") as mock_time:
+            mock_time.perf_counter.side_effect = [10.0, 12.5]
+            process_asset_grid(
+                self.conn,
+                sample_strategy_data(),
+                self.cfg,
+                "TQQQ",
+                "QQQ",
+                buy_rsi_values=[30.0],
+                profit_target_values=[1.50],
+                rebuild=True,
+                grid_compute_observer=observed.append,
+            )
+
+        self.assertEqual(observed, [2.5])
+
     def test_best_summary_matches_stored_best_equity_curve(self) -> None:
         data = sample_strategy_data()
 
@@ -155,6 +174,42 @@ class StorageOptimizationTests(unittest.TestCase):
 
         self.assertEqual(end_dates, [(data.index[-1].date().isoformat(),)])
         self.assertEqual(equity_configs, 1)
+        self.assertEqual(equity_rows, len(data))
+
+    def test_update_uses_legacy_equity_rollup_when_summary_rollup_is_missing(self) -> None:
+        data = sample_strategy_data()
+        first_window = data.iloc[:25]
+        update_window = data.iloc[24:]
+
+        process_asset_grid(
+            self.conn,
+            first_window,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            buy_rsi_values=[30.0],
+            profit_target_values=[1.50],
+            rebuild=True,
+        )
+        self.conn.execute("UPDATE strategy_summary SET first_equity = NULL")
+
+        process_asset_grid(
+            self.conn,
+            update_window,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            buy_rsi_values=[30.0],
+            profit_target_values=[1.50],
+            rebuild=False,
+        )
+
+        trading_days = self.conn.execute(
+            "SELECT trading_days FROM strategy_summary"
+        ).fetchone()[0]
+        equity_rows = self.conn.execute("SELECT COUNT(*) FROM strategy_equity").fetchone()[0]
+
+        self.assertEqual(trading_days, len(data))
         self.assertEqual(equity_rows, len(data))
 
     def test_corrected_persisted_session_rebuilds_rsi_and_strategy_state(self) -> None:

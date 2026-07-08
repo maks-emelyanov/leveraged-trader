@@ -170,8 +170,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_WORKFLOW_CONCURRENCY,
         help=(
-            "Maximum number of assets to process concurrently during data loading and optimization. "
-            "Use 1 for fully serial behavior."
+            "Maximum number of concurrent asset download workers; SQLite strategy updates remain "
+            "serialized. Use 1 for fully serial behavior."
         ),
     )
     parser.add_argument(

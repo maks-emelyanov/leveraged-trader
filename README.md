@@ -13,7 +13,7 @@ This project is intended for research and paper trading. It is not financial adv
 - Downloads daily Yahoo Finance OHLCV data, with optional Tradier fallback for skipped symbols.
 - Optimizes RSI buy thresholds and profit-target sell multiples.
 - Uses a NumPy/Numba-backed optimization loop for the parameter grid.
-- Downloads asset workflows concurrently with async orchestration while serializing shared SQLite strategy-state updates.
+- Uses bounded async download workers feeding serialized SQLite strategy-state updates.
 - Renders width-aware terminal progress and tables with semantic status coloring.
 - Persists strategy state in SQLite for resumable updates, with transactional cross-process invalidation safety.
 - Writes buy and sell recommendation reports.
@@ -45,7 +45,7 @@ TRADIER_ACCESS_TOKEN=your_tradier_access_token
 The CLI also supports `--alpaca-timeout-seconds` for request timeout tuning (default: `30`),
 `--alpaca-gtc-sell-renewal-days-before-expiration` for managed GTC sell renewal timing (default: `7`),
 `--tradier-timeout-seconds` for market-data fallback timeout tuning (default: `30`),
-`--workflow-concurrency` for asset-level concurrency tuning (default: `4`), and `--no-color`
+`--workflow-concurrency` for market-data worker tuning (default: `4`), and `--no-color`
 for plain terminal output. The Tradier fallback flag is enabled by default, but fallback requests
 are only usable when a non-placeholder Tradier token is configured.
 
@@ -118,7 +118,8 @@ Common options:
 - `--tradier-access-token VALUE`: override `TRADIER_ACCESS_TOKEN`, `TRADIER_API_TOKEN`, or `TRADIER_TOKEN`.
 - `--tradier-base-url URL`: override `TRADIER_BASE_URL` (defaults to Tradier production `/v1`).
 - `--tradier-timeout-seconds INT`: Tradier request timeout in seconds (default: `30`).
-- `--workflow-concurrency INT`: maximum number of assets processed concurrently (default: `4`; use `1` for serial behavior).
+- `--workflow-concurrency INT`: maximum concurrent asset download workers; SQLite strategy updates
+  remain serialized (default: `4`; use `1` for fully serial behavior).
 - `--require-workflow-source-success / --no-require-workflow-source-success`: fail a universe run after recording source health if an issuer or ETN source fetch or parser failed; a successfully parsed zero-match page remains healthy (default: disabled).
 - `--no-color`: disable colored terminal output.
 
@@ -161,9 +162,19 @@ the final asset summary is sorted by workflow index. The terminal Best Sharpe ta
 strategies with at least two executed trades and Sharpe of 1.0 or greater; `optimization_summary.csv`
 retains the full per-asset summary. CSV files retain full order IDs and detail, while terminal Alpaca
 tables show chronological display IDs that preserve closed-position gaps, plus the most useful fields
-with wrapped messages. A final workflow footer reports total elapsed time and ends with a divider for
-appended logs. Redirected or cron-driven non-terminal output defaults to a 156-column layout so log
-tables stay readable, while interactive terminal output uses the terminal's current width.
+with wrapped messages. A final workflow footer reports cumulative time spent downloading market data,
+synchronizing DB/state, computing the grid, generating reports, and performing Alpaca work, followed
+by total elapsed time and a divider for appended logs. Concurrent download durations can overlap, so
+the phase values are diagnostic work time and do not partition total wall time. Redirected or
+cron-driven non-terminal output defaults to a 156-column layout so log tables stay readable, while
+interactive terminal output uses the terminal's current width.
+
+To tune download concurrency locally, compare equivalent update runs against copies of the same
+SQLite state with `--workflow-concurrency 1`, `2`, `4`, and `8`; disable Alpaca submissions during
+the comparison. Use the final total elapsed time as the primary result and the cumulative phase
+timings to identify the bottleneck. Yahoo Finance requests remain internally serialized for
+correctness, so values above the default `4` mainly help when Tradier fallback or local parsing is
+significant and can otherwise add memory use and provider pressure.
 
 ## Environment Variables
 

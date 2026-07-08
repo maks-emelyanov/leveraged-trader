@@ -5,11 +5,12 @@ from collections.abc import Callable
 import numpy as np
 
 try:
-    from numba import njit
+    from numba import njit, prange
 
     NUMBA_AVAILABLE = True
 except ImportError:  # pragma: no cover - exercised only without optional runtime dependency
     NUMBA_AVAILABLE = False
+    prange = range
 
     def njit(*args: object, **kwargs: object) -> Callable:
         if args and callable(args[0]) and len(args) == 1 and not kwargs:
@@ -26,7 +27,7 @@ ACTION_BUY = 1
 ACTION_SELL = 2
 
 
-@njit(cache=True)
+@njit(cache=True, parallel=True)
 def run_grid_summary(
     open_prices: np.ndarray,
     close_prices: np.ndarray,
@@ -79,7 +80,7 @@ def run_grid_summary(
     out_max_drawdown = max_drawdown_values.copy()
     updated = np.zeros(config_count, dtype=np.bool_)
 
-    for config_idx in range(config_count):
+    for config_idx in prange(config_count):
         start_idx = start_indices[config_idx]
         if start_idx >= row_count:
             continue

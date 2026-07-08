@@ -14,6 +14,21 @@ from leveraged_trader.config import AlpacaOrderConfig, load_dotenv
 
 
 class ConfigTests(unittest.TestCase):
+    def test_workflow_concurrency_defaults_to_four_and_accepts_override(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sys, "argv", ["leveraged-trader"]),
+        ):
+            default_args = parse_args()
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sys, "argv", ["leveraged-trader", "--workflow-concurrency", "8"]),
+        ):
+            overridden_args = parse_args()
+
+        self.assertEqual(default_args.workflow_concurrency, 4)
+        self.assertEqual(overridden_args.workflow_concurrency, 8)
+
     def test_load_dotenv_does_not_override_existing_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             env_path = Path(tmp) / ".env"

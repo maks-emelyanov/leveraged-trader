@@ -7,22 +7,26 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pandas as pd
 from rich.console import Console
 
-from leveraged_trader.benchmark import WorkflowTimer
+from leveraged_trader.benchmark import WorkflowPhaseTimings, WorkflowTimer
 from leveraged_trader.config import AlpacaOrderConfig, BacktestConfig, UniverseConfig
 from leveraged_trader.output import WorkflowReporter
 from leveraged_trader.storage import init_state_db
 from leveraged_trader.workflow import (
+    AssetRunJob,
     AssetRunPlan,
     AssetRunResult,
+    PreparedAssetRun,
     WorkflowRunError,
     _build_reports_for_db,
     _prepare_asset_run,
-    _process_workflow_asset,
+    _prepare_workflow_asset,
+    _process_asset_grid_for_db,
+    _run_asset_pipeline,
     _state_connection,
     _terminal_alpaca_display_results,
     _write_workflow_outputs,
@@ -94,9 +98,42 @@ class WorkflowAsyncTests(unittest.TestCase):
             first.join(timeout=2)
             second.join(timeout=2)
 
+    def test_asset_transaction_separates_grid_compute_from_db_sync(self) -> None:
+        phase_timings = WorkflowPhaseTimings()
+
+        def fake_process_asset_grid(*_args: object, **kwargs: object) -> None:
+            observer = kwargs["grid_compute_observer"]
+            observer(2.0)
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("leveraged_trader.workflow.process_asset_grid", side_effect=fake_process_asset_grid),
+            patch("leveraged_trader.workflow.time") as mock_time,
+        ):
+            mock_time.perf_counter.side_effect = [10.0, 15.0]
+            _process_asset_grid_for_db(
+                str(Path(tmp) / "state.sqlite"),
+                pd.DataFrame(),
+                pd.DataFrame(),
+                pd.DataFrame(),
+                pd.DataFrame(),
+                BacktestConfig(),
+                "TQQQ",
+                "QQQ",
+                [30.0],
+                [1.5],
+                False,
+                phase_timings,
+            )
+
+        snapshot = phase_timings.snapshot()
+        self.assertEqual(snapshot.grid_compute_seconds, 2.0)
+        self.assertEqual(snapshot.db_sync_seconds, 3.0)
+
     def test_state_processing_is_serialized_across_different_signal_symbols(self) -> None:
         state_active = 0
         max_state_active = 0
+        phase_timings = WorkflowPhaseTimings()
 
         def history(symbol: str) -> pd.DataFrame:
             index = pd.to_datetime(["2026-01-02"])
@@ -140,37 +177,31 @@ class WorkflowAsyncTests(unittest.TestCase):
             raise AssertionError(f"unexpected worker call: {name}")
 
         async def run() -> list[AssetRunResult]:
-            signal_locks: dict[str, asyncio.Lock] = {}
-            risk_free_history_lock = asyncio.Lock()
-            risk_free_histories: dict[str, pd.DataFrame] = {}
-            strategy_state_lock = asyncio.Lock()
-            return await asyncio.gather(
-                *[
-                    _process_workflow_asset(
-                        db_path="state.sqlite",
-                        mode="update",
-                        base_cfg=BacktestConfig(),
-                        tradier_cfg=None,
-                        workflow_idx=index,
-                        total_workflows=2,
-                        asset_symbol=symbol,
-                        signal_symbol=symbol,
-                        buy_rsi_values=[30.0],
-                        profit_target_values=[1.5],
-                        signal_locks=signal_locks,
-                        signal_histories={},
-                        risk_free_history_lock=risk_free_history_lock,
-                        risk_free_histories=risk_free_histories,
-                        strategy_state_lock=strategy_state_lock,
-                    )
+            return await _run_asset_pipeline(
+                jobs=[
+                    AssetRunJob(index, symbol, symbol)
                     for index, symbol in enumerate(["AAA", "BBB"], start=1)
-                ]
+                ],
+                concurrency=2,
+                db_path="state.sqlite",
+                mode="update",
+                base_cfg=BacktestConfig(),
+                tradier_cfg=None,
+                buy_rsi_values=[30.0],
+                profit_target_values=[1.5],
+                asset_progress=None,
+                phase_timings=phase_timings,
             )
 
-        with patch("leveraged_trader.workflow.asyncio.to_thread", new=fake_to_thread):
+        with (
+            patch("leveraged_trader.workflow.asyncio.to_thread", new=fake_to_thread),
+            patch("leveraged_trader.workflow.time") as mock_time,
+        ):
+            mock_time.perf_counter.side_effect = [float(value) for value in range(1, 15)]
             results = asyncio.run(run())
 
         self.assertEqual(max_state_active, 1)
+        self.assertEqual(phase_timings.snapshot().download_seconds, 7.0)
         self.assertEqual([result.status for result in results], ["done", "done"])
 
     def test_startup_serializes_reconciliation_before_universe_writes(self) -> None:
@@ -208,8 +239,10 @@ class WorkflowAsyncTests(unittest.TestCase):
                     return_value=pd.DataFrame(columns=["Status"]),
                 ),
                 patch("leveraged_trader.workflow._load_alpaca_managed_positions_for_db", return_value=pd.DataFrame()),
-                patch("leveraged_trader.workflow._write_workflow_outputs"),
+                patch("leveraged_trader.workflow._write_workflow_outputs") as mock_write_outputs,
+                patch("leveraged_trader.workflow.time") as mock_time,
             ):
+                mock_time.perf_counter.side_effect = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
                 asyncio.run(
                     run_resumable_optimizations_async(
                         mode="update",
@@ -225,6 +258,9 @@ class WorkflowAsyncTests(unittest.TestCase):
                 )
 
         self.assertEqual(events, ["reconcile", "universe"])
+        phase_snapshot = mock_write_outputs.call_args.kwargs["phase_timings"].snapshot()
+        self.assertEqual(phase_snapshot.report_generation_seconds, 1.0)
+        self.assertEqual(phase_snapshot.alpaca_seconds, 2.0)
 
     def test_update_preflight_fetches_full_history_for_revision_detection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -268,19 +304,18 @@ class WorkflowAsyncTests(unittest.TestCase):
         initial_reconciliation = pd.DataFrame(columns=["Action"])
         post_buy_reconciliation = pd.DataFrame([{"Action": "sell", "Status": "accepted"}])
 
-        async def fake_process_asset(**kwargs: object) -> AssetRunResult:
-            asset_progress = kwargs.get("asset_progress")
-            if asset_progress is not None:
-                asset_progress.finish_asset()
-            return AssetRunResult(
-                workflow_idx=int(kwargs["workflow_idx"]),
-                asset_symbol="TQQQ",
-                signal_symbol="QQQ",
-                action="Updating",
-                rows_processed=1,
-                status="done",
-                message="Processed 1 row",
-            )
+        async def fake_asset_pipeline(**_kwargs: object) -> list[AssetRunResult]:
+            return [
+                AssetRunResult(
+                    workflow_idx=1,
+                    asset_symbol="TQQQ",
+                    signal_symbol="QQQ",
+                    action="Updating",
+                    rows_processed=1,
+                    status="done",
+                    message="Processed 1 row",
+                )
+            ]
 
         async def immediate_to_thread(func: object, /, *args: object, **kwargs: object) -> object:
             return func(*args, **kwargs)
@@ -301,7 +336,7 @@ class WorkflowAsyncTests(unittest.TestCase):
                     "leveraged_trader.workflow._load_or_refresh_workflow_assets_for_db",
                     return_value=workflow_assets,
                 ),
-                patch("leveraged_trader.workflow._process_workflow_asset", new=fake_process_asset),
+                patch("leveraged_trader.workflow._run_asset_pipeline", new=fake_asset_pipeline),
                 patch(
                     "leveraged_trader.workflow._build_reports_for_db",
                     return_value=(
@@ -344,19 +379,18 @@ class WorkflowAsyncTests(unittest.TestCase):
     def test_workflow_fails_when_every_asset_is_skipped(self) -> None:
         workflow_assets = pd.DataFrame([{"symbol": "TQQQ", "name": "T", "rsi_symbol": "QQQ"}])
 
-        async def skipped_process_asset(**kwargs: object) -> AssetRunResult:
-            asset_progress = kwargs.get("asset_progress")
-            if asset_progress is not None:
-                asset_progress.finish_asset()
-            return AssetRunResult(
-                workflow_idx=int(kwargs["workflow_idx"]),
-                asset_symbol="TQQQ",
-                signal_symbol="QQQ",
-                action="Updating",
-                rows_processed=None,
-                status="skipped",
-                message="market data providers unavailable",
-            )
+        async def skipped_asset_pipeline(**_kwargs: object) -> list[AssetRunResult]:
+            return [
+                AssetRunResult(
+                    workflow_idx=1,
+                    asset_symbol="TQQQ",
+                    signal_symbol="QQQ",
+                    action="Updating",
+                    rows_processed=None,
+                    status="skipped",
+                    message="market data providers unavailable",
+                )
+            ]
 
         async def immediate_to_thread(func: object, /, *args: object, **kwargs: object) -> object:
             return func(*args, **kwargs)
@@ -376,7 +410,7 @@ class WorkflowAsyncTests(unittest.TestCase):
                     "leveraged_trader.workflow._load_or_refresh_workflow_assets_for_db",
                     return_value=workflow_assets,
                 ),
-                patch("leveraged_trader.workflow._process_workflow_asset", new=skipped_process_asset),
+                patch("leveraged_trader.workflow._run_asset_pipeline", new=skipped_asset_pipeline),
                 patch("leveraged_trader.workflow._build_reports_for_db") as mock_build_reports,
                 patch("leveraged_trader.workflow._submit_alpaca_paper_buy_orders_for_db") as mock_submit_buys,
                 self.assertRaisesRegex(WorkflowRunError, "No asset workflows completed successfully"),
@@ -398,98 +432,231 @@ class WorkflowAsyncTests(unittest.TestCase):
         mock_build_reports.assert_not_called()
         mock_submit_buys.assert_not_called()
 
-    def test_workflow_concurrency_limits_asset_tasks(self) -> None:
-        workflow_assets = pd.DataFrame(
-            [
-                {"symbol": "AAA", "name": "A", "rsi_symbol": "AAA"},
-                {"symbol": "BBB", "name": "B", "rsi_symbol": "BBB"},
-                {"symbol": "CCC", "name": "C", "rsi_symbol": "CCC"},
-            ]
-        )
-        empty_orders = pd.DataFrame(columns=["Asset", "Action"])
-        active_tasks = 0
-        max_active_tasks = 0
+    def test_asset_pipeline_bounds_downloads_overlaps_db_and_sorts_results(self) -> None:
+        jobs = [
+            AssetRunJob(index, symbol, symbol)
+            for index, symbol in enumerate(["AAA", "BBB", "CCC", "DDD"], start=1)
+        ]
+        active_downloads = 0
+        max_active_downloads = 0
+        active_state = 0
+        max_active_state = 0
+        state_started = asyncio.Event()
+        download_overlapped_state = False
 
-        async def fake_process_asset(**kwargs: object) -> AssetRunResult:
-            nonlocal active_tasks, max_active_tasks
-            active_tasks += 1
-            max_active_tasks = max(max_active_tasks, active_tasks)
-            await asyncio.sleep(0.01)
-            active_tasks -= 1
-            asset_progress = kwargs.get("asset_progress")
-            if asset_progress is not None:
-                asset_progress.finish_asset()
+        async def fake_prepare(**kwargs: object) -> PreparedAssetRun:
+            nonlocal active_downloads, max_active_downloads, download_overlapped_state
+            job = kwargs["job"]
+            active_downloads += 1
+            max_active_downloads = max(max_active_downloads, active_downloads)
+            if state_started.is_set():
+                download_overlapped_state = True
+            await asyncio.sleep(0.005 if job.workflow_idx % 2 == 0 else 0.01)
+            active_downloads -= 1
+            data = pd.DataFrame({"Close": [100.0]})
+            return PreparedAssetRun(
+                job=job,
+                plan=AssetRunPlan(
+                    asset_symbol=job.asset_symbol,
+                    signal_symbol=job.signal_symbol,
+                    rebuild=False,
+                    start=None,
+                    action="Updating",
+                    start_label="earliest overlapping history",
+                ),
+                data=data,
+                asset_history=data,
+                signal_history=data,
+                risk_free_history=data,
+            )
+
+        async def fake_complete(
+            outcome: PreparedAssetRun,
+            **_kwargs: object,
+        ) -> AssetRunResult:
+            nonlocal active_state, max_active_state
+            active_state += 1
+            max_active_state = max(max_active_state, active_state)
+            state_started.set()
+            await asyncio.sleep(0.02)
+            active_state -= 1
             return AssetRunResult(
-                workflow_idx=int(kwargs["workflow_idx"]),
-                asset_symbol=str(kwargs["asset_symbol"]),
-                signal_symbol=str(kwargs["signal_symbol"]),
+                workflow_idx=outcome.job.workflow_idx,
+                asset_symbol=outcome.job.asset_symbol,
+                signal_symbol=outcome.job.signal_symbol,
                 action="Updating",
-                rows_processed=10,
+                rows_processed=1,
                 status="done",
-                message="Processed 10 rows",
+                message="done",
             )
 
-        async def immediate_to_thread(func: object, /, *args: object, **kwargs: object) -> object:
-            return func(*args, **kwargs)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            db_path = str(Path(tmp) / "state.sqlite")
-            output_dir = str(Path(tmp) / "outputs")
-            reporter = WorkflowReporter(
-                console=Console(file=io.StringIO(), width=100, color_system=None, no_color=True)
-            )
-            with (
-                patch("leveraged_trader.workflow.asyncio.to_thread", new=immediate_to_thread),
-                patch("leveraged_trader.workflow._initialize_state_db"),
-                patch(
-                    "leveraged_trader.workflow._reconcile_alpaca_managed_positions_for_db",
-                    return_value=pd.DataFrame(columns=["Action"]),
-                ),
-                patch(
-                    "leveraged_trader.workflow._load_or_refresh_workflow_assets_for_db",
-                    return_value=workflow_assets,
-                ),
-                patch("leveraged_trader.workflow._process_workflow_asset", new=fake_process_asset),
-                patch(
-                    "leveraged_trader.workflow._build_reports_for_db",
-                    return_value=(
-                        pd.DataFrame(),
-                        pd.DataFrame(),
-                        pd.DataFrame(),
-                        pd.DataFrame(),
-                        pd.DataFrame(),
-                        pd.DataFrame(),
-                    ),
-                ),
-                patch(
-                    "leveraged_trader.workflow._submit_alpaca_paper_buy_orders_for_db",
-                    return_value=empty_orders,
-                ),
-                patch(
-                    "leveraged_trader.workflow._load_alpaca_managed_positions_for_db",
-                    return_value=pd.DataFrame(),
-                ),
-                patch("leveraged_trader.workflow._write_workflow_outputs") as mock_write_outputs,
-            ):
-                asyncio.run(
-                    run_resumable_optimizations_async(
-                        mode="update",
-                        db_path=db_path,
-                        base_cfg=BacktestConfig(),
-                        universe_cfg=UniverseConfig(),
-                        buy_rsi_values=[30],
-                        profit_target_values=[1.5],
-                        alpaca_cfg=AlpacaOrderConfig(),
-                        output_dir=output_dir,
-                        workflow_concurrency=2,
-                        reporter=reporter,
-                    )
+        with (
+            patch("leveraged_trader.workflow._prepare_workflow_asset", new=fake_prepare),
+            patch("leveraged_trader.workflow._complete_workflow_asset", new=fake_complete),
+        ):
+            results = asyncio.run(
+                _run_asset_pipeline(
+                    jobs=jobs,
+                    concurrency=2,
+                    db_path="unused.sqlite",
+                    mode="update",
+                    base_cfg=BacktestConfig(),
+                    tradier_cfg=None,
+                    buy_rsi_values=[30.0],
+                    profit_target_values=[1.5],
+                    asset_progress=None,
+                    phase_timings=WorkflowPhaseTimings(),
                 )
+            )
 
-        self.assertEqual(max_active_tasks, 2)
-        mock_write_outputs.assert_called_once()
-        asset_run_results = mock_write_outputs.call_args.kwargs["asset_run_results"]
-        self.assertEqual([result.workflow_idx for result in asset_run_results], [1, 2, 3])
+        self.assertEqual(max_active_downloads, 2)
+        self.assertEqual(max_active_state, 1)
+        self.assertTrue(download_overlapped_state)
+        self.assertEqual([result.workflow_idx for result in results], [1, 2, 3, 4])
+
+    def test_asset_pipeline_concurrency_one_is_fully_serial(self) -> None:
+        jobs = [AssetRunJob(1, "AAA", "AAA"), AssetRunJob(2, "BBB", "BBB")]
+        events: list[str] = []
+
+        async def fake_prepare(**kwargs: object) -> AssetRunResult:
+            job = kwargs["job"]
+            events.append(f"prepare-{job.workflow_idx}")
+            return AssetRunResult(
+                workflow_idx=job.workflow_idx,
+                asset_symbol=job.asset_symbol,
+                signal_symbol=job.signal_symbol,
+                action="Updating",
+                rows_processed=0,
+                status="skipped",
+                message="prepared",
+            )
+
+        async def fake_complete(
+            outcome: AssetRunResult,
+            **_kwargs: object,
+        ) -> AssetRunResult:
+            events.append(f"complete-{outcome.workflow_idx}")
+            return outcome
+
+        with (
+            patch("leveraged_trader.workflow._prepare_workflow_asset", new=fake_prepare),
+            patch("leveraged_trader.workflow._complete_workflow_asset", new=fake_complete),
+        ):
+            asyncio.run(
+                _run_asset_pipeline(
+                    jobs=jobs,
+                    concurrency=1,
+                    db_path="unused.sqlite",
+                    mode="update",
+                    base_cfg=BacktestConfig(),
+                    tradier_cfg=None,
+                    buy_rsi_values=[30.0],
+                    profit_target_values=[1.5],
+                    asset_progress=None,
+                    phase_timings=WorkflowPhaseTimings(),
+                )
+            )
+
+        self.assertEqual(events, ["prepare-1", "complete-1", "prepare-2", "complete-2"])
+
+    def test_asset_preparation_returns_skipped_result_for_empty_market_data(self) -> None:
+        job = AssetRunJob(1, "TQQQ", "QQQ")
+
+        async def fake_to_thread(func: object, /, *args: object, **_kwargs: object) -> object:
+            if getattr(func, "__name__", "") == "_prepare_asset_run":
+                return AssetRunPlan(
+                    asset_symbol="TQQQ",
+                    signal_symbol="QQQ",
+                    rebuild=False,
+                    start=None,
+                    action="Updating",
+                    start_label="earliest overlapping history",
+                )
+            if getattr(func, "__name__", "") == "load_strategy_data":
+                return pd.DataFrame()
+            raise AssertionError(f"unexpected worker call: {getattr(func, '__name__', '')}")
+
+        with patch("leveraged_trader.workflow.asyncio.to_thread", new=fake_to_thread):
+            outcome = asyncio.run(
+                _prepare_workflow_asset(
+                    db_path="unused.sqlite",
+                    mode="update",
+                    base_cfg=BacktestConfig(),
+                    tradier_cfg=None,
+                    job=job,
+                    buy_rsi_values=[30.0],
+                    profit_target_values=[1.5],
+                    signal_locks={},
+                    signal_histories={},
+                    risk_free_history_lock=asyncio.Lock(),
+                    risk_free_histories={},
+                    phase_timings=WorkflowPhaseTimings(),
+                )
+            )
+
+        self.assertIsInstance(outcome, AssetRunResult)
+        self.assertEqual(outcome.status, "skipped")
+        self.assertEqual(outcome.rows_processed, 0)
+        self.assertIn("No finalized daily market data", outcome.message)
+
+    def test_asset_pipeline_drains_preparation_and_db_failures(self) -> None:
+        jobs = [AssetRunJob(1, "AAA", "AAA"), AssetRunJob(2, "BBB", "BBB")]
+        asset_progress = Mock()
+
+        async def fake_prepare(**kwargs: object) -> PreparedAssetRun | AssetRunResult:
+            job = kwargs["job"]
+            if job.workflow_idx == 1:
+                return AssetRunResult(
+                    workflow_idx=1,
+                    asset_symbol="AAA",
+                    signal_symbol="AAA",
+                    action="Updating",
+                    rows_processed=None,
+                    status="skipped",
+                    message="provider failed",
+                )
+            data = pd.DataFrame({"Close": [100.0]})
+            return PreparedAssetRun(
+                job=job,
+                plan=AssetRunPlan(
+                    asset_symbol="BBB",
+                    signal_symbol="BBB",
+                    rebuild=False,
+                    start=None,
+                    action="Updating",
+                    start_label="earliest overlapping history",
+                ),
+                data=data,
+                asset_history=data,
+                signal_history=data,
+                risk_free_history=data,
+            )
+
+        with (
+            patch("leveraged_trader.workflow._prepare_workflow_asset", new=fake_prepare),
+            patch(
+                "leveraged_trader.workflow._process_asset_grid_for_db",
+                side_effect=RuntimeError("database failed"),
+            ),
+        ):
+            results = asyncio.run(
+                _run_asset_pipeline(
+                    jobs=jobs,
+                    concurrency=2,
+                    db_path="unused.sqlite",
+                    mode="update",
+                    base_cfg=BacktestConfig(),
+                    tradier_cfg=None,
+                    buy_rsi_values=[30.0],
+                    profit_target_values=[1.5],
+                    asset_progress=asset_progress,
+                    phase_timings=WorkflowPhaseTimings(),
+                )
+            )
+
+        self.assertEqual([result.status for result in results], ["skipped", "skipped"])
+        self.assertEqual([result.message for result in results], ["provider failed", "database failed"])
+        self.assertEqual(asset_progress.finish_asset.call_count, 2)
 
     def test_terminal_alpaca_display_results_preserves_closed_position_id_gaps(self) -> None:
         managed_positions = pd.DataFrame(
@@ -688,7 +855,12 @@ class WorkflowAsyncTests(unittest.TestCase):
             ),
         ]
 
-        with tempfile.TemporaryDirectory() as tmp:
+        phase_timings = WorkflowPhaseTimings()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("leveraged_trader.workflow.time") as mock_time,
+        ):
+            mock_time.perf_counter.side_effect = [10.0, 12.0]
             output_dir = Path(tmp) / "outputs"
             output_buffer = io.StringIO()
             reporter = WorkflowReporter(
@@ -716,11 +888,14 @@ class WorkflowAsyncTests(unittest.TestCase):
                 sell_reconciliation_results=pd.DataFrame(),
                 order_results=pd.DataFrame(),
                 workflow_timer=WorkflowTimer.start(),
+                phase_timings=phase_timings,
             )
             benchmark_csv_exists = (output_dir / "workflow_benchmark.csv").exists()
             output = output_buffer.getvalue()
 
         self.assertFalse(benchmark_csv_exists)
+        self.assertEqual(phase_timings.snapshot().report_generation_seconds, 2.0)
+        self.assertIn("Cumulative phase time:", output)
         self.assertIn("Workflow finished in", output)
         self.assertNotIn("Workflow Benchmark", output)
         self.assertEqual(output.rstrip().splitlines()[-1], "\u2500" * 100)
