@@ -229,10 +229,11 @@ async def _timed_run_blocking(
     if phase_timings is None:
         return await _run_blocking(executor, func, *args, **kwargs)
     started = time.perf_counter()
+    phase_timings.begin(phase, started)
     try:
         return await _run_blocking(executor, func, *args, **kwargs)
     finally:
-        phase_timings.add(phase, time.perf_counter() - started)
+        phase_timings.end(phase, time.perf_counter())
 
 
 async def _run_blocking(
@@ -1013,10 +1014,7 @@ def _write_workflow_outputs(
     sell_reconciliation_results.to_csv(output_path / "alpaca_sell_order_results.csv", index=False)
     if phase_timings is not None:
         phase_timings.add("report_generation", time.perf_counter() - report_output_started)
-    reporter.workflow_footer(
-        workflow_timer.elapsed_seconds(),
-        phase_timings.snapshot() if phase_timings is not None else None,
-    )
+    reporter.workflow_footer(workflow_timer.elapsed_seconds())
 
 
 def _terminal_alpaca_display_results(

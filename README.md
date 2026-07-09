@@ -162,19 +162,15 @@ the final asset summary is sorted by workflow index. The terminal Best Sharpe ta
 strategies with at least two executed trades and Sharpe of 1.0 or greater; `optimization_summary.csv`
 retains the full per-asset summary. CSV files retain full order IDs and detail, while terminal Alpaca
 tables show chronological display IDs that preserve closed-position gaps, plus the most useful fields
-with wrapped messages. A final workflow footer reports cumulative time spent downloading market data,
-synchronizing DB/state, computing the grid, generating reports, and performing Alpaca work, followed
-by total elapsed time and a divider for appended logs. Concurrent download durations can overlap, so
-the phase values are diagnostic work time and do not partition total wall time. Redirected or
-cron-driven non-terminal output defaults to a 156-column layout so log tables stay readable, while
-interactive terminal output uses the terminal's current width.
+with wrapped messages. A final workflow footer reports total elapsed time followed by a divider for
+appended logs. Redirected or cron-driven non-terminal output defaults to a 156-column layout so log
+tables stay readable, while interactive terminal output uses the terminal's current width.
 
 To tune download concurrency locally, compare equivalent update runs against copies of the same
 SQLite state with `--workflow-concurrency 1`, `2`, `4`, and `8`; disable Alpaca submissions during
-the comparison. Use the final total elapsed time as the primary result and the cumulative phase
-timings to identify the bottleneck. Yahoo Finance requests remain internally serialized for
-correctness, so values above the default `4` mainly help when Tradier fallback or local parsing is
-significant and can otherwise add memory use and provider pressure.
+the comparison and use the final total elapsed time as the result. Yahoo Finance requests remain
+internally serialized for correctness, so values above the default `4` mainly help when Tradier
+fallback or local parsing is significant and can otherwise add memory use and provider pressure.
 
 ## Environment Variables
 

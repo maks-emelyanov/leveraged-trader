@@ -1247,7 +1247,7 @@ class WorkflowAsyncTests(unittest.TestCase):
 
         self.assertFalse(benchmark_csv_exists)
         self.assertEqual(phase_timings.snapshot().report_generation_seconds, 2.0)
-        self.assertIn("Cumulative phase time:", output)
+        self.assertNotIn("Phase time:", output)
         self.assertIn("Workflow finished in", output)
         self.assertNotIn("Workflow Benchmark", output)
         self.assertEqual(output.rstrip().splitlines()[-1], "\u2500" * 100)

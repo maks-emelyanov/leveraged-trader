@@ -8,7 +8,6 @@ from unittest.mock import patch
 import pandas as pd
 from rich.console import Console
 
-from leveraged_trader.benchmark import WorkflowPhaseSnapshot
 from leveraged_trader.output import DEFAULT_NON_TERMINAL_WIDTH, TableColumn, WorkflowReporter
 
 
@@ -628,25 +627,10 @@ class OutputTests(unittest.TestCase):
         console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)
         reporter = WorkflowReporter(console=console)
 
-        reporter.workflow_footer(
-            65.25,
-            WorkflowPhaseSnapshot(
-                download_seconds=12.5,
-                db_sync_seconds=3.25,
-                grid_compute_seconds=1.5,
-                report_generation_seconds=0.75,
-                alpaca_seconds=2.0,
-            ),
-        )
+        reporter.workflow_footer(65.25)
         output = console.export_text(styles=False)
         lines = output.splitlines()
 
-        self.assertIn("Cumulative phase time:", output)
-        self.assertIn("download 12.50s", output)
-        self.assertIn("DB/state sync 3.25s", output)
-        self.assertIn("grid compute 1.50s", output)
-        self.assertIn("reports 0.75s", output)
-        self.assertIn("Alpaca 2.00s", output)
         self.assertIn("Workflow finished in 1m 05.25s.", output)
         self.assertNotIn("Workflow Benchmark", output)
         self.assertNotIn("CPU", output)

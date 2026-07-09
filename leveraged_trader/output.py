@@ -15,8 +15,6 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn
 from rich.table import Column, Table
 from rich.text import Text
 
-from .benchmark import WorkflowPhaseSnapshot
-
 DEFAULT_NON_TERMINAL_WIDTH = 156
 
 UNIVERSE_SUMMARY_COUNT_LABELS = (
@@ -558,18 +556,8 @@ class WorkflowReporter:
     def workflow_footer(
         self,
         elapsed_seconds: float,
-        phase_timings: WorkflowPhaseSnapshot | None = None,
     ) -> None:
         self.console.print()
-        if phase_timings is not None:
-            self.console.print(
-                "Cumulative phase time: "
-                f"download {format_duration(phase_timings.download_seconds)}; "
-                f"DB/state sync {format_duration(phase_timings.db_sync_seconds)}; "
-                f"grid compute {format_duration(phase_timings.grid_compute_seconds)}; "
-                f"reports {format_duration(phase_timings.report_generation_seconds)}; "
-                f"Alpaca {format_duration(phase_timings.alpaca_seconds)}."
-            )
         self.console.print(f"Workflow finished in {format_duration(elapsed_seconds)}.")
         self.console.rule(style="dim")
 
