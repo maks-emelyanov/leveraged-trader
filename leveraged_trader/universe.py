@@ -1727,6 +1727,7 @@ def _audit_source_columns() -> list[str]:
         "source_url",
         "is_leveraged_candidate",
         "is_long_leveraged_candidate",
+        "is_short_leveraged_candidate",
         "leverage",
         "direction",
     ]
@@ -1743,6 +1744,7 @@ def _audit_row_leverage_metadata(name: object, source: UniverseSource) -> pd.Ser
             {
                 "is_leveraged_candidate": False,
                 "is_long_leveraged_candidate": False,
+                "is_short_leveraged_candidate": False,
                 "leverage": None,
                 "direction": None,
             }
@@ -1753,6 +1755,7 @@ def _audit_row_leverage_metadata(name: object, source: UniverseSource) -> pd.Ser
         {
             "is_leveraged_candidate": leveraged_name_filter(str(name)),
             "is_long_leveraged_candidate": is_long_leveraged_name(str(name)),
+            "is_short_leveraged_candidate": is_short_leveraged_name(str(name)),
             "leverage": leverage,
             "direction": direction,
         }
@@ -1846,10 +1849,23 @@ def build_universe_audit_report(
     workflow_symbols = set(workflow_assets["symbol"].dropna().astype(str))
 
     out = audit_rows.copy()
+    if "is_short_leveraged_candidate" not in out.columns:
+        out["is_short_leveraged_candidate"] = out["direction"].eq("inverse") & out[
+            "is_leveraged_candidate"
+        ].astype(bool)
     out["in_merged_universe"] = out["symbol"].isin(merged_symbols)
     out["in_workflow_universe"] = out["symbol"].isin(workflow_symbols)
-    out = out[out["is_long_leveraged_candidate"] & ~out["in_merged_universe"]].copy()
-    out["audit_reason"] = "long leveraged-looking audit source row missing from merged source universe"
+    leveraged_candidate = (
+        out["is_long_leveraged_candidate"].astype(bool)
+        | out["is_short_leveraged_candidate"].astype(bool)
+    )
+    out = out[leveraged_candidate & ~out["in_merged_universe"]].copy()
+    out["audit_reason"] = out["is_short_leveraged_candidate"].map(
+        {
+            True: "inverse leveraged-looking audit source row missing from merged source universe",
+            False: "long leveraged-looking audit source row missing from merged source universe",
+        }
+    )
     return out[columns].sort_values(["source", "symbol"]).reset_index(drop=True)
 
 
@@ -2008,7 +2024,12 @@ def determine_workflow_asset_groups(cfg: UniverseConfig) -> dict[str, pd.DataFra
         raise RuntimeError("Nasdaq ETF universe returned no current leveraged ETFs/ETNs.")
 
     audit_rows, audit_status = load_audit_universe_sources(timeout=cfg.request_timeout_seconds)
-    audit_report = build_universe_audit_report(audit_rows, etf_df, all_long_leveraged)
+    all_workflow_leveraged = pd.concat(
+        [all_long_leveraged, all_short_leveraged],
+        ignore_index=True,
+        sort=False,
+    ).drop_duplicates("symbol")
+    audit_report = build_universe_audit_report(audit_rows, etf_df, all_workflow_leveraged)
     save_table_to_sqlite(audit_rows, cfg.sqlite_db_path, "universe_audit_rows")
     save_table_to_sqlite(audit_report, cfg.sqlite_db_path, "universe_audit_missing_candidates")
     save_table_to_sqlite(audit_status, cfg.sqlite_db_path, "universe_audit_source_status")
@@ -2017,6 +2038,11 @@ def determine_workflow_asset_groups(cfg: UniverseConfig) -> dict[str, pd.DataFra
         "long": _workflow_candidates(all_long_leveraged, known_symbols, workflow_label="Long"),
         "short": _workflow_candidates(all_short_leveraged, known_symbols, workflow_label="Short"),
     }
+    short_self_fallback = workflow_candidates_by_side["short"]["confidence"].eq("fallback_to_self")
+    workflow_candidates_by_side["short"].loc[short_self_fallback, "confidence"] = "needs_review"
+    workflow_candidates_by_side["short"].loc[short_self_fallback, "mapping_reason"] = (
+        "inverse product requires an underlying RSI proxy; self-RSI would invert the upper-RSI entry rule"
+    )
     all_workflow_candidates = pd.concat(
         workflow_candidates_by_side.values(),
         ignore_index=True,
@@ -2059,7 +2085,7 @@ def determine_workflow_asset_groups(cfg: UniverseConfig) -> dict[str, pd.DataFra
         "RSI mappings excluded pending review": len(rsi_mapping_review),
         "Audit sources registered": len(AUDIT_UNIVERSE_SOURCES),
         "Audit rows parsed": len(audit_rows),
-        "Audit long leveraged candidates missing from merged universe": len(audit_report),
+        "Audit leveraged candidates missing from merged universe": len(audit_report),
     }
     common_attrs = {
         "universe_degraded": (

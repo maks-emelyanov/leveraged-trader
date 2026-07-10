@@ -7,9 +7,11 @@ This project is intended for research and paper trading. It is not financial adv
 ## Features
 
 - Discovers current long and inverse leveraged ETFs/ETNs from Nasdaq ETF definitions plus best-effort issuer and ETN pages; source health distinguishes fetch/parser failures from healthy zero-match pages, and issuer-only products are filtered only when both active-listing sources load successfully.
-- Writes audit-only source checks for exchange directories, third-party ETF directories, and SEC EDGAR registry review.
+- Writes audit-only source checks for exchange directories, third-party ETF directories, and SEC EDGAR registry review, including long and inverse leveraged-looking products missing from the merged universe.
 - Infers an RSI signal symbol from each leveraged ETF name, with curated proxy mappings,
-  explicit self-RSI fallbacks, and a review table for unresolved mappings.
+  explicit long-product self-RSI fallbacks, and a review table for unresolved mappings. Inverse
+  products without an underlying RSI proxy are held for review because applying the inverse entry
+  rule to the product's own RSI would reverse the intended signal.
 - Downloads daily Yahoo Finance OHLCV data, with optional Tradier fallback for skipped symbols.
 - Optimizes low-RSI long entries, high-RSI inverse-product entries, and shared profit-target sell multiples.
 - Uses a NumPy/Numba-backed optimization loop for the parameter grid.
@@ -150,8 +152,10 @@ generation also persists `nasdaq_etf_universe`, `universe_audit_rows`,
 `universe_workflow_source_status`, `universe_active_listing_source_status`, and
 `universe_rsi_mapping_review` tables for source and RSI-mapping review. Leveraged workflow rows whose RSI
 symbol cannot be mapped confidently are excluded from the executable workflow and saved to
-`universe_rsi_mapping_review`; curated proxy mappings and explicit self-RSI fallbacks remain
-executable and are annotated in `nasdaq_etf_universe`. A universe discovery or active listing source
+`universe_rsi_mapping_review`; curated proxy mappings and long-product self-RSI fallbacks remain
+executable and are annotated in `nasdaq_etf_universe`. Inverse-product self-RSI fallbacks are instead
+marked for review and excluded because the high-RSI inverse entry rule requires an underlying proxy.
+A universe discovery or active listing source
 failure, or a successful response that cannot be parsed, leaves the run marked as degraded in terminal
 output. A successfully parsed source with zero leveraged matches remains healthy; use
 `--require-workflow-source-success` when a partial universe caused by a fetch or parser failure is not

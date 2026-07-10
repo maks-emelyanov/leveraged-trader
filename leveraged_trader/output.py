@@ -28,7 +28,7 @@ UNIVERSE_SUMMARY_NONZERO_COUNT_LABELS = (
     "RSI mappings excluded pending review",
     "Workflow universe sources failed",
     "Active listing sources failed",
-    "Audit long leveraged candidates missing from merged universe",
+    "Audit leveraged candidates missing from merged universe",
 )
 
 STATUS_STYLES = {

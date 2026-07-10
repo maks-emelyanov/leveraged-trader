@@ -1188,7 +1188,38 @@ class UniverseTests(unittest.TestCase):
 
         report = build_universe_audit_report(audit_rows, merged, workflow)
 
-        self.assertEqual(report["symbol"].tolist(), ["MISSING"])
+        self.assertEqual(report["symbol"].tolist(), ["MISSING", "SHORTY"])
+        short_row = report.loc[report["symbol"].eq("SHORTY")].iloc[0]
+        self.assertIn("inverse leveraged-looking", short_row["audit_reason"])
+
+    def test_inverse_self_rsi_fallback_is_excluded_for_review(self) -> None:
+        nasdaq_rows = pd.DataFrame(
+            [
+                {"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"},
+                {"symbol": "MYST", "name": "Example 2X Inverse Mystery Index ETF", "fund_type": "ETF"},
+            ]
+        )
+        empty_rows = pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+        empty_rows.attrs["workflow_source_status"] = []
+
+        with (
+            patch("leveraged_trader.universe.load_current_etf_universe", return_value=nasdaq_rows),
+            patch("leveraged_trader.universe.load_issuer_etf_universe", return_value=empty_rows),
+            patch("leveraged_trader.universe.load_etn_universe", return_value=empty_rows),
+            patch("leveraged_trader.universe.load_active_listed_symbols", return_value={"TQQQ", "QQQ", "MYST"}),
+            patch(
+                "leveraged_trader.universe.load_audit_universe_sources",
+                return_value=(pd.DataFrame(), pd.DataFrame()),
+            ),
+            patch("leveraged_trader.universe.save_table_to_sqlite"),
+        ):
+            groups = determine_workflow_asset_groups(UniverseConfig(sqlite_db_path="state.sqlite"))
+
+        self.assertTrue(groups["short"].empty)
+        review = groups["long"].attrs["rsi_mapping_review"]
+        self.assertEqual([row["symbol"] for row in review], ["MYST"])
+        self.assertEqual(review[0]["confidence"], "needs_review")
+        self.assertIn("requires an underlying RSI proxy", review[0]["mapping_reason"])
 
     @patch("leveraged_trader.universe.requests.get")
     def test_load_current_etf_universe_filters_exclusions_and_normalizes_brkb(self, mock_get: Mock) -> None:
@@ -1319,7 +1350,7 @@ class UniverseTests(unittest.TestCase):
         self.assertEqual(workflow_assets.attrs["universe_counts"]["Current long leveraged ETFs/ETNs found"], 4)
         self.assertEqual(workflow_assets.attrs["universe_counts"]["Audit rows parsed"], 1)
         self.assertEqual(
-            workflow_assets.attrs["universe_counts"]["Audit long leveraged candidates missing from merged universe"],
+            workflow_assets.attrs["universe_counts"]["Audit leveraged candidates missing from merged universe"],
             1,
         )
         self.assertEqual(workflow_assets.attrs["universe_db_path"], "state.sqlite")
