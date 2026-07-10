@@ -28,16 +28,19 @@ from leveraged_trader.universe import (
     _with_audit_metadata,
     build_nasdaq_universe_table,
     build_universe_audit_report,
+    determine_workflow_asset_groups,
     determine_workflow_assets,
     infer_leverage_and_direction,
     infer_rsi_mapping,
     infer_rsi_symbol,
     is_long_leveraged_name,
+    is_short_leveraged_name,
     leveraged_name_filter,
     load_active_listed_symbols,
     load_current_etf_universe,
     load_etn_universe,
     load_issuer_etf_universe,
+    select_short_workflow_universe,
 )
 
 
@@ -85,6 +88,88 @@ class UniverseTests(unittest.TestCase):
 
         self.assertEqual(len(workflow_assets), 1)
         self.assertIn("rsi_symbol", workflow_assets.columns)
+
+    def test_workflow_asset_groups_include_short_inverse_products(self) -> None:
+        nasdaq_rows = pd.DataFrame(
+            [
+                {"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"},
+                {"symbol": "SQQQ", "name": "ProShares UltraPro Short QQQ", "fund_type": "ETF"},
+            ]
+        )
+        empty_rows = pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+        empty_rows.attrs["workflow_source_status"] = []
+
+        with (
+            patch("leveraged_trader.universe.load_current_etf_universe", return_value=nasdaq_rows),
+            patch("leveraged_trader.universe.load_issuer_etf_universe", return_value=empty_rows),
+            patch("leveraged_trader.universe.load_etn_universe", return_value=empty_rows),
+            patch(
+                "leveraged_trader.universe.load_active_listed_symbols",
+                return_value={"TQQQ", "SQQQ", "QQQ"},
+            ),
+            patch(
+                "leveraged_trader.universe.load_audit_universe_sources",
+                return_value=(pd.DataFrame(), pd.DataFrame()),
+            ),
+            patch("leveraged_trader.universe.save_table_to_sqlite"),
+        ):
+            workflow_asset_groups = determine_workflow_asset_groups(
+                UniverseConfig(sqlite_db_path="state.sqlite")
+            )
+
+        self.assertEqual(workflow_asset_groups["long"]["symbol"].tolist(), ["TQQQ"])
+        self.assertEqual(workflow_asset_groups["short"]["symbol"].tolist(), ["SQQQ"])
+        self.assertEqual(workflow_asset_groups["short"].loc[0, "rsi_symbol"], "QQQ")
+        self.assertEqual(workflow_asset_groups["short"].loc[0, "direction"], "inverse")
+
+    def test_workflow_asset_groups_allow_short_only_universe(self) -> None:
+        nasdaq_rows = pd.DataFrame(
+            [
+                {"symbol": "QQQ", "name": "Invesco QQQ Trust", "fund_type": "ETF"},
+                {"symbol": "SQQQ", "name": "ProShares UltraPro Short QQQ", "fund_type": "ETF"},
+            ]
+        )
+        empty_rows = pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+        empty_rows.attrs["workflow_source_status"] = []
+
+        with (
+            patch("leveraged_trader.universe.load_current_etf_universe", return_value=nasdaq_rows),
+            patch("leveraged_trader.universe.load_issuer_etf_universe", return_value=empty_rows),
+            patch("leveraged_trader.universe.load_etn_universe", return_value=empty_rows),
+            patch(
+                "leveraged_trader.universe.load_active_listed_symbols",
+                return_value={"SQQQ", "QQQ"},
+            ),
+            patch(
+                "leveraged_trader.universe.load_audit_universe_sources",
+                return_value=(pd.DataFrame(), pd.DataFrame()),
+            ),
+            patch("leveraged_trader.universe.save_table_to_sqlite"),
+        ):
+            workflow_asset_groups = determine_workflow_asset_groups(
+                UniverseConfig(sqlite_db_path="state.sqlite")
+            )
+
+        self.assertTrue(workflow_asset_groups["long"].empty)
+        self.assertEqual(workflow_asset_groups["short"]["symbol"].tolist(), ["SQQQ"])
+        self.assertEqual(
+            workflow_asset_groups["short"].attrs["universe_counts"]["Executable short leveraged ETFs/ETNs selected"],
+            1,
+        )
+
+        with (
+            patch("leveraged_trader.universe.load_current_etf_universe", return_value=nasdaq_rows),
+            patch("leveraged_trader.universe.load_issuer_etf_universe", return_value=empty_rows),
+            patch("leveraged_trader.universe.load_etn_universe", return_value=empty_rows),
+            patch("leveraged_trader.universe.load_active_listed_symbols", return_value={"SQQQ", "QQQ"}),
+            patch(
+                "leveraged_trader.universe.load_audit_universe_sources",
+                return_value=(pd.DataFrame(), pd.DataFrame()),
+            ),
+            patch("leveraged_trader.universe.save_table_to_sqlite"),
+            self.assertRaisesRegex(RuntimeError, "no executable long leveraged"),
+        ):
+            determine_workflow_assets(UniverseConfig(sqlite_db_path="state.sqlite"))
 
     @patch("leveraged_trader.universe._read_nasdaq_symbol_file")
     def test_active_listing_status_marks_partial_download_non_authoritative(
@@ -168,7 +253,9 @@ class UniverseTests(unittest.TestCase):
             "ETNG": ("2x Long ETN Daily ETF", "ETN"),
             "GOOX": ("T-REX 2X Long Alphabet Daily Target ETF", "GOOG"),
             "MSFX": ("T-REX 2X Long Microsoft Daily Target ETF", "MSFT"),
+            "NVDQ": ("Tradr 2X Short NVDA Daily ETF", "NVDA"),
             "NVDX": ("T-REX 2X Long NVIDIA Daily Target ETF", "NVDA"),
+            "TSLZ": ("T-Rex 2X Inverse Tesla Daily Target ETF", "TSLA"),
             "TSLT": ("T-REX 2X Long Tesla Daily Target ETF", "TSLA"),
             "BULG": ("Leverage Shares 2X Long BULL Daily ETF", "BULL"),
             "MST": ("Defiance Leveraged Long + Income MSTR ETF", "MSTR"),
@@ -377,6 +464,21 @@ class UniverseTests(unittest.TestCase):
                 "Direxion Daily NVDA Bull 5X Shares",
                 "ETF (Direxion)",
             ),
+            (
+                "FOOD",
+                "T-REX 2X Inverse ExampleCorp Daily Target ETF",
+                "ETF (Example Issuer)",
+            ),
+            (
+                "FOOS",
+                "2X Short ExampleCorp Daily ETF",
+                "ETF (Example Issuer)",
+            ),
+            (
+                "FOOB",
+                "Direxion Daily AAPL Bear 2X Shares",
+                "ETF (Direxion)",
+            ),
         ]
 
         for asset_symbol, name, fund_type in cases:
@@ -511,6 +613,22 @@ class UniverseTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(infer_leverage_and_direction(name), (leverage, "inverse"))
                 self.assertFalse(is_long_leveraged_name(name))
+                self.assertTrue(is_short_leveraged_name(name))
+
+    def test_short_leveraged_workflow_selection_uses_inverse_products(self) -> None:
+        products = pd.DataFrame(
+            [
+                {"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"},
+                {"symbol": "SQQQ", "name": "ProShares UltraPro Short QQQ", "fund_type": "ETF"},
+                {"symbol": "SVIX", "name": "ProShares Short VIX Short-Term Futures ETF", "fund_type": "ETF"},
+            ]
+        )
+
+        short_universe = select_short_workflow_universe(products)
+
+        self.assertEqual(short_universe["symbol"].tolist(), ["SQQQ"])
+        self.assertTrue(is_short_leveraged_name("ProShares UltraPro Short QQQ"))
+        self.assertFalse(is_short_leveraged_name("ProShares Short VIX Short-Term Futures ETF"))
 
     def test_percent_based_leverage_names_are_classified(self) -> None:
         self.assertEqual(
@@ -1269,6 +1387,70 @@ class UniverseTests(unittest.TestCase):
         review_df = review_call.args[0]
         self.assertEqual(review_df["symbol"].tolist(), ["FOOU"])
         self.assertEqual(review_df["confidence"].tolist(), ["needs_review"])
+
+    def test_unresolved_short_single_stock_mapping_is_saved_for_review(self) -> None:
+        nasdaq_rows = pd.DataFrame(
+            [
+                {
+                    "symbol": "TQQQ",
+                    "name": "ProShares UltraPro QQQ",
+                    "fund_type": "ETF",
+                },
+                {
+                    "symbol": "SQQQ",
+                    "name": "ProShares UltraPro Short QQQ",
+                    "fund_type": "ETF",
+                },
+                {
+                    "symbol": "FOOS",
+                    "name": "2X Short ExampleCorp Daily ETF",
+                    "fund_type": "ETF (Example Issuer)",
+                },
+            ]
+        )
+        empty_rows = pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+        empty_rows.attrs["workflow_source_status"] = []
+
+        with (
+            patch("leveraged_trader.universe.load_current_etf_universe", return_value=nasdaq_rows),
+            patch("leveraged_trader.universe.load_issuer_etf_universe", return_value=empty_rows),
+            patch("leveraged_trader.universe.load_etn_universe", return_value=empty_rows),
+            patch(
+                "leveraged_trader.universe.load_active_listed_symbols",
+                return_value={"FOOS", "QQQ", "SQQQ", "TQQQ"},
+            ),
+            patch(
+                "leveraged_trader.universe.load_audit_universe_sources",
+                return_value=(pd.DataFrame(), pd.DataFrame()),
+            ),
+            patch("leveraged_trader.universe.save_table_to_sqlite") as mock_save_table,
+        ):
+            workflow_asset_groups = determine_workflow_asset_groups(
+                UniverseConfig(sqlite_db_path="state.sqlite")
+            )
+
+        self.assertEqual(workflow_asset_groups["long"]["symbol"].tolist(), ["TQQQ"])
+        self.assertEqual(workflow_asset_groups["short"]["symbol"].tolist(), ["SQQQ"])
+        self.assertEqual(workflow_asset_groups["short"]["rsi_symbol"].tolist(), ["QQQ"])
+        self.assertEqual(
+            workflow_asset_groups["short"].attrs["universe_counts"]["RSI mappings needing review"],
+            1,
+        )
+        self.assertEqual(
+            workflow_asset_groups["short"].attrs["universe_counts"]["RSI mappings excluded pending review"],
+            1,
+        )
+
+        review_call = next(
+            call
+            for call in mock_save_table.call_args_list
+            if call.args[2] == "universe_rsi_mapping_review"
+        )
+        review_df = review_call.args[0]
+        self.assertEqual(review_df["workflow"].tolist(), ["Short"])
+        self.assertEqual(review_df["symbol"].tolist(), ["FOOS"])
+        self.assertEqual(review_df["confidence"].tolist(), ["needs_review"])
+        self.assertEqual(review_df["mapping_source"].tolist(), ["unresolved_single_stock"])
 
     def test_explicit_self_fallback_basket_mapping_remains_executable(self) -> None:
         nasdaq_rows = pd.DataFrame(

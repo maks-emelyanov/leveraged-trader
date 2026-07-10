@@ -26,6 +26,9 @@ ACTION_NONE = 0
 ACTION_BUY = 1
 ACTION_SELL = 2
 
+RSI_ENTRY_LOWER = 0
+RSI_ENTRY_UPPER = 1
+
 
 @njit(cache=True, parallel=True)
 def run_grid_summary(
@@ -55,6 +58,7 @@ def run_grid_summary(
     positive_return_count_values: np.ndarray,
     max_drawdown_values: np.ndarray,
     trading_cost_rate: float,
+    rsi_entry_rule: int = RSI_ENTRY_LOWER,
 ) -> tuple:
     config_count = buy_rsi_values.shape[0]
     row_count = open_prices.shape[0]
@@ -146,7 +150,12 @@ def run_grid_summary(
 
             next_action = deferred_action
             if deferred_action == ACTION_NONE and not np.isnan(rsi):
-                if (not in_position) and rsi <= buy_rsi:
+                entry_signal = (
+                    rsi >= buy_rsi
+                    if rsi_entry_rule == RSI_ENTRY_UPPER
+                    else rsi <= buy_rsi
+                )
+                if (not in_position) and entry_signal:
                     next_action = ACTION_BUY
                 elif (
                     in_position
@@ -237,6 +246,7 @@ def run_single_equity_curve(
     profit_target_multiple: float,
     initial_capital: float,
     trading_cost_rate: float,
+    rsi_entry_rule: int = RSI_ENTRY_LOWER,
 ) -> tuple:
     row_count = open_prices.shape[0]
     equity_values = np.empty(row_count, dtype=np.float64)
@@ -293,7 +303,12 @@ def run_single_equity_curve(
 
         next_action = deferred_action
         if deferred_action == ACTION_NONE and not np.isnan(rsi):
-            if (not in_position) and rsi <= buy_rsi:
+            entry_signal = (
+                rsi >= buy_rsi
+                if rsi_entry_rule == RSI_ENTRY_UPPER
+                else rsi <= buy_rsi
+            )
+            if (not in_position) and entry_signal:
                 next_action = ACTION_BUY
             elif (
                 in_position

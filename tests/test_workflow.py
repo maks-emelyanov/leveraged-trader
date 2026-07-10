@@ -271,9 +271,7 @@ class WorkflowAsyncTests(unittest.TestCase):
                     risk_free_history,
                 )
                 with sqlite3.connect(db_path) as external:
-                    external.execute(
-                        "UPDATE strategy_state_generation SET generation = generation + 1 WHERE id = 1"
-                    )
+                    external.execute("UPDATE strategy_state_generation SET generation = generation + 1 WHERE id = 1")
                 with patch(
                     "leveraged_trader.storage._synchronize_market_data_history",
                     wraps=_synchronize_market_data_history,
@@ -471,10 +469,7 @@ class WorkflowAsyncTests(unittest.TestCase):
 
         async def run() -> list[AssetRunResult]:
             return await _run_asset_pipeline(
-                jobs=[
-                    AssetRunJob(index, symbol, symbol)
-                    for index, symbol in enumerate(["AAA", "BBB"], start=1)
-                ],
+                jobs=[AssetRunJob(index, symbol, symbol) for index, symbol in enumerate(["AAA", "BBB"], start=1)],
                 concurrency=2,
                 db_path="state.sqlite",
                 mode="update",
@@ -521,7 +516,20 @@ class WorkflowAsyncTests(unittest.TestCase):
         def load_universe(*_args: object) -> pd.DataFrame:
             self.assertEqual(events, ["reconcile"])
             events.append("universe")
-            return pd.DataFrame(columns=["symbol", "name", "rsi_symbol"])
+            return pd.DataFrame([{"symbol": "TQQQ", "name": "T", "rsi_symbol": "QQQ"}])
+
+        async def completed_asset_pipeline(**_kwargs: object) -> list[AssetRunResult]:
+            return [
+                AssetRunResult(
+                    workflow_idx=1,
+                    asset_symbol="TQQQ",
+                    signal_symbol="QQQ",
+                    action="Updating",
+                    rows_processed=1,
+                    status="done",
+                    message="Processed 1 row",
+                )
+            ]
 
         with tempfile.TemporaryDirectory() as tmp:
             reporter = WorkflowReporter(
@@ -532,10 +540,16 @@ class WorkflowAsyncTests(unittest.TestCase):
                 patch("leveraged_trader.workflow._initialize_state_db"),
                 patch("leveraged_trader.workflow._reconcile_alpaca_managed_positions_for_db", side_effect=reconcile),
                 patch("leveraged_trader.workflow._load_or_refresh_workflow_assets_for_db", side_effect=load_universe),
+                patch("leveraged_trader.workflow._run_asset_pipeline", new=completed_asset_pipeline),
                 patch(
                     "leveraged_trader.workflow._build_reports_for_db",
                     return_value=(
-                        pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+                        pd.DataFrame(),
+                        pd.DataFrame(),
+                        pd.DataFrame(),
+                        pd.DataFrame(),
+                        pd.DataFrame(),
+                        pd.DataFrame(),
                     ),
                 ),
                 patch(
@@ -546,7 +560,7 @@ class WorkflowAsyncTests(unittest.TestCase):
                 patch("leveraged_trader.workflow._write_workflow_outputs") as mock_write_outputs,
                 patch("leveraged_trader.workflow.time") as mock_time,
             ):
-                mock_time.perf_counter.side_effect = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+                mock_time.perf_counter.side_effect = [float(value) for value in range(1, 9)]
                 asyncio.run(
                     run_resumable_optimizations_async(
                         mode="update",
@@ -563,7 +577,7 @@ class WorkflowAsyncTests(unittest.TestCase):
 
         self.assertEqual(events, ["reconcile", "universe"])
         phase_snapshot = mock_write_outputs.call_args.kwargs["phase_timings"].snapshot()
-        self.assertEqual(phase_snapshot.report_generation_seconds, 1.0)
+        self.assertEqual(phase_snapshot.report_generation_seconds, 2.0)
         self.assertEqual(phase_snapshot.alpaca_seconds, 2.0)
 
     def test_update_preflight_fetches_full_history_for_revision_detection(self) -> None:
@@ -602,6 +616,71 @@ class WorkflowAsyncTests(unittest.TestCase):
         self.assertTrue(optimization_summary.empty)
         self.assertTrue(buy_signals.empty)
         self.assertTrue(sell_signals.empty)
+
+    def test_report_build_adds_workflow_and_side_prefixed_curve_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "state.sqlite")
+            with sqlite3.connect(db_path) as conn:
+                init_state_db(conn)
+                conn.execute(
+                    """
+                    INSERT INTO strategy_summary
+                    (asset_symbol, signal_symbol, buy_rsi, profit_target_multiple, start_date, end_date,
+                     trading_days, trades_executed, total_return, cagr, annualized_vol, sharpe,
+                     kelly_fraction, max_drawdown, hit_rate, first_equity, last_equity, running_max_equity,
+                     return_count, return_sum, return_sum_squares, excess_return_count, excess_return_sum,
+                     excess_return_sum_squares, positive_return_count)
+                    VALUES
+                    ('SQQQ', 'QQQ', 70.0, 1.5, '2026-01-02', '2026-01-05',
+                     2, 2, 0.02, 0.10, 0.20, 1.20,
+                     0.30, -0.01, 0.50, 100000.0, 102000.0, 102000.0,
+                     2, 0.02, 0.0004, 2, 0.02, 0.0004, 1)
+                    """
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO strategy_equity
+                    (asset_symbol, signal_symbol, buy_rsi, profit_target_multiple, date, equity,
+                     daily_return, risk_free_return, in_position, action_executed, pending_action, trades_executed)
+                    VALUES ('SQQQ', 'QQQ', 70.0, 1.5, ?, ?, ?, 0.0, ?, ?, ?, ?)
+                    """,
+                    [
+                        ("2026-01-02", 100000.0, 0.0, 0, "none", "none", 0),
+                        ("2026-01-05", 102000.0, 0.02, 0, "none", "buy", 2),
+                    ],
+                )
+                conn.execute(
+                    """
+                    INSERT INTO strategy_state
+                    (asset_symbol, signal_symbol, buy_rsi, profit_target_multiple, start_date, last_date,
+                     cash, shares, in_position, entry_price, pending_action, prev_equity, trades_executed)
+                    VALUES
+                    ('SQQQ', 'QQQ', 70.0, 1.5, '2026-01-02', '2026-01-05',
+                     102000.0, 0.0, 0, NULL, 'buy', 102000.0, 2)
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO rsi_values
+                    (signal_symbol, rsi_period, date, close, avg_gain, avg_loss, rsi)
+                    VALUES ('QQQ', 14, '2026-01-05', 100.0, 1.0, 0.1, 75.0)
+                    """
+                )
+                conn.commit()
+
+            workflow_assets = pd.DataFrame([{"symbol": "SQQQ", "name": "S", "rsi_symbol": "QQQ"}])
+
+            optimization_summary, curves, buy_signals, _eligible, _sell_signals, _pnl = _build_reports_for_db(
+                db_path,
+                workflow_assets,
+                BacktestConfig(),
+                processed_asset_pairs={("SQQQ", "QQQ")},
+                workflow_label="Short",
+            )
+
+        self.assertEqual(optimization_summary["Workflow"].tolist(), ["Short"])
+        self.assertEqual(curves.columns.tolist(), ["Short_SQQQ_RSI_Strategy"])
+        self.assertEqual(buy_signals["Workflow"].tolist(), ["Short"])
 
     def test_workflow_reconciles_again_after_submitting_a_buy(self) -> None:
         workflow_assets = pd.DataFrame([{"symbol": "TQQQ", "name": "T", "rsi_symbol": "QQQ"}])
@@ -680,6 +759,114 @@ class WorkflowAsyncTests(unittest.TestCase):
         reconciliation_results = mock_write_outputs.call_args.kwargs["reconciliation_results"]
         self.assertEqual(reconciliation_results["Action"].tolist(), ["sell"])
 
+    def test_workflow_runs_long_then_short_and_submits_combined_buy_signals(self) -> None:
+        workflow_asset_groups = {
+            "long": pd.DataFrame([{"symbol": "TQQQ", "name": "T", "rsi_symbol": "QQQ"}]),
+            "short": pd.DataFrame([{"symbol": "SQQQ", "name": "S", "rsi_symbol": "QQQ"}]),
+        }
+        pipeline_rules: list[str] = []
+        submitted_buy_signals: list[pd.DataFrame] = []
+
+        async def fake_asset_pipeline(**kwargs: object) -> list[AssetRunResult]:
+            pipeline_rules.append(str(kwargs["rsi_entry_rule"]))
+            jobs = kwargs["jobs"]
+            return [
+                AssetRunResult(
+                    workflow_idx=job.workflow_idx,
+                    asset_symbol=job.asset_symbol,
+                    signal_symbol=job.signal_symbol,
+                    action="Updating",
+                    rows_processed=1,
+                    status="done",
+                    message="Processed 1 row",
+                )
+                for job in jobs
+            ]
+
+        def fake_build_reports(
+            _db_path: str,
+            _workflow_assets: pd.DataFrame,
+            _base_cfg: BacktestConfig,
+            _processed_asset_pairs: set[tuple[str, str]],
+            workflow_label: str | None = None,
+        ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+            asset = "TQQQ" if workflow_label == "Long" else "SQQQ"
+            buy_signals = pd.DataFrame(
+                [
+                    {
+                        "Workflow": workflow_label,
+                        "Asset": asset,
+                        "RSI Symbol": "QQQ",
+                        "Date": "2026-01-02",
+                        "Buy RSI": 30.0 if workflow_label == "Long" else 70.0,
+                        "Sell Return Multiple": 1.5,
+                    }
+                ]
+            )
+            return (
+                pd.DataFrame([{"Workflow": workflow_label, "Asset": asset}]),
+                pd.DataFrame(),
+                buy_signals,
+                buy_signals.copy(),
+                pd.DataFrame(),
+                pd.DataFrame(),
+            )
+
+        def fake_submit(_db_path: str, buy_signals: pd.DataFrame, _alpaca_cfg: AlpacaOrderConfig) -> pd.DataFrame:
+            submitted_buy_signals.append(buy_signals.copy())
+            return pd.DataFrame(columns=["Status"])
+
+        async def immediate_to_thread(func: object, /, *args: object, **kwargs: object) -> object:
+            return func(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = WorkflowReporter(
+                console=Console(file=io.StringIO(), width=100, color_system=None, no_color=True)
+            )
+            with (
+                patch("leveraged_trader.workflow.asyncio.to_thread", new=immediate_to_thread),
+                patch("leveraged_trader.workflow._initialize_state_db"),
+                patch(
+                    "leveraged_trader.workflow._reconcile_alpaca_managed_positions_for_db",
+                    return_value=pd.DataFrame(columns=["Action"]),
+                ),
+                patch(
+                    "leveraged_trader.workflow._load_or_refresh_workflow_assets_for_db",
+                    return_value=workflow_asset_groups,
+                ),
+                patch("leveraged_trader.workflow._run_asset_pipeline", new=fake_asset_pipeline),
+                patch("leveraged_trader.workflow._build_reports_for_db", side_effect=fake_build_reports),
+                patch("leveraged_trader.workflow._submit_alpaca_paper_buy_orders_for_db", side_effect=fake_submit),
+                patch("leveraged_trader.workflow._load_alpaca_managed_positions_for_db", return_value=pd.DataFrame()),
+                patch("leveraged_trader.workflow._write_workflow_outputs"),
+                patch.object(reporter, "universe_assets", wraps=reporter.universe_assets) as mock_universe_assets,
+            ):
+                asyncio.run(
+                    run_resumable_optimizations_async(
+                        mode="update",
+                        db_path=str(Path(tmp) / "state.sqlite"),
+                        base_cfg=BacktestConfig(),
+                        universe_cfg=UniverseConfig(),
+                        buy_rsi_values=[30.0],
+                        profit_target_values=[1.5],
+                        alpaca_cfg=AlpacaOrderConfig(),
+                        output_dir=str(Path(tmp) / "outputs"),
+                        reporter=reporter,
+                    )
+                )
+
+        self.assertEqual(pipeline_rules, ["lower", "upper"])
+        mock_universe_assets.assert_called_once()
+        rendered_universe = mock_universe_assets.call_args.args[0]
+        self.assertEqual(rendered_universe["symbol"].tolist(), ["TQQQ", "SQQQ"])
+        self.assertEqual(
+            rendered_universe.attrs["universe_title"],
+            "Executable Leveraged ETFs/ETNs From Merged Universe",
+        )
+        self.assertEqual(len(submitted_buy_signals), 1)
+        self.assertEqual(submitted_buy_signals[0]["Workflow"].tolist(), ["Long", "Short"])
+        self.assertEqual(submitted_buy_signals[0]["Asset"].tolist(), ["TQQQ", "SQQQ"])
+
     def test_workflow_fails_when_every_asset_is_skipped(self) -> None:
         workflow_assets = pd.DataFrame([{"symbol": "TQQQ", "name": "T", "rsi_symbol": "QQQ"}])
 
@@ -736,10 +923,57 @@ class WorkflowAsyncTests(unittest.TestCase):
         mock_build_reports.assert_not_called()
         mock_submit_buys.assert_not_called()
 
+    def test_workflow_fails_when_no_assets_are_run(self) -> None:
+        empty_assets = pd.DataFrame(columns=["symbol", "name", "rsi_symbol"])
+        workflow_asset_groups = {
+            "long": empty_assets,
+            "short": empty_assets.copy(),
+        }
+
+        async def immediate_to_thread(func: object, /, *args: object, **kwargs: object) -> object:
+            return func(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = WorkflowReporter(
+                console=Console(file=io.StringIO(), width=100, color_system=None, no_color=True)
+            )
+            with (
+                patch("leveraged_trader.workflow.asyncio.to_thread", new=immediate_to_thread),
+                patch("leveraged_trader.workflow._initialize_state_db"),
+                patch(
+                    "leveraged_trader.workflow._reconcile_alpaca_managed_positions_for_db",
+                    return_value=pd.DataFrame(columns=["Action"]),
+                ),
+                patch(
+                    "leveraged_trader.workflow._load_or_refresh_workflow_assets_for_db",
+                    return_value=workflow_asset_groups,
+                ),
+                patch("leveraged_trader.workflow._run_asset_pipeline") as mock_run_pipeline,
+                patch("leveraged_trader.workflow._build_reports_for_db") as mock_build_reports,
+                patch("leveraged_trader.workflow._submit_alpaca_paper_buy_orders_for_db") as mock_submit_buys,
+                self.assertRaisesRegex(WorkflowRunError, "No executable assets were run"),
+            ):
+                asyncio.run(
+                    run_resumable_optimizations_async(
+                        mode="update",
+                        db_path=str(Path(tmp) / "state.sqlite"),
+                        base_cfg=BacktestConfig(),
+                        universe_cfg=UniverseConfig(),
+                        buy_rsi_values=[30.0],
+                        profit_target_values=[1.5],
+                        alpaca_cfg=AlpacaOrderConfig(),
+                        output_dir=str(Path(tmp) / "outputs"),
+                        reporter=reporter,
+                    )
+                )
+
+        mock_run_pipeline.assert_not_called()
+        mock_build_reports.assert_not_called()
+        mock_submit_buys.assert_not_called()
+
     def test_asset_pipeline_bounds_downloads_overlaps_db_and_sorts_results(self) -> None:
         jobs = [
-            AssetRunJob(index, symbol, symbol)
-            for index, symbol in enumerate(["AAA", "BBB", "CCC", "DDD"], start=1)
+            AssetRunJob(index, symbol, symbol) for index, symbol in enumerate(["AAA", "BBB", "CCC", "DDD"], start=1)
         ]
         active_downloads = 0
         max_active_downloads = 0
@@ -912,7 +1146,7 @@ class WorkflowAsyncTests(unittest.TestCase):
         self.assertTrue(close_threads[0].startswith("workflow-strategy"))
 
     def test_asset_preparation_returns_skipped_result_for_empty_market_data(self) -> None:
-        job = AssetRunJob(1, "TQQQ", "QQQ")
+        job = AssetRunJob(1, "TQQQ", "QQQ", workflow="Long")
 
         async def fake_to_thread(func: object, /, *args: object, **_kwargs: object) -> object:
             if getattr(func, "__name__", "") == "_prepare_asset_run":
@@ -949,6 +1183,7 @@ class WorkflowAsyncTests(unittest.TestCase):
         self.assertIsInstance(outcome, AssetRunResult)
         self.assertEqual(outcome.status, "skipped")
         self.assertEqual(outcome.rows_processed, 0)
+        self.assertEqual(outcome.workflow, "Long")
         self.assertIn("No finalized daily market data", outcome.message)
 
     def test_asset_pipeline_drains_preparation_and_db_failures(self) -> None:
@@ -1251,6 +1486,201 @@ class WorkflowAsyncTests(unittest.TestCase):
         self.assertIn("Workflow finished in", output)
         self.assertNotIn("Workflow Benchmark", output)
         self.assertEqual(output.rstrip().splitlines()[-1], "\u2500" * 100)
+
+    def test_write_workflow_outputs_preserves_workflow_columns_and_side_prefixed_curves(self) -> None:
+        optimization_summary = pd.DataFrame(
+            [
+                {
+                    "Workflow": "Long",
+                    "Asset": "TQQQ",
+                    "RSI Symbol": "QQQ",
+                    "Start Date": "2026-01-02",
+                    "End Date": "2026-01-05",
+                    "Trading Days": 2,
+                    "Buy RSI": 30.0,
+                    "Sell Return Multiple": 1.5,
+                    "Trades Executed": 2,
+                    "Total Return": 0.05,
+                    "CAGR": 0.10,
+                    "Annualized Vol": 0.20,
+                    "Sharpe": 1.20,
+                    "Kelly Fraction": 0.30,
+                    "Max Drawdown": -0.01,
+                    "Hit Rate": 0.50,
+                },
+                {
+                    "Workflow": "Short",
+                    "Asset": "SQQQ",
+                    "RSI Symbol": "QQQ",
+                    "Start Date": "2026-01-02",
+                    "End Date": "2026-01-05",
+                    "Trading Days": 2,
+                    "Buy RSI": 70.0,
+                    "Sell Return Multiple": 1.5,
+                    "Trades Executed": 2,
+                    "Total Return": 0.04,
+                    "CAGR": 0.08,
+                    "Annualized Vol": 0.20,
+                    "Sharpe": 1.10,
+                    "Kelly Fraction": 0.25,
+                    "Max Drawdown": -0.02,
+                    "Hit Rate": 0.50,
+                },
+            ]
+        )
+        buy_signals = pd.DataFrame(
+            [
+                {
+                    "Workflow": "Long",
+                    "Asset": "TQQQ",
+                    "RSI Symbol": "QQQ",
+                    "Date": "2026-01-05",
+                    "Start Date": "2026-01-02",
+                    "Trading Days": 2,
+                    "Latest RSI": 25.0,
+                    "Buy RSI": 30.0,
+                    "Sell Return Multiple": 1.5,
+                    "Trades Executed": 2,
+                    "Sharpe": 1.2,
+                    "In Position": False,
+                    "Pending Action": "buy",
+                },
+                {
+                    "Workflow": "Short",
+                    "Asset": "SQQQ",
+                    "RSI Symbol": "QQQ",
+                    "Date": "2026-01-05",
+                    "Start Date": "2026-01-02",
+                    "Trading Days": 2,
+                    "Latest RSI": 75.0,
+                    "Buy RSI": 70.0,
+                    "Sell Return Multiple": 1.5,
+                    "Trades Executed": 2,
+                    "Sharpe": 1.1,
+                    "In Position": False,
+                    "Pending Action": "buy",
+                },
+            ]
+        )
+        sell_signals = pd.DataFrame(
+            [
+                {
+                    "Workflow": "Short",
+                    "Asset": "SQQQ",
+                    "RSI Symbol": "QQQ",
+                    "Date": "2026-01-05",
+                    "Pending Action": "sell",
+                }
+            ]
+        )
+        order_results = pd.DataFrame(
+            [
+                {
+                    "Workflow": "Short",
+                    "Asset": "SQQQ",
+                    "Date": "2026-01-05",
+                    "Client Order ID": "buy-SQQQ",
+                    "Notional": 100.0,
+                    "Qty": 1,
+                    "Limit Price": 100.0,
+                    "Status": "submitted",
+                    "Alpaca Order ID": "alpaca-buy-SQQQ",
+                    "Message": "submitted",
+                }
+            ]
+        )
+        reconciliation_results = pd.DataFrame(
+            [
+                {
+                    "Position ID": 1,
+                    "Workflow": "Short",
+                    "Asset": "SQQQ",
+                    "Action": "sell",
+                    "Status": "new",
+                    "Qty": 1,
+                    "Limit Price": 115.0,
+                    "Message": "managed sell submitted",
+                }
+            ]
+        )
+        realized_pnl_summary = pd.DataFrame(
+            [
+                {
+                    "Workflow": "Short",
+                    "Closed Positions": 1,
+                    "Complete Closed Positions": 1,
+                    "Incomplete Closed Positions": 0,
+                    "Total Buy Cost": 100.0,
+                    "Total Sell Value": 115.0,
+                    "Realized P/L": 15.0,
+                    "Realized P/L %": 15.0,
+                }
+            ]
+        )
+        curves = pd.DataFrame(
+            {
+                "Long_TQQQ_RSI_Strategy": [100_000.0, 101_000.0],
+                "Short_SQQQ_RSI_Strategy": [100_000.0, 102_000.0],
+            },
+            index=pd.to_datetime(["2026-01-02", "2026-01-05"]),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "outputs"
+            reporter = WorkflowReporter(
+                console=Console(file=io.StringIO(), width=160, color_system=None, no_color=True)
+            )
+            _write_workflow_outputs(
+                mode="update",
+                db_path=str(Path(tmp) / "state.sqlite"),
+                base_cfg=BacktestConfig(),
+                buy_rsi_values=[30.0],
+                profit_target_values=[1.5],
+                alpaca_cfg=AlpacaOrderConfig(enabled=True, sell_enabled=True),
+                output_dir=str(output_dir),
+                workflow_concurrency=1,
+                reporter=reporter,
+                asset_run_results=[],
+                optimization_summary=optimization_summary,
+                curves=curves,
+                buy_signals=buy_signals,
+                eligible_buy_signals=buy_signals.iloc[[1]].copy(),
+                sell_signals=sell_signals,
+                realized_pnl_summary=realized_pnl_summary,
+                managed_positions=pd.DataFrame(),
+                reconciliation_results=reconciliation_results,
+                sell_reconciliation_results=reconciliation_results,
+                order_results=order_results,
+                workflow_timer=WorkflowTimer.start(),
+            )
+
+            written_curves = pd.read_csv(output_dir / "best_equity_curves.csv", index_col=0)
+            written_summary = pd.read_csv(output_dir / "optimization_summary.csv")
+            written_buy_signals = pd.read_csv(output_dir / "buy_signals.csv")
+            written_eligible = pd.read_csv(output_dir / "eligible_buy_signals.csv")
+            written_sell_signals = pd.read_csv(output_dir / "sell_signals.csv")
+            written_orders = pd.read_csv(output_dir / "alpaca_order_results.csv")
+            written_reconciliation = pd.read_csv(output_dir / "alpaca_reconciliation_results.csv")
+            written_sell_orders = pd.read_csv(output_dir / "alpaca_sell_order_results.csv")
+            written_realized_pnl = pd.read_csv(output_dir / "alpaca_realized_pnl.csv")
+
+        self.assertEqual(
+            written_curves.columns.tolist(),
+            ["Long_TQQQ_RSI_Strategy", "Short_SQQQ_RSI_Strategy"],
+        )
+        for frame in [
+            written_summary,
+            written_buy_signals,
+            written_eligible,
+            written_sell_signals,
+            written_orders,
+            written_reconciliation,
+            written_sell_orders,
+            written_realized_pnl,
+        ]:
+            self.assertIn("Workflow", frame.columns)
+        self.assertEqual(written_buy_signals["Workflow"].tolist(), ["Long", "Short"])
+        self.assertEqual(written_eligible["Workflow"].tolist(), ["Short"])
 
     def test_write_workflow_outputs_keeps_full_csv_and_filters_terminal_summary_rows(self) -> None:
         optimization_summary = pd.DataFrame(

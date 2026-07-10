@@ -15,6 +15,7 @@ REALIZED_PNL_COLUMNS = [
     "Realized P/L",
     "Realized P/L %",
 ]
+REALIZED_PNL_WORKFLOW_COLUMNS = ["Workflow", *REALIZED_PNL_COLUMNS]
 
 
 def summarize_saved_results(
@@ -146,10 +147,14 @@ def build_sell_signal_report(
     )
 
 
-def build_alpaca_realized_pnl_summary(conn: sqlite3.Connection) -> pd.DataFrame:
+def build_alpaca_realized_pnl_summary(
+    conn: sqlite3.Connection,
+    *,
+    include_workflow: bool = False,
+) -> pd.DataFrame:
     positions = pd.read_sql_query(
         """
-        SELECT filled_qty, filled_avg_price, sell_filled_qty,
+        SELECT workflow, filled_qty, filled_avg_price, sell_filled_qty,
                sell_filled_avg_price, sold_qty, sold_value, remaining_qty, closed_at
         FROM alpaca_managed_positions
         WHERE closed_at IS NOT NULL
@@ -158,19 +163,12 @@ def build_alpaca_realized_pnl_summary(conn: sqlite3.Connection) -> pd.DataFrame:
         conn,
     )
     if positions.empty:
+        row = _realized_pnl_summary_row(0, 0, 0.0, 0.0)
+        if include_workflow:
+            row = {"Workflow": "All", **row}
         return pd.DataFrame(
-            [
-                {
-                    "Closed Positions": 0,
-                    "Complete Closed Positions": 0,
-                    "Incomplete Closed Positions": 0,
-                    "Total Buy Cost": 0.0,
-                    "Total Sell Value": 0.0,
-                    "Realized P/L": 0.0,
-                    "Realized P/L %": 0.0,
-                }
-            ],
-            columns=REALIZED_PNL_COLUMNS,
+            [row],
+            columns=REALIZED_PNL_WORKFLOW_COLUMNS if include_workflow else REALIZED_PNL_COLUMNS,
         )
 
     numeric_columns = [
@@ -207,25 +205,60 @@ def build_alpaca_realized_pnl_summary(conn: sqlite3.Connection) -> pd.DataFrame:
         & complete["effective_remaining_qty"].abs().le(1e-8)
     ]
 
+    if include_workflow:
+        positions["Workflow"] = positions["workflow"].fillna("Unknown").replace("", "Unknown")
+        complete["Workflow"] = complete["workflow"].fillna("Unknown").replace("", "Unknown")
+        rows = []
+        for workflow, workflow_positions in positions.groupby("Workflow", sort=True, dropna=False):
+            workflow_complete = complete[complete["Workflow"].eq(workflow)]
+            total_buy_cost = float((workflow_complete["filled_qty"] * workflow_complete["filled_avg_price"]).sum())
+            total_sell_value = float(workflow_complete["effective_sold_value"].sum())
+            rows.append(
+                {
+                    "Workflow": workflow,
+                    **_realized_pnl_summary_row(
+                        closed_positions=len(workflow_positions),
+                        complete_closed_positions=len(workflow_complete),
+                        total_buy_cost=total_buy_cost,
+                        total_sell_value=total_sell_value,
+                    ),
+                }
+            )
+        return pd.DataFrame(rows, columns=REALIZED_PNL_WORKFLOW_COLUMNS)
+
     total_buy_cost = float((complete["filled_qty"] * complete["filled_avg_price"]).sum())
     total_sell_value = float(complete["effective_sold_value"].sum())
-    realized_pl = total_sell_value - total_buy_cost
-    realized_pl_pct = (realized_pl / total_buy_cost * 100.0) if total_buy_cost > 0 else 0.0
 
     return pd.DataFrame(
         [
-            {
-                "Closed Positions": len(positions),
-                "Complete Closed Positions": len(complete),
-                "Incomplete Closed Positions": len(positions) - len(complete),
-                "Total Buy Cost": total_buy_cost,
-                "Total Sell Value": total_sell_value,
-                "Realized P/L": realized_pl,
-                "Realized P/L %": realized_pl_pct,
-            }
+            _realized_pnl_summary_row(
+                closed_positions=len(positions),
+                complete_closed_positions=len(complete),
+                total_buy_cost=total_buy_cost,
+                total_sell_value=total_sell_value,
+            )
         ],
         columns=REALIZED_PNL_COLUMNS,
     )
+
+
+def _realized_pnl_summary_row(
+    closed_positions: int,
+    complete_closed_positions: int,
+    total_buy_cost: float,
+    total_sell_value: float,
+) -> dict[str, object]:
+    realized_pl = total_sell_value - total_buy_cost
+    realized_pl_pct = (realized_pl / total_buy_cost * 100.0) if total_buy_cost > 0 else 0.0
+    return {
+        "Closed Positions": closed_positions,
+        "Complete Closed Positions": complete_closed_positions,
+        "Incomplete Closed Positions": closed_positions - complete_closed_positions,
+        "Total Buy Cost": total_buy_cost,
+        "Total Sell Value": total_sell_value,
+        "Realized P/L": realized_pl,
+        "Realized P/L %": realized_pl_pct,
+    }
 
 
 def build_pending_action_report(

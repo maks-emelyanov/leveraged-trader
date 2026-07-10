@@ -47,10 +47,13 @@ from .storage import (
     strategy_config_fingerprint,
     strategy_state_matches_config,
 )
-from .universe import determine_workflow_assets
+from .universe import determine_workflow_asset_groups
 
 DEFAULT_WORKFLOW_CONCURRENCY = 4
 SQLITE_BUSY_TIMEOUT_MS = 60_000
+LONG_WORKFLOW_LABEL = "Long"
+SHORT_WORKFLOW_LABEL = "Short"
+DEFAULT_SHORT_BUY_RSI_VALUES = list(range(50, 81))
 
 
 def _validate_grid_values(name: str, values: list[float]) -> None:
@@ -98,11 +101,13 @@ class AssetRunResult:
     rows_processed: int | None
     status: str
     message: str
+    workflow: str | None = None
 
-    def as_output_row(self) -> dict[str, object]:
+    def as_output_row(self, *, workflow: str | None = None) -> dict[str, object]:
         row = asdict(self)
         return {
             "Workflow #": row["workflow_idx"],
+            "Workflow": row["workflow"] or workflow,
             "Asset": row["asset_symbol"],
             "RSI Symbol": row["signal_symbol"],
             "Action": row["action"],
@@ -117,6 +122,7 @@ class AssetRunJob:
     workflow_idx: int
     asset_symbol: str
     signal_symbol: str
+    workflow: str | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +133,20 @@ class PreparedAssetRun:
     asset_history: pd.DataFrame
     signal_history: pd.DataFrame
     risk_free_history: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class WorkflowSideOutput:
+    label: str
+    universe_assets: pd.DataFrame
+    buy_rsi_values: list[float]
+    rsi_entry_rule: str
+    asset_run_results: list[AssetRunResult]
+    optimization_summary: pd.DataFrame
+    curves: pd.DataFrame
+    buy_signals: pd.DataFrame
+    eligible_buy_signals: pd.DataFrame
+    sell_signals: pd.DataFrame
 
 
 class _WorkflowStrategySession:
@@ -252,11 +272,36 @@ async def _run_blocking(
 def _load_or_refresh_workflow_assets_for_db(
     db_path: str,
     universe_cfg: UniverseConfig,
-) -> pd.DataFrame:
-    workflow_assets = determine_workflow_assets(universe_cfg)
+) -> dict[str, pd.DataFrame]:
+    workflow_asset_groups = determine_workflow_asset_groups(universe_cfg)
     with _state_connection(db_path) as conn:
-        save_workflow_assets(conn, workflow_assets)
-    return workflow_assets
+        save_workflow_assets(conn, _combined_workflow_assets(workflow_asset_groups))
+    return workflow_asset_groups
+
+
+def _combined_workflow_assets(workflow_asset_groups: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    frames = [frame for frame in workflow_asset_groups.values()]
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True, sort=False)
+    source = next((frame for frame in frames if frame.attrs), None)
+    if source is not None:
+        out.attrs.update(source.attrs)
+    counts: dict[str, object] = {}
+    for frame in frames:
+        counts.update(frame.attrs.get("universe_counts", {}))
+    out.attrs["universe_counts"] = counts
+    out.attrs["universe_title"] = "Executable Leveraged ETFs/ETNs From Merged Universe"
+    return out
+
+
+def _with_workflow_column(df: pd.DataFrame, workflow_label: str) -> pd.DataFrame:
+    out = df.copy()
+    if "Workflow" in out.columns:
+        out["Workflow"] = out["Workflow"].where(out["Workflow"].notna(), workflow_label)
+    else:
+        out.insert(0, "Workflow", workflow_label)
+    return out
 
 
 def _reconcile_alpaca_managed_positions_for_db(
@@ -275,6 +320,7 @@ def _prepare_asset_run(
     signal_symbol: str,
     buy_rsi_values: list[float],
     profit_target_values: list[float],
+    rsi_entry_rule: str = "lower",
 ) -> AssetRunPlan:
     with _state_connection(db_path) as conn:
         rebuild_asset = mode == "rebuild"
@@ -285,6 +331,7 @@ def _prepare_asset_run(
             base_cfg,
             buy_rsi_values,
             profit_target_values,
+            rsi_entry_rule,
         ):
             rebuild_asset = True
 
@@ -319,6 +366,7 @@ def _process_asset_grid_for_db(
     rebuild: bool,
     phase_timings: WorkflowPhaseTimings | None = None,
     strategy_session: _WorkflowStrategySession | None = None,
+    rsi_entry_rule: str = "lower",
 ) -> None:
     # This transaction covers market-data synchronization, global benchmark
     # invalidation, and rebuilt state.  A second process waits here and then
@@ -360,17 +408,17 @@ def _process_asset_grid_for_db(
                 signal_history=signal_history,
                 authoritative_histories=authoritative_histories,
                 presynchronized_authoritative_symbols=(
-                    strategy_session.presynchronized_symbols(shared_histories)
-                    if strategy_session is not None
-                    else None
+                    strategy_session.presynchronized_symbols(shared_histories) if strategy_session is not None else None
                 ),
                 commit=False,
                 strategy_fingerprint=strategy_config_fingerprint(
                     base_cfg,
                     buy_rsi_values,
                     profit_target_values,
+                    rsi_entry_rule,
                 ),
                 grid_compute_observer=observe_grid_compute if phase_timings is not None else None,
+                rsi_entry_rule=rsi_entry_rule,
             )
         if strategy_session is not None:
             strategy_session.mark_synchronized(shared_histories)
@@ -385,6 +433,7 @@ def _build_reports_for_db(
     workflow_assets: pd.DataFrame,
     base_cfg: BacktestConfig,
     processed_asset_pairs: set[tuple[str, str]],
+    workflow_label: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     report_assets = workflow_assets[
         workflow_assets.apply(
@@ -411,7 +460,18 @@ def _build_reports_for_db(
             eligible_buy_signals = buy_signals[
                 ~buy_signals["Asset"].astype(str).str.upper().isin(active_managed_symbols)
             ].copy()
-        realized_pnl_summary = build_alpaca_realized_pnl_summary(conn)
+        realized_pnl_summary = build_alpaca_realized_pnl_summary(
+            conn,
+            include_workflow=workflow_label is not None,
+        )
+
+    if workflow_label is not None:
+        optimization_summary = _with_workflow_column(optimization_summary, workflow_label)
+        buy_signals = _with_workflow_column(buy_signals, workflow_label)
+        eligible_buy_signals = _with_workflow_column(eligible_buy_signals, workflow_label)
+        sell_signals = _with_workflow_column(sell_signals, workflow_label)
+        if not curves.empty:
+            curves = curves.rename(columns=lambda column: f"{workflow_label}_{column}")
 
     return optimization_summary, curves, buy_signals, eligible_buy_signals, sell_signals, realized_pnl_summary
 
@@ -447,6 +507,7 @@ async def _prepare_workflow_asset(
     job: AssetRunJob,
     buy_rsi_values: list[float],
     profit_target_values: list[float],
+    rsi_entry_rule: str = "lower",
     signal_locks: dict[str, asyncio.Lock],
     signal_histories: dict[str, pd.DataFrame],
     risk_free_history_lock: asyncio.Lock,
@@ -467,6 +528,7 @@ async def _prepare_workflow_asset(
             job.signal_symbol,
             buy_rsi_values,
             profit_target_values,
+            rsi_entry_rule,
         )
         action = plan.action
         if asset_progress is not None:
@@ -502,6 +564,7 @@ async def _prepare_workflow_asset(
                 rows_processed=0,
                 status="skipped",
                 message="No finalized daily market data is available yet.",
+                workflow=job.workflow,
             )
         asset_history = await _timed_run_blocking(
             phase_timings,
@@ -514,9 +577,7 @@ async def _prepare_workflow_asset(
             executor=download_executor,
         )
         if asset_history.empty:
-            raise RuntimeError(
-                f"No settled daily asset history is available for {job.asset_symbol}."
-            )
+            raise RuntimeError(f"No settled daily asset history is available for {job.asset_symbol}.")
         async with risk_free_history_lock:
             risk_free_history = risk_free_histories.get(RISK_FREE_SYMBOL)
             if risk_free_history is None:
@@ -547,9 +608,7 @@ async def _prepare_workflow_asset(
                     executor=download_executor,
                 )
                 if signal_history.empty:
-                    raise RuntimeError(
-                        f"No settled daily signal history is available for {job.signal_symbol}."
-                    )
+                    raise RuntimeError(f"No settled daily signal history is available for {job.signal_symbol}.")
                 signal_histories[job.signal_symbol] = signal_history
         return PreparedAssetRun(
             job=job,
@@ -574,6 +633,7 @@ async def _prepare_workflow_asset(
             rows_processed=None,
             status="skipped",
             message=str(exc),
+            workflow=job.workflow,
         )
 
 
@@ -584,6 +644,7 @@ async def _complete_workflow_asset(
     base_cfg: BacktestConfig,
     buy_rsi_values: list[float],
     profit_target_values: list[float],
+    rsi_entry_rule: str,
     asset_progress: AssetProgress | None = None,
     phase_timings: WorkflowPhaseTimings | None = None,
     strategy_executor: Executor | None = None,
@@ -610,6 +671,7 @@ async def _complete_workflow_asset(
                 outcome.plan.rebuild,
                 phase_timings,
                 strategy_session,
+                rsi_entry_rule,
             )
         except Exception as exc:
             if asset_progress is not None:
@@ -626,6 +688,7 @@ async def _complete_workflow_asset(
                 rows_processed=None,
                 status="skipped",
                 message=str(exc),
+                workflow=outcome.job.workflow,
             )
 
         return AssetRunResult(
@@ -636,6 +699,7 @@ async def _complete_workflow_asset(
             rows_processed=len(outcome.data),
             status="done",
             message=_processed_message(outcome.data, outcome.plan.start_label),
+            workflow=outcome.job.workflow,
         )
     finally:
         if asset_progress is not None:
@@ -654,6 +718,7 @@ async def _run_asset_pipeline(
     profit_target_values: list[float],
     asset_progress: AssetProgress | None,
     phase_timings: WorkflowPhaseTimings,
+    rsi_entry_rule: str = "lower",
 ) -> list[AssetRunResult]:
     if not jobs:
         return []
@@ -676,6 +741,7 @@ async def _run_asset_pipeline(
             job=job,
             buy_rsi_values=buy_rsi_values,
             profit_target_values=profit_target_values,
+            rsi_entry_rule=rsi_entry_rule,
             signal_locks=signal_locks,
             signal_histories=signal_histories,
             risk_free_history_lock=risk_free_history_lock,
@@ -695,6 +761,7 @@ async def _run_asset_pipeline(
             base_cfg=base_cfg,
             buy_rsi_values=buy_rsi_values,
             profit_target_values=profit_target_values,
+            rsi_entry_rule=rsi_entry_rule,
             asset_progress=asset_progress,
             phase_timings=phase_timings,
             strategy_executor=strategy_executor,
@@ -707,10 +774,7 @@ async def _run_asset_pipeline(
     ) as strategy_executor:
         try:
             if concurrency <= 1:
-                results = [
-                    await complete(await prepare(job), strategy_executor)
-                    for job in jobs
-                ]
+                results = [await complete(await prepare(job), strategy_executor) for job in jobs]
                 return sorted(results, key=lambda result: result.workflow_idx)
 
             worker_count = min(max(1, concurrency), len(jobs))
@@ -749,6 +813,59 @@ async def _run_asset_pipeline(
             await _run_blocking(strategy_executor, strategy_session.close)
 
 
+def _empty_workflow_assets(workflow_label: str) -> pd.DataFrame:
+    out = pd.DataFrame(columns=["symbol", "name", "rsi_symbol", "workflow"])
+    out.attrs["universe_title"] = f"Executable {workflow_label} Leveraged ETFs/ETNs From Merged Universe"
+    out.attrs["universe_counts"] = {}
+    return out
+
+
+def _normalize_workflow_asset_groups(
+    workflow_assets: dict[str, pd.DataFrame] | pd.DataFrame,
+) -> dict[str, pd.DataFrame]:
+    if isinstance(workflow_assets, pd.DataFrame):
+        return {
+            "long": workflow_assets,
+            "short": _empty_workflow_assets(SHORT_WORKFLOW_LABEL),
+        }
+    return {
+        "long": workflow_assets.get("long", _empty_workflow_assets(LONG_WORKFLOW_LABEL)),
+        "short": workflow_assets.get("short", _empty_workflow_assets(SHORT_WORKFLOW_LABEL)),
+    }
+
+
+def _workflow_jobs(
+    workflow_assets: pd.DataFrame,
+    *,
+    workflow_label: str | None = None,
+) -> list[AssetRunJob]:
+    return [
+        AssetRunJob(
+            workflow_idx=workflow_idx,
+            asset_symbol=str(workflow_asset.symbol),
+            signal_symbol=str(workflow_asset.rsi_symbol),
+            workflow=workflow_label,
+        )
+        for workflow_idx, workflow_asset in enumerate(
+            workflow_assets.itertuples(index=False),
+            start=1,
+        )
+    ]
+
+
+def _completed_asset_pairs(asset_run_results: list[AssetRunResult]) -> set[tuple[str, str]]:
+    return {(result.asset_symbol, result.signal_symbol) for result in asset_run_results if result.status == "done"}
+
+
+def _concat_report_frames(frames: list[pd.DataFrame], *, axis: int = 0) -> pd.DataFrame:
+    if not frames:
+        return pd.DataFrame()
+    if axis == 1:
+        non_empty = [frame for frame in frames if not frame.empty]
+        return pd.concat(non_empty, axis=1, join="outer", sort=False) if non_empty else pd.DataFrame()
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
 async def run_resumable_optimizations_async(
     mode: str,
     db_path: str,
@@ -762,8 +879,11 @@ async def run_resumable_optimizations_async(
     no_color: bool = False,
     reporter: WorkflowReporter | None = None,
     tradier_cfg: TradierMarketDataConfig | None = None,
+    short_buy_rsi_values: list[float] | None = None,
 ) -> None:
     _validate_optimization_grids(buy_rsi_values, profit_target_values)
+    short_buy_rsi_values = list(DEFAULT_SHORT_BUY_RSI_VALUES) if short_buy_rsi_values is None else short_buy_rsi_values
+    _validate_optimization_grids(short_buy_rsi_values, profit_target_values)
     concurrency = max(1, workflow_concurrency)
     universe_cfg = replace(universe_cfg, sqlite_db_path=db_path)
     reporter = reporter or WorkflowReporter(no_color=no_color)
@@ -779,10 +899,14 @@ async def run_resumable_optimizations_async(
 
     with reporter.status("Initializing workflow state"):
         await asyncio.to_thread(_initialize_state_db, db_path)
-    with reporter.status("Reconciling Alpaca positions and loading workflow assets"):
+    with reporter.step_progress(
+        "Reconciling Alpaca positions and loading workflow assets",
+        total=2,
+    ) as startup_progress:
         # Both steps write to the same SQLite database.  Keep startup writes
         # serialized: universe discovery performs replace-table writes while
         # reconciliation updates managed positions.
+        startup_progress.start_step("Reconciling Alpaca positions")
         reconciliation_results = await _timed_run_blocking(
             phase_timings,
             "alpaca",
@@ -790,68 +914,118 @@ async def run_resumable_optimizations_async(
             db_path,
             alpaca_cfg,
         )
-        workflow_assets = await asyncio.to_thread(
+        startup_progress.finish_step()
+        startup_progress.start_step("Loading workflow assets")
+        workflow_asset_groups = await asyncio.to_thread(
             _load_or_refresh_workflow_assets_for_db,
             db_path,
             universe_cfg,
         )
+        startup_progress.finish_step()
 
-    reporter.universe_assets(workflow_assets)
-
-    total_workflows = len(workflow_assets)
-    jobs = [
-        AssetRunJob(
-            workflow_idx=workflow_idx,
-            asset_symbol=str(workflow_asset.symbol),
-            signal_symbol=str(workflow_asset.rsi_symbol),
-        )
-        for workflow_idx, workflow_asset in enumerate(
-            workflow_assets.itertuples(index=False),
-            start=1,
-        )
+    workflow_asset_groups = _normalize_workflow_asset_groups(workflow_asset_groups)
+    workflow_specs = [
+        {
+            "key": "long",
+            "label": LONG_WORKFLOW_LABEL,
+            "rsi_entry_rule": "lower",
+            "buy_rsi_values": buy_rsi_values,
+            "assets": workflow_asset_groups["long"],
+        },
+        {
+            "key": "short",
+            "label": SHORT_WORKFLOW_LABEL,
+            "rsi_entry_rule": "upper",
+            "buy_rsi_values": short_buy_rsi_values,
+            "assets": workflow_asset_groups["short"],
+        },
     ]
-    with reporter.asset_progress(total_workflows) as asset_progress:
-        asset_run_results = await _run_asset_pipeline(
-            jobs=jobs,
-            concurrency=concurrency,
-            db_path=db_path,
-            mode=mode,
-            base_cfg=base_cfg,
-            tradier_cfg=tradier_cfg,
-            buy_rsi_values=buy_rsi_values,
-            profit_target_values=profit_target_values,
-            asset_progress=asset_progress,
-            phase_timings=phase_timings,
-        )
 
-    completed_runs = [result for result in asset_run_results if result.status == "done"]
-    if asset_run_results and not completed_runs:
-        details = "; ".join(
-            f"{result.asset_symbol}: {result.message}"
-            for result in asset_run_results
+    reporter.universe_assets(_combined_workflow_assets(workflow_asset_groups))
+
+    asset_run_results_by_side: dict[str, list[AssetRunResult]] = {}
+    all_asset_run_results: list[AssetRunResult] = []
+    for workflow_spec in workflow_specs:
+        workflow_key = str(workflow_spec["key"])
+        workflow_label = str(workflow_spec["label"])
+        workflow_assets = workflow_spec["assets"]
+        assert isinstance(workflow_assets, pd.DataFrame)
+        jobs = _workflow_jobs(workflow_assets, workflow_label=workflow_label)
+        if jobs:
+            with reporter.asset_progress(len(jobs), workflow_label=workflow_label) as asset_progress:
+                asset_run_results = await _run_asset_pipeline(
+                    jobs=jobs,
+                    concurrency=concurrency,
+                    db_path=db_path,
+                    mode=mode,
+                    base_cfg=base_cfg,
+                    tradier_cfg=tradier_cfg,
+                    buy_rsi_values=list(workflow_spec["buy_rsi_values"]),
+                    profit_target_values=profit_target_values,
+                    asset_progress=asset_progress,
+                    phase_timings=phase_timings,
+                    rsi_entry_rule=str(workflow_spec["rsi_entry_rule"]),
+                )
+        else:
+            asset_run_results = []
+        asset_run_results_by_side[workflow_key] = asset_run_results
+        all_asset_run_results.extend(asset_run_results)
+
+    completed_runs = [result for result in all_asset_run_results if result.status == "done"]
+    if not completed_runs:
+        details = (
+            "; ".join(f"{result.asset_symbol}: {result.message}" for result in all_asset_run_results)
+            if all_asset_run_results
+            else "No executable assets were run."
         )
         raise WorkflowRunError(f"No asset workflows completed successfully. {details}")
 
     with reporter.status("Building workflow reports"):
-        processed_asset_pairs = {
-            (result.asset_symbol, result.signal_symbol) for result in completed_runs
-        }
-        (
-            optimization_summary,
-            curves,
-            buy_signals,
-            eligible_buy_signals,
-            sell_signals,
-            realized_pnl_summary,
-        ) = await _timed_run_blocking(
-            phase_timings,
-            "report_generation",
-            _build_reports_for_db,
-            db_path,
-            workflow_assets,
-            base_cfg,
-            processed_asset_pairs,
-        )
+        side_outputs: list[WorkflowSideOutput] = []
+        realized_pnl_summary = pd.DataFrame()
+        for workflow_spec in workflow_specs:
+            workflow_key = str(workflow_spec["key"])
+            workflow_label = str(workflow_spec["label"])
+            workflow_assets = workflow_spec["assets"]
+            assert isinstance(workflow_assets, pd.DataFrame)
+            side_asset_run_results = asset_run_results_by_side.get(workflow_key, [])
+            (
+                side_optimization_summary,
+                side_curves,
+                side_buy_signals,
+                side_eligible_buy_signals,
+                side_sell_signals,
+                realized_pnl_summary,
+            ) = await _timed_run_blocking(
+                phase_timings,
+                "report_generation",
+                _build_reports_for_db,
+                db_path,
+                workflow_assets,
+                base_cfg,
+                _completed_asset_pairs(side_asset_run_results),
+                workflow_label,
+            )
+            side_outputs.append(
+                WorkflowSideOutput(
+                    label=workflow_label,
+                    universe_assets=workflow_assets,
+                    buy_rsi_values=list(workflow_spec["buy_rsi_values"]),
+                    rsi_entry_rule=str(workflow_spec["rsi_entry_rule"]),
+                    asset_run_results=side_asset_run_results,
+                    optimization_summary=side_optimization_summary,
+                    curves=side_curves,
+                    buy_signals=side_buy_signals,
+                    eligible_buy_signals=side_eligible_buy_signals,
+                    sell_signals=side_sell_signals,
+                )
+            )
+
+        optimization_summary = _concat_report_frames([side.optimization_summary for side in side_outputs])
+        curves = _concat_report_frames([side.curves for side in side_outputs], axis=1)
+        buy_signals = _concat_report_frames([side.buy_signals for side in side_outputs])
+        eligible_buy_signals = _concat_report_frames([side.eligible_buy_signals for side in side_outputs])
+        sell_signals = _concat_report_frames([side.sell_signals for side in side_outputs])
     with reporter.status("Preparing Alpaca order results"):
         order_results = await _timed_run_blocking(
             phase_timings,
@@ -893,7 +1067,7 @@ async def run_resumable_optimizations_async(
         output_dir=output_dir,
         workflow_concurrency=concurrency,
         reporter=reporter,
-        asset_run_results=asset_run_results,
+        asset_run_results=all_asset_run_results,
         optimization_summary=optimization_summary,
         curves=curves,
         buy_signals=buy_signals,
@@ -906,6 +1080,8 @@ async def run_resumable_optimizations_async(
         order_results=order_results,
         workflow_timer=workflow_timer,
         phase_timings=phase_timings,
+        workflow_side_outputs=side_outputs,
+        short_buy_rsi_values=short_buy_rsi_values,
     )
 
 
@@ -922,6 +1098,7 @@ def run_resumable_optimizations(
     no_color: bool = False,
     reporter: WorkflowReporter | None = None,
     tradier_cfg: TradierMarketDataConfig | None = None,
+    short_buy_rsi_values: list[float] | None = None,
 ) -> None:
     asyncio.run(
         run_resumable_optimizations_async(
@@ -937,6 +1114,7 @@ def run_resumable_optimizations(
             no_color=no_color,
             reporter=reporter,
             tradier_cfg=tradier_cfg,
+            short_buy_rsi_values=short_buy_rsi_values,
         )
     )
 
@@ -965,6 +1143,8 @@ def _write_workflow_outputs(
     order_results: pd.DataFrame,
     workflow_timer: WorkflowTimer,
     phase_timings: WorkflowPhaseTimings | None = None,
+    workflow_side_outputs: list[WorkflowSideOutput] | None = None,
+    short_buy_rsi_values: list[float] | None = None,
 ) -> None:
     report_output_started = time.perf_counter()
     terminal_order_results, terminal_reconciliation_results = _terminal_alpaca_display_results(
@@ -978,10 +1158,22 @@ def _write_workflow_outputs(
         workflow_concurrency=workflow_concurrency,
         risk_free_symbol=RISK_FREE_SYMBOL,
         buy_rsi_values=buy_rsi_values,
+        short_buy_rsi_values=short_buy_rsi_values,
         profit_target_values=profit_target_values,
     )
-    reporter.asset_run_summary([result.as_output_row() for result in asset_run_results])
-    reporter.optimization_summary(optimization_summary)
+    if workflow_side_outputs:
+        for side_output in workflow_side_outputs:
+            reporter.asset_run_summary(
+                [result.as_output_row(workflow=side_output.label) for result in side_output.asset_run_results],
+                title=f"{side_output.label} Asset Run Summary",
+            )
+            reporter.optimization_summary(
+                side_output.optimization_summary.drop(columns="Workflow", errors="ignore"),
+                title=f"Best Sharpe Parameters By Asset — {side_output.label}",
+            )
+    else:
+        reporter.asset_run_summary([result.as_output_row() for result in asset_run_results])
+        reporter.optimization_summary(optimization_summary.drop(columns="Workflow", errors="ignore"))
     reporter.signal_report(
         "Buy Signals For Next Open",
         buy_signals,
@@ -1032,9 +1224,9 @@ def _terminal_alpaca_display_results(
             display_order_results["Client Order ID"].astype(str).map(display_id_by_buy_client_order_id)
         )
     if display_id_by_position and "Position ID" in display_reconciliation_results.columns:
-        display_reconciliation_results["Display ID"] = (
-            pd.to_numeric(display_reconciliation_results["Position ID"], errors="coerce").map(display_id_by_position)
-        )
+        display_reconciliation_results["Display ID"] = pd.to_numeric(
+            display_reconciliation_results["Position ID"], errors="coerce"
+        ).map(display_id_by_position)
     return display_order_results, display_reconciliation_results
 
 
@@ -1051,8 +1243,7 @@ def _managed_position_display_id_maps(managed_positions: pd.DataFrame) -> tuple[
     managed["id"] = managed["id"].astype(int)
     managed = managed.sort_values("id", kind="stable")
     display_id_by_position = {
-        position_id: display_id
-        for display_id, position_id in enumerate(managed["id"].tolist(), start=1)
+        position_id: display_id for display_id, position_id in enumerate(managed["id"].tolist(), start=1)
     }
     position_id_by_buy_client_order_id = {
         str(row["buy_client_order_id"]): int(row["id"])

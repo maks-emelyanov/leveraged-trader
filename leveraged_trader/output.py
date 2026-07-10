@@ -19,7 +19,9 @@ DEFAULT_NON_TERMINAL_WIDTH = 156
 
 UNIVERSE_SUMMARY_COUNT_LABELS = (
     "Current long leveraged ETFs/ETNs found",
+    "Current short leveraged ETFs/ETNs found",
     "Executable long leveraged ETFs/ETNs selected",
+    "Executable short leveraged ETFs/ETNs selected",
     "RSI mappings needing review",
 )
 UNIVERSE_SUMMARY_NONZERO_COUNT_LABELS = (
@@ -92,9 +94,7 @@ MESSAGE_ALIASES = {
     ): "Managed GTC sell expires soon; cancellation requested",
     "managed limit sell submission is disabled": "Managed limit sell submission is disabled",
     "managed target sell filled; position closed": "Managed target sell filled; position closed",
-    "open sell order already exists for symbol in Alpaca account": (
-        "Open sell order already exists in Alpaca account"
-    ),
+    "open sell order already exists for symbol in Alpaca account": ("Open sell order already exists in Alpaca account"),
     "prior managed GTC sell expired; submitted replacement at frozen target price": (
         "Expired managed GTC sell renewed at frozen target price"
     ),
@@ -104,9 +104,7 @@ MESSAGE_ALIASES = {
     "renewed managed GTC limit sell before Alpaca aged-order expiration": (
         "Renewed managed GTC sell before expiration"
     ),
-    "submitted one-time GTC limit sell at frozen target price": (
-        "Submitted GTC limit sell at frozen target price"
-    ),
+    "submitted one-time GTC limit sell at frozen target price": ("Submitted GTC limit sell at frozen target price"),
     "submitted managed GTC limit sell at frozen target price": "Submitted GTC limit sell at frozen target price",
     "symbol already has an active managed Alpaca position": "Symbol already has an active managed Alpaca position",
 }
@@ -149,6 +147,20 @@ class AssetProgress:
         self._progress.update(self._task_id, advance=1)
 
 
+class WorkflowStepProgress:
+    def __init__(self, progress: Progress | None = None, task_id: int | None = None) -> None:
+        self._progress = progress
+        self._task_id = task_id
+
+    def start_step(self, status: str) -> None:
+        if self._progress is not None and self._task_id is not None:
+            self._progress.update(self._task_id, status=status)
+
+    def finish_step(self) -> None:
+        if self._progress is not None and self._task_id is not None:
+            self._progress.update(self._task_id, advance=1)
+
+
 class WorkflowReporter:
     def __init__(self, *, console: Console | None = None, no_color: bool = False) -> None:
         self.console = console or _default_console(no_color=no_color)
@@ -163,7 +175,17 @@ class WorkflowReporter:
             yield
 
     @contextmanager
-    def asset_progress(self, total: int) -> Iterator[AssetProgress]:
+    def step_progress(
+        self,
+        message: str,
+        *,
+        total: int,
+    ) -> Iterator[WorkflowStepProgress]:
+        if not self.console.is_terminal:
+            self.console.print(Text(message, style="dim"))
+            yield WorkflowStepProgress()
+            return
+
         progress = Progress(
             SpinnerColumn(style="cyan"),
             TextColumn("[bold blue]{task.description}"),
@@ -176,7 +198,25 @@ class WorkflowReporter:
             transient=True,
         )
         with progress:
-            task_id = progress.add_task("Processing assets", total=total, status="")
+            task_id = progress.add_task("Preparing workflow", total=total, status="")
+            yield WorkflowStepProgress(progress, task_id)
+
+    @contextmanager
+    def asset_progress(self, total: int, *, workflow_label: str | None = None) -> Iterator[AssetProgress]:
+        progress = Progress(
+            SpinnerColumn(style="cyan"),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TextColumn("{task.fields[status]}", table_column=Column(ratio=1, overflow="fold")),
+            console=self.console,
+            expand=True,
+            transient=True,
+        )
+        with progress:
+            description = f"Processing {workflow_label} Assets" if workflow_label else "Processing Assets"
+            task_id = progress.add_task(description, total=total, status="")
             yield AssetProgress(progress, task_id)
 
     def section(self, title: str) -> None:
@@ -220,6 +260,7 @@ class WorkflowReporter:
         workflow_concurrency: int,
         risk_free_symbol: str,
         buy_rsi_values: list[float],
+        short_buy_rsi_values: list[float] | None = None,
         profit_target_values: list[float],
     ) -> None:
         self.section("Grid Search Settings")
@@ -228,7 +269,14 @@ class WorkflowReporter:
         table.add_column(ratio=1)
         table.add_row("Start date", "Earliest overlapping history for each leveraged asset and RSI symbol")
         table.add_row("Sharpe benchmark", f"{risk_free_symbol} 13-week U.S. Treasury bill")
-        table.add_row("Buy RSI values", _grid_range_label(buy_rsi_values, places=0, step_label="1"))
+        if short_buy_rsi_values is None:
+            table.add_row("Buy RSI values", _grid_range_label(buy_rsi_values, places=0, step_label="1"))
+        else:
+            table.add_row("Long buy RSI values", _grid_range_label(buy_rsi_values, places=0, step_label="1"))
+            table.add_row(
+                "Short buy RSI values",
+                _grid_range_label(short_buy_rsi_values, places=0, step_label="1"),
+            )
         table.add_row(
             "Sell return multiples",
             _grid_range_label(profit_target_values, places=1, step_label="0.1"),
@@ -322,6 +370,7 @@ class WorkflowReporter:
                 "RSI Mappings Needing Review",
                 mapping_review,
                 [
+                    TableColumn("workflow", "Workflow", no_wrap=True),
                     TableColumn("symbol", "Asset", no_wrap=True),
                     TableColumn("name", "Name", ratio=1, min_width=26),
                     TableColumn("rsi_symbol", "RSI", no_wrap=True),
@@ -333,13 +382,15 @@ class WorkflowReporter:
             )
 
         if df.empty:
-            self.console.print(Text("No long leveraged ETFs found.", style="dim"))
+            self.console.print(Text("No leveraged ETFs/ETNs found for this workflow.", style="dim"))
             return
 
+        display_df = df.sort_values("symbol", kind="stable").reset_index(drop=True)
         self.console.print(
             self._table(
-                df,
+                display_df,
                 [
+                    TableColumn("workflow", "Workflow", no_wrap=True),
                     TableColumn("symbol", "Asset", no_wrap=True),
                     TableColumn("name", "Name", ratio=1, min_width=30),
                     TableColumn("rsi_symbol", "RSI", no_wrap=True),
@@ -348,12 +399,12 @@ class WorkflowReporter:
             )
         )
 
-    def asset_run_summary(self, rows: Iterable[Mapping[str, Any]]) -> None:
+    def asset_run_summary(self, rows: Iterable[Mapping[str, Any]], *, title: str = "Asset Run Summary") -> None:
         df = pd.DataFrame(rows)
-        if not df.empty:
-            df = df.sort_values("Workflow #")
+        if not df.empty and "Asset" in df.columns:
+            df = df.sort_values("Asset", kind="stable").reset_index(drop=True)
         self.dataframe(
-            "Asset Run Summary",
+            title,
             df,
             [
                 TableColumn("Workflow #", "#", justify="right", no_wrap=True),
@@ -367,7 +418,7 @@ class WorkflowReporter:
             empty_message="No asset workflows were run.",
         )
 
-    def optimization_summary(self, df: pd.DataFrame) -> None:
+    def optimization_summary(self, df: pd.DataFrame, *, title: str = "Best Sharpe Parameters By Asset") -> None:
         display_df = df.drop(columns=["End Date", "Annualized Vol", "Hit Rate"], errors="ignore")
         if "Trades Executed" in display_df.columns:
             trades = pd.to_numeric(display_df["Trades Executed"], errors="coerce").fillna(0)
@@ -380,7 +431,7 @@ class WorkflowReporter:
         if "Sharpe" in display_df.columns:
             display_df = display_df[pd.to_numeric(display_df["Sharpe"], errors="coerce").ge(1.0)]
         self.dataframe(
-            "Best Sharpe Parameters By Asset",
+            title,
             display_df,
             [
                 TableColumn("Asset", no_wrap=True),
@@ -413,6 +464,7 @@ class WorkflowReporter:
 
     def signal_report(self, title: str, df: pd.DataFrame, *, empty_message: str) -> None:
         columns = [
+            TableColumn("Workflow", no_wrap=True),
             TableColumn("Asset", no_wrap=True),
             TableColumn("RSI Symbol", "RSI", no_wrap=True),
             TableColumn("Date", no_wrap=True),
@@ -433,11 +485,7 @@ class WorkflowReporter:
             TableColumn("Pending Action", "Action", no_wrap=True),
         ]
         if self.console.width < 120:
-            columns = [
-                column
-                for column in columns
-                if column.source not in {"Start Date", "Latest RSI"}
-            ]
+            columns = [column for column in columns if column.source not in {"Start Date", "Latest RSI"}]
         self.dataframe(
             title,
             df,
@@ -461,9 +509,7 @@ class WorkflowReporter:
         if not order_results.empty and "Status" in order_results:
             statuses = order_results["Status"].astype(str).str.lower()
             submitted_or_existing = int(statuses.isin({"submitted", "existing"}).sum())
-            live_preflight_skips = int(
-                (~statuses.isin({"submitted", "existing", "managed"})).sum()
-            )
+            live_preflight_skips = int((~statuses.isin({"submitted", "existing", "managed"})).sum())
 
         table = Table.grid(padding=(0, 2))
         table.add_column(style="bold", no_wrap=True)
@@ -483,6 +529,7 @@ class WorkflowReporter:
             columns.append(TableColumn("Display ID", "ID", justify="right", formatter=format_int, no_wrap=True))
         columns.extend(
             [
+                TableColumn("Workflow", no_wrap=True),
                 TableColumn("Asset", no_wrap=True),
                 TableColumn("Date", no_wrap=True),
                 TableColumn("Notional", justify="right", formatter=format_decimal_2, no_wrap=True),
@@ -507,6 +554,7 @@ class WorkflowReporter:
             df,
             [
                 TableColumn(id_column, "ID", justify="right", formatter=format_int, no_wrap=True),
+                TableColumn("Workflow", no_wrap=True),
                 TableColumn("Asset", no_wrap=True),
                 TableColumn("Action", no_wrap=True),
                 TableColumn("Status", status=True, no_wrap=True),

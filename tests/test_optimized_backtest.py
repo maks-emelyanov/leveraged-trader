@@ -4,7 +4,13 @@ import unittest
 
 import numpy as np
 
-from leveraged_trader.optimized_backtest import ACTION_BUY, ACTION_NONE, run_grid_summary, run_single_equity_curve
+from leveraged_trader.optimized_backtest import (
+    ACTION_BUY,
+    ACTION_NONE,
+    RSI_ENTRY_UPPER,
+    run_grid_summary,
+    run_single_equity_curve,
+)
 
 
 class OptimizedBacktestTests(unittest.TestCase):
@@ -40,6 +46,33 @@ class OptimizedBacktestTests(unittest.TestCase):
         self.assertEqual(result[6].tolist(), [0, 0])
         self.assertEqual(result[11], ACTION_BUY)
         self.assertEqual(result[-1], 0)
+
+    def test_upper_rsi_entry_rule_buys_only_on_high_rsi(self) -> None:
+        lower_result = run_single_equity_curve(
+            open_prices=np.array([100.0, 100.0]),
+            close_prices=np.array([100.0, 100.0]),
+            rsi_values=np.array([80.0, 80.0]),
+            risk_free_returns=np.array([0.0, 0.0]),
+            buy_rsi=70.0,
+            profit_target_multiple=2.0,
+            initial_capital=100_000.0,
+            trading_cost_rate=0.0003,
+        )
+        upper_result = run_single_equity_curve(
+            open_prices=np.array([100.0, 100.0]),
+            close_prices=np.array([100.0, 100.0]),
+            rsi_values=np.array([80.0, 80.0]),
+            risk_free_returns=np.array([0.0, 0.0]),
+            buy_rsi=70.0,
+            profit_target_multiple=2.0,
+            initial_capital=100_000.0,
+            trading_cost_rate=0.0003,
+            rsi_entry_rule=RSI_ENTRY_UPPER,
+        )
+
+        self.assertEqual(lower_result[5].tolist(), [ACTION_NONE, ACTION_NONE])
+        self.assertEqual(upper_result[5].tolist(), [ACTION_BUY, ACTION_NONE])
+        self.assertEqual(upper_result[-1], 1)
 
     def test_grid_summary_matches_single_curve_accounting(self) -> None:
         open_prices = np.array([100.0, 100.0, 105.0])

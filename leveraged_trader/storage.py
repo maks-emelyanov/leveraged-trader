@@ -18,6 +18,8 @@ from .optimized_backtest import (
     ACTION_BUY,
     ACTION_NONE,
     ACTION_SELL,
+    RSI_ENTRY_LOWER,
+    RSI_ENTRY_UPPER,
     run_grid_summary,
     run_single_equity_curve,
 )
@@ -36,6 +38,7 @@ SUMMARY_ROLLUP_COLUMNS = {
 }
 
 ALPACA_MANAGED_POSITION_COLUMNS = {
+    "workflow": "TEXT",
     "buy_submission_claimed_at": "TEXT",
     "buy_submission_attempt_count": "INTEGER NOT NULL DEFAULT 1",
     "sell_expires_at": "TEXT",
@@ -51,7 +54,11 @@ ALPACA_MANAGED_POSITION_COLUMNS = {
     "remaining_qty": "REAL",
 }
 
-STRATEGY_STATE_SCHEMA_VERSION = 2
+STRATEGY_STATE_SCHEMA_VERSION = 3
+RSI_ENTRY_RULE_LABELS = {
+    "lower": RSI_ENTRY_LOWER,
+    "upper": RSI_ENTRY_UPPER,
+}
 _MARKET_DATA_FIELDS = ("Open", "High", "Low", "Close", "Volume")
 SQLITE_BUSY_TIMEOUT_MS = 60_000
 
@@ -189,6 +196,7 @@ def init_state_db(conn: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS alpaca_managed_positions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow TEXT,
             symbol TEXT NOT NULL,
             signal_symbol TEXT NOT NULL,
             buy_rsi REAL NOT NULL,
@@ -263,14 +271,25 @@ def _date_str(value: object) -> str:
     return pd.Timestamp(value).date().isoformat()
 
 
+def rsi_entry_rule_code(entry_rule: str) -> int:
+    try:
+        return RSI_ENTRY_RULE_LABELS[entry_rule]
+    except KeyError as exc:
+        supported = ", ".join(sorted(RSI_ENTRY_RULE_LABELS))
+        raise ValueError(f"Unsupported RSI entry rule {entry_rule!r}; expected one of: {supported}.") from exc
+
+
 def strategy_config_fingerprint(
     base_cfg: BacktestConfig,
     buy_rsi_values: list[float],
     profit_target_values: list[float],
+    rsi_entry_rule: str = "lower",
 ) -> str:
     """Return a stable identity for every setting that changes a simulation."""
+    rsi_entry_rule_code(rsi_entry_rule)
     payload = {
         "schema_version": STRATEGY_STATE_SCHEMA_VERSION,
+        "rsi_entry_rule": rsi_entry_rule,
         "backtest": asdict(base_cfg),
         "buy_rsi_values": sorted({float(value) for value in buy_rsi_values}),
         "profit_target_values": sorted({float(value) for value in profit_target_values}),
@@ -297,13 +316,19 @@ def strategy_state_matches_config(
     base_cfg: BacktestConfig,
     buy_rsi_values: list[float],
     profit_target_values: list[float],
+    rsi_entry_rule: str = "lower",
 ) -> bool:
     """Whether persisted state exactly matches the requested simulation setup."""
     expected_pairs = _strategy_config_pairs(buy_rsi_values, profit_target_values)
     if not expected_pairs:
         return False
 
-    fingerprint = strategy_config_fingerprint(base_cfg, buy_rsi_values, profit_target_values)
+    fingerprint = strategy_config_fingerprint(
+        base_cfg,
+        buy_rsi_values,
+        profit_target_values,
+        rsi_entry_rule,
+    )
     if not strategy_config_matches_fingerprint(conn, asset_symbol, signal_symbol, fingerprint):
         return False
 
@@ -784,6 +809,7 @@ def save_strategy_states(conn: sqlite3.Connection, rows: list[tuple]) -> None:
 def save_alpaca_managed_buy_order(
     conn: sqlite3.Connection,
     *,
+    workflow: str | None = None,
     symbol: str,
     signal_symbol: str,
     buy_rsi: float,
@@ -804,11 +830,12 @@ def save_alpaca_managed_buy_order(
     conn.execute(
         """
         INSERT INTO alpaca_managed_positions
-        (symbol, signal_symbol, buy_rsi, profit_target_multiple, buy_signal_date,
+        (workflow, symbol, signal_symbol, buy_rsi, profit_target_multiple, buy_signal_date,
          buy_client_order_id, buy_alpaca_order_id, buy_submitted_at,
          buy_submission_claimed_at, buy_status, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
         ON CONFLICT(buy_client_order_id) DO UPDATE SET
+            workflow = COALESCE(excluded.workflow, workflow),
             buy_alpaca_order_id = COALESCE(excluded.buy_alpaca_order_id, buy_alpaca_order_id),
             buy_submitted_at = COALESCE(excluded.buy_submitted_at, buy_submitted_at),
             buy_status = excluded.buy_status,
@@ -823,6 +850,7 @@ def save_alpaca_managed_buy_order(
             updated_at = CURRENT_TIMESTAMP
         """,
         (
+            workflow,
             symbol,
             signal_symbol,
             buy_rsi,
@@ -848,6 +876,7 @@ def save_alpaca_managed_buy_order(
 def claim_alpaca_managed_buy_intent(
     conn: sqlite3.Connection,
     *,
+    workflow: str | None = None,
     symbol: str,
     signal_symbol: str,
     buy_rsi: float,
@@ -867,12 +896,13 @@ def claim_alpaca_managed_buy_intent(
     cursor = conn.execute(
         """
         INSERT INTO alpaca_managed_positions
-        (symbol, signal_symbol, buy_rsi, profit_target_multiple, buy_signal_date,
+        (workflow, symbol, signal_symbol, buy_rsi, profit_target_multiple, buy_signal_date,
          buy_client_order_id, buy_submission_claimed_at, buy_status, notes)
-        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'submission_pending', ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'submission_pending', ?)
         ON CONFLICT(buy_client_order_id) DO NOTHING
         """,
         (
+            workflow,
             symbol,
             signal_symbol,
             buy_rsi,
@@ -887,7 +917,8 @@ def claim_alpaca_managed_buy_intent(
         retry_cursor = conn.execute(
             """
             UPDATE alpaca_managed_positions
-            SET buy_status = 'submission_pending',
+            SET workflow = COALESCE(?, workflow),
+                buy_status = 'submission_pending',
                 buy_submission_claimed_at = CURRENT_TIMESTAMP,
                 buy_submission_attempt_count = buy_submission_attempt_count + 1,
                 closed_at = NULL,
@@ -900,7 +931,7 @@ def claim_alpaca_managed_buy_intent(
               AND sell_client_order_id IS NULL
               AND closed_at IS NOT NULL
             """,
-            (buy_client_order_id,),
+            (workflow, buy_client_order_id),
         )
         claimed = retry_cursor.rowcount == 1
     conn.commit()
@@ -942,7 +973,7 @@ def load_alpaca_managed_positions(conn: sqlite3.Connection, *, active_only: bool
     where = "WHERE closed_at IS NULL" if active_only else ""
     return pd.read_sql_query(
         f"""
-        SELECT id, symbol, signal_symbol, buy_rsi, profit_target_multiple,
+        SELECT id, workflow, symbol, signal_symbol, buy_rsi, profit_target_multiple,
                buy_signal_date, buy_client_order_id, buy_alpaca_order_id,
                buy_submitted_at, buy_submission_claimed_at, buy_submission_attempt_count,
                buy_status, filled_qty, filled_avg_price,
@@ -2021,6 +2052,7 @@ def _replace_best_equity_curve(
     signal_symbol: str,
     buy_rsi: float,
     profit_target_multiple: float,
+    rsi_entry_rule: str,
 ) -> None:
     full_data = load_saved_market_data(
         conn,
@@ -2065,6 +2097,7 @@ def _replace_best_equity_curve(
         profit_target_multiple,
         base_cfg.initial_capital,
         _trading_cost_rate(base_cfg),
+        rsi_entry_rule_code(rsi_entry_rule),
     )
     date_strings = [_date_str(date) for date in full_data.index]
     state = {
@@ -2122,13 +2155,16 @@ def process_asset_grid(
     presynchronized_authoritative_symbols: set[str] | None = None,
     commit: bool = True,
     grid_compute_observer: Callable[[float], None] | None = None,
+    rsi_entry_rule: str = "lower",
 ) -> None:
+    rsi_entry_rule_value = rsi_entry_rule_code(rsi_entry_rule)
     symbols = list(dict.fromkeys([asset_symbol, signal_symbol, RISK_FREE_SYMBOL]))
     expected_state_generation = strategy_state_generation(conn)
     strategy_fingerprint = strategy_fingerprint or strategy_config_fingerprint(
         base_cfg,
         buy_rsi_values,
         profit_target_values,
+        rsi_entry_rule,
     )
     config_is_current = strategy_config_matches_fingerprint(
         conn,
@@ -2379,6 +2415,7 @@ def process_asset_grid(
             positive_return_count_values,
             max_drawdown_values,
             _trading_cost_rate(base_cfg),
+            rsi_entry_rule_value,
         )
     finally:
         if grid_compute_observer is not None:
@@ -2459,6 +2496,7 @@ def process_asset_grid(
                 signal_symbol,
                 best_buy_rsi,
                 best_profit_target_multiple,
+                rsi_entry_rule,
             )
         prune_non_best_equity_records(
             conn,

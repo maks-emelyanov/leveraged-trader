@@ -233,6 +233,7 @@ def main() -> None:
         timeout_seconds=args.tradier_timeout_seconds,
     )
     buy_rsi_values = list(range(20, 51))
+    short_buy_rsi_values = list(range(50, 81))
     profit_target_values = [round(x, 2) for x in np.arange(1.1, 5.05, 0.1)]
 
     run_resumable_optimizations(
@@ -247,4 +248,5 @@ def main() -> None:
         workflow_concurrency=args.workflow_concurrency,
         no_color=args.no_color,
         tradier_cfg=tradier_cfg,
+        short_buy_rsi_values=short_buy_rsi_values,
     )

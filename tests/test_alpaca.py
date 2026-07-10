@@ -98,6 +98,58 @@ class AlpacaTests(unittest.TestCase):
         self.assertEqual(mock_post.call_args.kwargs["json"]["limit_price"], "105")
         self.assertFalse(mock_post.call_args.kwargs["json"]["extended_hours"])
 
+    @patch("leveraged_trader.alpaca._latest_market_price")
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_buy_order_preserves_workflow_side_in_results_and_managed_position(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+        mock_latest_market_price: Mock,
+    ) -> None:
+        mock_get.side_effect = [
+            response(404, {}),
+            response(200, []),
+            response(404, {}),
+            response(200, {"symbol": "SQQQ", "status": "active", "tradable": True}),
+            response(
+                200,
+                {"is_open": False, "timestamp": "2026-01-05T13:30:00Z", "next_open": "2026-01-05T14:30:00Z"},
+            ),
+            response(200, [{"date": "2026-01-02"}, {"date": "2026-01-05"}]),
+            response(200, {"cash": "3000"}),
+        ]
+        mock_latest_market_price.return_value = 100.0
+        mock_post.return_value = response(
+            200,
+            {"id": "order-short-1", "status": "accepted", "submitted_at": "2026-01-05T13:31:00Z"},
+        )
+
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            result = submit_alpaca_paper_buy_orders(
+                pd.DataFrame(
+                    [
+                        {
+                            "Workflow": "Short",
+                            "Asset": "SQQQ",
+                            "RSI Symbol": "QQQ",
+                            "Date": "2026-01-02",
+                            "Buy RSI": 70.0,
+                            "Sell Return Multiple": 1.5,
+                        }
+                    ]
+                ),
+                self.cfg(buy=True),
+                conn=conn,
+            )
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Workflow"], "Short")
+        self.assertEqual(result.loc[0, "Status"], "submitted")
+        self.assertEqual(managed.loc[0, "workflow"], "Short")
+        self.assertEqual(managed.loc[0, "symbol"], "SQQQ")
+
     def test_dynamic_batch_cash_fraction_scales_with_eligible_signal_count(self) -> None:
         self.assertEqual(_alpaca_dynamic_batch_cash_fraction(1), 0.05)
         self.assertEqual(_alpaca_dynamic_batch_cash_fraction(2), 0.10)

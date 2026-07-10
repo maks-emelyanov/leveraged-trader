@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import unittest
 from datetime import UTC, datetime
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import pandas as pd
 from rich.console import Console
@@ -12,6 +12,56 @@ from leveraged_trader.output import DEFAULT_NON_TERMINAL_WIDTH, TableColumn, Wor
 
 
 class OutputTests(unittest.TestCase):
+    def test_asset_progress_includes_workflow_label(self) -> None:
+        console = Console(file=io.StringIO(), force_terminal=True, color_system=None, no_color=True)
+
+        with patch("leveraged_trader.output.Progress") as mock_progress_type:
+            progress = mock_progress_type.return_value
+            progress.add_task.return_value = 7
+            reporter = WorkflowReporter(console=console)
+
+            with reporter.asset_progress(1, workflow_label="Short") as asset_progress:
+                asset_progress.finish_asset()
+
+        progress.add_task.assert_called_once_with("Processing Short Assets", total=1, status="")
+        progress.update.assert_called_once_with(7, advance=1)
+
+    def test_step_progress_tracks_terminal_workflow_steps(self) -> None:
+        console = Console(file=io.StringIO(), force_terminal=True, color_system=None, no_color=True)
+
+        with patch("leveraged_trader.output.Progress") as mock_progress_type:
+            progress = mock_progress_type.return_value
+            progress.add_task.return_value = 7
+            reporter = WorkflowReporter(console=console)
+
+            with reporter.step_progress("Preparing startup", total=2) as step_progress:
+                step_progress.start_step("Reconciling Alpaca positions")
+                step_progress.finish_step()
+                step_progress.start_step("Loading workflow assets")
+                step_progress.finish_step()
+
+        progress.add_task.assert_called_once_with("Preparing workflow", total=2, status="")
+        progress.update.assert_has_calls(
+            [
+                call(7, status="Reconciling Alpaca positions"),
+                call(7, advance=1),
+                call(7, status="Loading workflow assets"),
+                call(7, advance=1),
+            ]
+        )
+
+    def test_step_progress_keeps_non_terminal_status_message(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+
+        with reporter.step_progress("Reconciling Alpaca positions and loading workflow assets", total=2):
+            pass
+
+        self.assertIn(
+            "Reconciling Alpaca positions and loading workflow assets",
+            console.export_text(styles=False),
+        )
+
     def test_default_reporter_uses_wide_width_for_non_terminal_output(self) -> None:
         output_buffer = io.StringIO()
         created_consoles: list[Console] = []
@@ -156,14 +206,15 @@ class OutputTests(unittest.TestCase):
         for line in output.splitlines():
             self.assertLessEqual(len(line), 80)
 
-    def test_asset_run_summary_sorts_by_workflow_index(self) -> None:
+    def test_asset_run_summary_sorts_by_asset_and_uses_custom_title(self) -> None:
         console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)
         reporter = WorkflowReporter(console=console)
 
         reporter.asset_run_summary(
             [
                 {
-                    "Workflow #": 2,
+                    "Workflow #": 1,
+                    "Workflow": "Long",
                     "Asset": "BBB",
                     "RSI Symbol": "BBB",
                     "Action": "Updating",
@@ -172,7 +223,8 @@ class OutputTests(unittest.TestCase):
                     "Message": "Processed 20 rows",
                 },
                 {
-                    "Workflow #": 1,
+                    "Workflow #": 2,
+                    "Workflow": "Long",
                     "Asset": "AAA",
                     "RSI Symbol": "AAA",
                     "Action": "Updating",
@@ -180,10 +232,13 @@ class OutputTests(unittest.TestCase):
                     "Status": "done",
                     "Message": "Processed 10 rows",
                 },
-            ]
+            ],
+            title="Long Asset Run Summary",
         )
         output = console.export_text(styles=False)
 
+        self.assertIn("Long Asset Run Summary", output)
+        self.assertNotIn("Workflow", output)
         self.assertLess(output.index("AAA"), output.index("BBB"))
 
     def test_universe_assets_renders_as_rich_table(self) -> None:
@@ -250,6 +305,24 @@ class OutputTests(unittest.TestCase):
         self.assertIn("A074", output)
         self.assertIn("A075", output)
         self.assertNotIn("Showing 75 of 76 rows", output)
+
+    def test_universe_assets_sorts_all_workflows_by_asset_symbol(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=120, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+        universe = pd.DataFrame(
+            [
+                {"workflow": "Long", "symbol": "XYZG", "name": "Long XYZ", "rsi_symbol": "XYZ"},
+                {"workflow": "Short", "symbol": "AIQD", "name": "Short AIQ", "rsi_symbol": "AIQ"},
+                {"workflow": "Long", "symbol": "AALG", "name": "Long AAL", "rsi_symbol": "AAL"},
+                {"workflow": "Short", "symbol": "AMZO", "name": "Short AMZN", "rsi_symbol": "AMZN"},
+            ]
+        )
+
+        reporter.universe_assets(universe)
+        output = console.export_text(styles=False)
+
+        positions = [output.index(symbol) for symbol in ("AALG", "AIQD", "AMZO", "XYZG")]
+        self.assertEqual(positions, sorted(positions))
 
     def test_universe_assets_renders_failed_source_details(self) -> None:
         console = Console(file=io.StringIO(), record=True, width=120, color_system=None, no_color=True)
@@ -370,6 +443,27 @@ class OutputTests(unittest.TestCase):
         self.assertNotIn("STXX", output)
         self.assertNotIn("N/A", output)
         self.assertNotIn("-1751", output)
+
+    def test_optimization_summary_uses_side_title_without_workflow_column(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=160, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+        row = {
+            "Workflow": "Long",
+            "Asset": "TQQQ",
+            "RSI Symbol": "QQQ",
+            "Trades Executed": 2,
+            "Sharpe": 1.25,
+        }
+
+        reporter.optimization_summary(
+            pd.DataFrame([row]),
+            title="Best Sharpe Parameters By Asset — Long",
+        )
+        output = console.export_text(styles=False)
+
+        self.assertIn("Best Sharpe Parameters By Asset — Long", output)
+        self.assertIn("TQQQ", output)
+        self.assertNotIn("Workflow", output)
 
     def test_optimization_summary_shows_only_rows_with_enough_trades_and_sharpe(self) -> None:
         console = Console(file=io.StringIO(), record=True, width=160, color_system=None, no_color=True)
@@ -495,6 +589,39 @@ class OutputTests(unittest.TestCase):
         self.assertIn("2026-05-28", output)
         self.assertIn("37.25", output)
 
+    def test_combined_signal_report_shows_workflow_column(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=160, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+
+        reporter.signal_report(
+            "Buy Signals For Next Open",
+            pd.DataFrame(
+                [
+                    {
+                        "Workflow": "Short",
+                        "Asset": "SQQQ",
+                        "RSI Symbol": "QQQ",
+                        "Date": "2026-06-26",
+                        "Start Date": "2026-05-28",
+                        "Trading Days": 21,
+                        "Latest RSI": 72.25,
+                        "Buy RSI": 70.0,
+                        "Sell Return Multiple": 1.2,
+                        "Trades Executed": 2,
+                        "Sharpe": 5.7836,
+                        "In Position": False,
+                        "Pending Action": "buy",
+                    }
+                ]
+            ),
+            empty_message="empty",
+        )
+        output = console.export_text(styles=False)
+
+        self.assertIn("Workflow", output)
+        self.assertIn("Short", output)
+        self.assertIn("SQQQ", output)
+
     def test_signal_report_omits_some_columns_when_narrow(self) -> None:
         console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)
         reporter = WorkflowReporter(console=console)
@@ -583,6 +710,7 @@ class OutputTests(unittest.TestCase):
             pd.DataFrame(
                 [
                     {
+                        "Workflow": "Long",
                         "Closed Positions": 2,
                         "Complete Closed Positions": 1,
                         "Incomplete Closed Positions": 1,
@@ -597,6 +725,8 @@ class OutputTests(unittest.TestCase):
         output = console.export_text(styles=False)
 
         self.assertIn("Closed Managed Alpaca Realized P/L", output)
+        self.assertNotIn("Workflow", output)
+        self.assertNotIn("Long", output)
         self.assertIn("50.00", output)
         self.assertIn("25.00%", output)
         for line in output.splitlines():
@@ -622,6 +752,26 @@ class OutputTests(unittest.TestCase):
         self.assertIn("Buy RSI values", output)
         self.assertIn("Sell return multiples", output)
         self.assertIn("none", output)
+
+    def test_settings_renders_long_and_short_rsi_grids(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+
+        reporter.settings(
+            mode="update",
+            db_path="state.sqlite",
+            workflow_concurrency=1,
+            risk_free_symbol="^IRX",
+            buy_rsi_values=[20.0, 21.0],
+            short_buy_rsi_values=[70.0, 71.0],
+            profit_target_values=[1.1],
+        )
+        output = console.export_text(styles=False)
+
+        self.assertIn("Long buy RSI values", output)
+        self.assertIn("Short buy RSI values", output)
+        self.assertIn("20 to 21", output)
+        self.assertIn("70 to 71", output)
 
     def test_workflow_footer_renders_elapsed_time_and_divider(self) -> None:
         console = Console(file=io.StringIO(), record=True, width=100, color_system=None, no_color=True)

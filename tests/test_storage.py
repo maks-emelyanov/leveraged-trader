@@ -850,6 +850,79 @@ class StorageOptimizationTests(unittest.TestCase):
             )
         )
 
+    def test_rsi_entry_rule_is_part_of_strategy_identity(self) -> None:
+        buy_rsi_values = [70.0]
+        profit_target_values = [1.50]
+
+        lower_fingerprint = strategy_config_fingerprint(
+            self.cfg,
+            buy_rsi_values,
+            profit_target_values,
+            "lower",
+        )
+        upper_fingerprint = strategy_config_fingerprint(
+            self.cfg,
+            buy_rsi_values,
+            profit_target_values,
+            "upper",
+        )
+
+        self.assertNotEqual(lower_fingerprint, upper_fingerprint)
+
+    def test_upper_rsi_entry_rule_processes_high_rsi_signals(self) -> None:
+        periods = 20
+        dates = pd.date_range("2026-01-02", periods=periods, freq="B")
+        asset_close = np.linspace(100.0, 120.0, periods)
+        signal_close = np.linspace(100.0, 140.0, periods)
+        data = pd.DataFrame(
+            {
+                "SQQQ_Open": asset_close,
+                "SQQQ_High": asset_close + 1.0,
+                "SQQQ_Low": asset_close - 1.0,
+                "SQQQ_Close": asset_close,
+                "SQQQ_Volume": 1_000_000,
+                "QQQ_Open": signal_close,
+                "QQQ_High": signal_close + 1.0,
+                "QQQ_Low": signal_close - 1.0,
+                "QQQ_Close": signal_close,
+                "QQQ_Volume": 2_000_000,
+                f"{RISK_FREE_SYMBOL}_Open": 5.0,
+                f"{RISK_FREE_SYMBOL}_High": 5.0,
+                f"{RISK_FREE_SYMBOL}_Low": 5.0,
+                f"{RISK_FREE_SYMBOL}_Close": 5.0,
+                f"{RISK_FREE_SYMBOL}_Volume": 0,
+            },
+            index=dates,
+        )
+
+        process_asset_grid(
+            self.conn,
+            data,
+            self.cfg,
+            "SQQQ",
+            "QQQ",
+            [70.0],
+            [5.0],
+            rebuild=True,
+            rsi_entry_rule="upper",
+        )
+
+        trades, equity_rows = self.conn.execute(
+            """
+            SELECT s.trades_executed, COUNT(e.date)
+            FROM strategy_state s
+            JOIN strategy_equity e
+              ON e.asset_symbol = s.asset_symbol
+             AND e.signal_symbol = s.signal_symbol
+             AND e.buy_rsi = s.buy_rsi
+             AND e.profit_target_multiple = s.profit_target_multiple
+            WHERE s.asset_symbol = 'SQQQ'
+            GROUP BY s.trades_executed
+            """
+        ).fetchone()
+        self.assertGreater(trades, 0)
+        self.assertEqual(equity_rows, periods)
+
 
 if __name__ == "__main__":
     unittest.main()

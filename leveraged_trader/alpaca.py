@@ -264,6 +264,10 @@ def _optional_int(value: object) -> int:
     return int(value)
 
 
+def _signal_workflow(signal: dict) -> str | None:
+    return _optional_str(signal.get("Workflow"))
+
+
 def _managed_remaining_qty(position: dict, buy_filled_qty: float) -> float:
     sold_qty = _optional_float(position.get("sold_qty")) or 0.0
     return float(buy_filled_qty) - sold_qty
@@ -621,6 +625,7 @@ def _recover_managed_buy_submission(
 
     save_alpaca_managed_buy_order(
         conn,
+        workflow=_signal_workflow(signal),
         symbol=symbol,
         signal_symbol=str(signal["RSI Symbol"]),
         buy_rsi=float(signal["Buy RSI"]),
@@ -634,6 +639,7 @@ def _recover_managed_buy_submission(
     )
     rows.append(
         {
+            "Workflow": _signal_workflow(signal),
             "Asset": symbol,
             "Date": signal_date,
             "Client Order ID": client_order_id,
@@ -1394,6 +1400,7 @@ def reconcile_alpaca_managed_positions(
 ) -> pd.DataFrame:
     columns = [
         "Position ID",
+        "Workflow",
         "Asset",
         "Action",
         "Status",
@@ -1410,6 +1417,10 @@ def reconcile_alpaca_managed_positions(
     positions = load_alpaca_managed_positions(conn, active_only=True)
     if positions.empty:
         return pd.DataFrame(columns=columns)
+    workflow_by_position_id = {
+        int(position["id"]): _optional_str(position.get("workflow"))
+        for position in positions.to_dict("records")
+    }
 
     client = AlpacaClient(cfg)
     rows = []
@@ -1970,7 +1981,11 @@ def reconcile_alpaca_managed_positions(
                 message=str(exc),
             )
 
-    return pd.DataFrame(rows, columns=columns)
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return pd.DataFrame(columns=columns)
+    result.insert(1, "Workflow", result["Position ID"].map(workflow_by_position_id))
+    return result.reindex(columns=columns)
 
 
 def submit_alpaca_paper_buy_orders(
@@ -1979,6 +1994,7 @@ def submit_alpaca_paper_buy_orders(
     conn: sqlite3.Connection | None = None,
 ) -> pd.DataFrame:
     columns = [
+        "Workflow",
         "Asset",
         "Date",
         "Client Order ID",
@@ -2003,6 +2019,7 @@ def submit_alpaca_paper_buy_orders(
     eligible_orders: list[dict[str, object]] = []
     pending_batch_symbols: set[str] = set()
     pending_batch_client_order_ids: set[str] = set()
+    workflow_by_signal_index: dict[int, str | None] = {}
 
     def append_preflight_result(
         signal_index: int,
@@ -2019,6 +2036,7 @@ def submit_alpaca_paper_buy_orders(
     ) -> None:
         rows.append(
             {
+                "Workflow": workflow_by_signal_index.get(signal_index),
                 "Asset": symbol,
                 "Date": signal_date,
                 "Client Order ID": client_order_id,
@@ -2036,6 +2054,7 @@ def submit_alpaca_paper_buy_orders(
     # protected limit.  Only signals that can actually reach submission share
     # the account-level batch budget below.
     for signal_index, signal in enumerate(buy_signals.to_dict("records")):
+        workflow_by_signal_index[signal_index] = _signal_workflow(signal)
         symbol = str(signal["Asset"])
         symbol_key = symbol.upper()
         signal_date = str(signal["Date"])
@@ -2072,6 +2091,7 @@ def submit_alpaca_paper_buy_orders(
                 if conn is not None and {"RSI Symbol", "Buy RSI", "Sell Return Multiple"}.issubset(signal):
                     save_alpaca_managed_buy_order(
                         conn,
+                        workflow=_signal_workflow(signal),
                         symbol=symbol,
                         signal_symbol=str(signal["RSI Symbol"]),
                         buy_rsi=float(signal["Buy RSI"]),
@@ -2304,6 +2324,7 @@ def submit_alpaca_paper_buy_orders(
                 if is_managed_signal:
                     managed_position_id, submission_claimed = claim_alpaca_managed_buy_intent(
                         conn,
+                        workflow=_signal_workflow(signal),
                         symbol=symbol,
                         signal_symbol=str(signal["RSI Symbol"]),
                         buy_rsi=float(signal["Buy RSI"]),
@@ -2340,6 +2361,7 @@ def submit_alpaca_paper_buy_orders(
                         existing = _response_json(existing_resp)
                         save_alpaca_managed_buy_order(
                             conn,
+                            workflow=_signal_workflow(signal),
                             symbol=symbol,
                             signal_symbol=str(signal["RSI Symbol"]),
                             buy_rsi=float(signal["Buy RSI"]),
@@ -2392,6 +2414,7 @@ def submit_alpaca_paper_buy_orders(
                     if is_managed_signal:
                         save_alpaca_managed_buy_order(
                             conn,
+                            workflow=_signal_workflow(signal),
                             symbol=symbol,
                             signal_symbol=str(signal["RSI Symbol"]),
                             buy_rsi=float(signal["Buy RSI"]),

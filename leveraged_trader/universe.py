@@ -336,7 +336,9 @@ RSI_SYMBOL_OVERRIDES = {
     "ETNG": ("ETN", "Eaton Corp. plc"),
     "GOOX": ("GOOG", "Alphabet Inc."),
     "MSFX": ("MSFT", "Microsoft Corp."),
+    "NVDQ": ("NVDA", "NVIDIA Corp."),
     "NVDX": ("NVDA", "NVIDIA Corp."),
+    "TSLZ": ("TSLA", "Tesla Inc."),
     "TSLT": ("TSLA", "Tesla Inc."),
     "BULG": ("BULL", "Webull Corp."),
     "BULX": ("BULL", "Webull Corp."),
@@ -471,9 +473,13 @@ LEVERAGE_TOKEN_PATTERN = rf"(?:{RECOGNIZED_X_LEVERAGE_TOKEN}|{RECOGNIZED_PERCENT
 
 RSI_SYMBOL_PATTERNS = [
     rf"\b{LEVERAGE_TOKEN_PATTERN}\s+(?:DAILY\s+)?(?:TARGET\s+)?(?:LONG|BULL)\s+([A-Z][A-Z0-9.-]{{0,5}})\b",
+    rf"\b{LEVERAGE_TOKEN_PATTERN}\s+(?:DAILY\s+)?(?:TARGET\s+)?(?:SHORT|BEAR|INVERSE)\s+([A-Z][A-Z0-9.-]{{0,5}})\b",
     r"\b(?:LONG|BULL)\s+([A-Z][A-Z0-9.-]{0,5})\s+(?:DAILY\s+)?(?:ETF|ETN|SHARES?)\b",
+    r"\b(?:SHORT|BEAR|INVERSE)\s+([A-Z][A-Z0-9.-]{0,5})\s+(?:DAILY\s+)?(?:ETF|ETN|SHARES?)\b",
     r"\b([A-Z][A-Z0-9.-]{0,5})\s+(?:DAILY\s+)?(?:LONG|BULL)\b",
+    r"\b([A-Z][A-Z0-9.-]{0,5})\s+(?:DAILY\s+)?(?:SHORT|BEAR|INVERSE)\b",
     rf"\b([A-Z][A-Z0-9.-]{{0,5}})\s+{LEVERAGE_TOKEN_PATTERN}(?![A-Z0-9])",
+    r"\b(?:ULTRAPRO|ULTRA)\s+(?:SHORT|BEAR|INVERSE)\s+([A-Z][A-Z0-9.-]{0,5})\b",
     r"\b(?:ULTRAPRO|ULTRA)\s+([A-Z][A-Z0-9.-]{0,5})\b",
 ]
 
@@ -670,11 +676,12 @@ def _looks_like_single_stock_product(fund_name: object, fund_type: object | None
         return True
     if not leveraged_name_filter(normalized_name):
         return False
+    direction_pattern = r"(?:LONG|BULL|SHORT|BEAR|INVERSE)"
     single_stock_patterns = [
-        rf"\bT-?REX\b.*\b{LEVERAGE_TOKEN_PATTERN}\s+LONG\b.*\bDAILY\s+TARGET\s+ETF\b",
-        rf"\b{LEVERAGE_TOKEN_PATTERN}\s+LONG\s+.+?\s+DAILY\s+(?:TARGET\s+)?(?:ETF|ETN)\b",
-        rf"\b[A-Z][A-Z0-9.-]{{0,5}}\s+(?:BULL|LONG)\s+{LEVERAGE_TOKEN_PATTERN}\s+(?:DAILY\s+)?(?:ETF|ETN|SHARES?)\b",
-        rf"\b.+?\s+{LEVERAGE_TOKEN_PATTERN}\s+(?:DAILY\s+)?(?:TARGET\s+)?(?:LONG|BULL)\s+(?:DAILY\s+)?(?:ETF|ETN|SHARES?)\b",
+        rf"\bT-?REX\b.*\b{LEVERAGE_TOKEN_PATTERN}\s+{direction_pattern}\b.*\bDAILY\s+TARGET\s+ETF\b",
+        rf"\b{LEVERAGE_TOKEN_PATTERN}\s+{direction_pattern}\s+.+?\s+DAILY\s+(?:TARGET\s+)?(?:ETF|ETN)\b",
+        rf"\b[A-Z][A-Z0-9.-]{{0,5}}\s+{direction_pattern}\s+{LEVERAGE_TOKEN_PATTERN}\s+(?:DAILY\s+)?(?:ETF|ETN|SHARES?)\b",
+        rf"\b.+?\s+{LEVERAGE_TOKEN_PATTERN}\s+(?:DAILY\s+)?(?:TARGET\s+)?{direction_pattern}\s+(?:DAILY\s+)?(?:ETF|ETN|SHARES?)\b",
     ]
     return any(re.search(pattern, normalized_name) for pattern in single_stock_patterns)
 
@@ -750,6 +757,7 @@ def infer_rsi_symbol(asset_symbol: str, fund_name: str, known_symbols: set[str] 
 
 def _rsi_mapping_review_table(workflow_assets: pd.DataFrame) -> pd.DataFrame:
     columns = [
+        "workflow",
         "symbol",
         "name",
         "rsi_symbol",
@@ -1003,6 +1011,14 @@ def is_long_leveraged_name(name: str) -> bool:
         return False
     leverage, direction = infer_leverage_and_direction(n)
     return leverage is not None and leverage > 1.0 and direction == "long"
+
+
+def is_short_leveraged_name(name: str) -> bool:
+    n = str(name).upper()
+    if not leveraged_name_filter(n):
+        return False
+    leverage, direction = infer_leverage_and_direction(n)
+    return leverage is not None and leverage > 1.0 and direction == "inverse"
 
 
 def _first_matching_column(columns: Iterable[object], patterns: list[str]) -> object | None:
@@ -1916,7 +1932,15 @@ def select_universes(etf_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     )
 
 
-def determine_workflow_assets(cfg: UniverseConfig) -> pd.DataFrame:
+def select_short_workflow_universe(etf_df: pd.DataFrame) -> pd.DataFrame:
+    eligible = etf_df[~etf_df["symbol"].isin(EXCLUDED_UNIVERSE_SYMBOLS)].copy()
+    all_short_leveraged = eligible.loc[
+        eligible["name"].map(is_short_leveraged_name).astype(bool)
+    ].copy()
+    return all_short_leveraged.sort_values("symbol").reset_index(drop=True)
+
+
+def determine_workflow_asset_groups(cfg: UniverseConfig) -> dict[str, pd.DataFrame]:
     if cfg.top_n is not None and (
         isinstance(cfg.top_n, bool) or not isinstance(cfg.top_n, int) or cfg.top_n <= 0
     ):
@@ -1979,8 +2003,9 @@ def determine_workflow_assets(cfg: UniverseConfig) -> pd.DataFrame:
         )
 
     single_stock_long, all_long_leveraged = select_universes(etf_df)
-    if all_long_leveraged.empty:
-        raise RuntimeError("Nasdaq ETF universe returned no current long leveraged ETFs.")
+    all_short_leveraged = select_short_workflow_universe(etf_df)
+    if all_long_leveraged.empty and all_short_leveraged.empty:
+        raise RuntimeError("Nasdaq ETF universe returned no current leveraged ETFs/ETNs.")
 
     audit_rows, audit_status = load_audit_universe_sources(timeout=cfg.request_timeout_seconds)
     audit_report = build_universe_audit_report(audit_rows, etf_df, all_long_leveraged)
@@ -1988,56 +2013,34 @@ def determine_workflow_assets(cfg: UniverseConfig) -> pd.DataFrame:
     save_table_to_sqlite(audit_report, cfg.sqlite_db_path, "universe_audit_missing_candidates")
     save_table_to_sqlite(audit_status, cfg.sqlite_db_path, "universe_audit_source_status")
 
-    candidate_metadata = all_long_leveraged.apply(
-        lambda row: _workflow_row_metadata(row, known_symbols),
-        axis=1,
+    workflow_candidates_by_side = {
+        "long": _workflow_candidates(all_long_leveraged, known_symbols, workflow_label="Long"),
+        "short": _workflow_candidates(all_short_leveraged, known_symbols, workflow_label="Short"),
+    }
+    all_workflow_candidates = pd.concat(
+        workflow_candidates_by_side.values(),
+        ignore_index=True,
+        sort=False,
     )
-    workflow_candidates = pd.concat(
-        [all_long_leveraged.reset_index(drop=True), candidate_metadata.reset_index(drop=True)],
-        axis=1,
-    )
-    rsi_mapping_review = _rsi_mapping_review_table(workflow_candidates)
-    executable_workflow_assets = workflow_candidates.loc[
-        ~workflow_candidates["confidence"].eq("needs_review")
-    ].copy()
+    rsi_mapping_review = _rsi_mapping_review_table(all_workflow_candidates)
+    executable_by_side = {
+        side: candidates.loc[
+            ~candidates["confidence"].eq("needs_review")
+        ].copy()
+        for side, candidates in workflow_candidates_by_side.items()
+    }
     save_table_to_sqlite(
         rsi_mapping_review,
         cfg.sqlite_db_path,
         "universe_rsi_mapping_review",
     )
 
-    if executable_workflow_assets.empty:
+    if executable_by_side["long"].empty and executable_by_side["short"].empty:
         raise RuntimeError(
-            "Workflow universe has no executable long leveraged ETFs/ETNs after excluding RSI mappings needing review."
+            "Workflow universe has no executable leveraged ETFs/ETNs after excluding RSI mappings needing review."
         )
 
-    workflow_assets = (
-        executable_workflow_assets
-        if cfg.top_n is None
-        else executable_workflow_assets.head(cfg.top_n).copy()
-    )
-
-    if cfg.top_n is None:
-        universe_title = "Executable Long Leveraged ETFs/ETNs From Merged Universe"
-    else:
-        universe_title = f"First {cfg.top_n} Executable Long Leveraged ETFs/ETNs From Merged Universe"
-
-    out = workflow_assets[["symbol", "name", "rsi_symbol"]].reset_index(drop=True)
-    for column in [
-        "leverage",
-        "direction",
-        "underlying_symbol",
-        "underlying_name",
-        "fund_type",
-        "source",
-        "mapping_source",
-        "confidence",
-        "mapping_reason",
-    ]:
-        if column in workflow_assets.columns:
-            out[column] = workflow_assets[column].to_numpy()
-    out.attrs["universe_title"] = universe_title
-    out.attrs["universe_counts"] = {
+    common_counts = {
         "Current ETFs in Nasdaq table": len(nasdaq_df),
         "Current issuer-discovered leveraged ETFs found": len(issuer_df),
         "Current issuer-discovered leveraged ETNs found": len(etn_df),
@@ -2051,20 +2054,128 @@ def determine_workflow_assets(cfg: UniverseConfig) -> pd.DataFrame:
         "Merged current ETFs/ETNs": len(etf_df),
         "Current long single-stock leveraged ETFs found": len(single_stock_long),
         "Current long leveraged ETFs/ETNs found": len(all_long_leveraged),
-        "Executable long leveraged ETFs/ETNs selected": len(workflow_assets),
+        "Current short leveraged ETFs/ETNs found": len(all_short_leveraged),
         "RSI mappings needing review": len(rsi_mapping_review),
         "RSI mappings excluded pending review": len(rsi_mapping_review),
         "Audit sources registered": len(AUDIT_UNIVERSE_SOURCES),
         "Audit rows parsed": len(audit_rows),
         "Audit long leveraged candidates missing from merged universe": len(audit_report),
     }
-    out.attrs["universe_degraded"] = (
-        not workflow_source_failures.empty or not active_listing_failures.empty
+    common_attrs = {
+        "universe_degraded": (
+            not workflow_source_failures.empty or not active_listing_failures.empty
+        ),
+        "workflow_source_failures": workflow_source_failures.to_dict("records"),
+        "active_listing_source_failures": active_listing_failures.to_dict("records"),
+        "rsi_mapping_review": rsi_mapping_review.to_dict("records"),
+        "universe_db_path": cfg.sqlite_db_path,
+    }
+
+    return {
+        "long": _workflow_assets_output(
+            executable_by_side["long"],
+            cfg,
+            workflow_label="Long",
+            universe_title_base="Executable Long Leveraged ETFs/ETNs From Merged Universe",
+            count_label="Executable long leveraged ETFs/ETNs selected",
+            common_counts=common_counts,
+            common_attrs=common_attrs,
+        ),
+        "short": _workflow_assets_output(
+            executable_by_side["short"],
+            cfg,
+            workflow_label="Short",
+            universe_title_base="Executable Short Leveraged ETFs/ETNs From Merged Universe",
+            count_label="Executable short leveraged ETFs/ETNs selected",
+            common_counts=common_counts,
+            common_attrs=common_attrs,
+        ),
+    }
+
+
+def determine_workflow_assets(cfg: UniverseConfig) -> pd.DataFrame:
+    workflow_assets = determine_workflow_asset_groups(cfg)["long"]
+    if workflow_assets.empty:
+        raise RuntimeError(
+            "Workflow universe has no executable long leveraged ETFs/ETNs after excluding RSI mappings needing review."
+        )
+    return workflow_assets
+
+
+def _workflow_candidates(
+    products: pd.DataFrame,
+    known_symbols: set[str] | None,
+    *,
+    workflow_label: str,
+) -> pd.DataFrame:
+    if products.empty:
+        return pd.DataFrame(
+            columns=[
+                *products.columns,
+                "rsi_symbol",
+                "leverage",
+                "direction",
+                "underlying_symbol",
+                "underlying_name",
+                "mapping_source",
+                "confidence",
+                "mapping_reason",
+                "workflow",
+            ]
+        )
+    candidate_metadata = products.apply(
+        lambda row: _workflow_row_metadata(row, known_symbols),
+        axis=1,
     )
-    out.attrs["workflow_source_failures"] = workflow_source_failures.to_dict("records")
-    out.attrs["active_listing_source_failures"] = active_listing_failures.to_dict("records")
-    out.attrs["rsi_mapping_review"] = rsi_mapping_review.to_dict("records")
-    out.attrs["universe_db_path"] = cfg.sqlite_db_path
+    candidates = pd.concat(
+        [products.reset_index(drop=True), candidate_metadata.reset_index(drop=True)],
+        axis=1,
+    )
+    candidates["workflow"] = workflow_label
+    return candidates
+
+
+def _workflow_assets_output(
+    workflow_assets: pd.DataFrame,
+    cfg: UniverseConfig,
+    *,
+    workflow_label: str,
+    universe_title_base: str,
+    count_label: str,
+    common_counts: dict[str, object],
+    common_attrs: dict[str, object],
+) -> pd.DataFrame:
+    selected_assets = (
+        workflow_assets
+        if cfg.top_n is None
+        else workflow_assets.head(cfg.top_n).copy()
+    )
+
+    universe_title = universe_title_base if cfg.top_n is None else f"First {cfg.top_n} {universe_title_base}"
+
+    base_columns = ["symbol", "name", "rsi_symbol"]
+    out = selected_assets.reindex(columns=base_columns).reset_index(drop=True)
+    for column in [
+        "workflow",
+        "leverage",
+        "direction",
+        "underlying_symbol",
+        "underlying_name",
+        "fund_type",
+        "source",
+        "mapping_source",
+        "confidence",
+        "mapping_reason",
+    ]:
+        if column in selected_assets.columns:
+            out[column] = selected_assets[column].to_numpy()
+    if "workflow" not in out.columns:
+        out["workflow"] = workflow_label
+    counts = dict(common_counts)
+    counts[count_label] = len(out)
+    out.attrs["universe_title"] = universe_title
+    out.attrs["universe_counts"] = counts
+    out.attrs.update(common_attrs)
     return out
 
 
@@ -2077,6 +2188,7 @@ def build_nasdaq_universe_table(
     if known_symbols is None:
         known_symbols = _known_rsi_symbols(out, set())
     out["is_long_leveraged"] = out["name"].apply(is_long_leveraged_name)
+    out["is_short_leveraged"] = out["name"].apply(is_short_leveraged_name)
     out["is_single_stock"] = out["fund_type"].str.contains(
         r"ETF \(Single Stock\)",
         regex=True,
@@ -2095,7 +2207,7 @@ def _nasdaq_table_rsi_mapping_metadata(
     row: pd.Series,
     known_symbols: set[str] | None,
 ) -> pd.Series:
-    if row["is_long_leveraged"]:
+    if row["is_long_leveraged"] or row.get("is_short_leveraged", False):
         mapping = infer_rsi_mapping(
             row["symbol"],
             row["name"],
@@ -2121,6 +2233,6 @@ def _nasdaq_table_rsi_mapping_metadata(
             "underlying_name": symbol,
             "mapping_source": "asset_symbol",
             "confidence": "not_applicable",
-            "mapping_reason": "not a long leveraged product",
+            "mapping_reason": "not a workflow leveraged product",
         }
     )
