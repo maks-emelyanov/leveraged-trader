@@ -8,6 +8,7 @@ import pandas as pd
 from leveraged_trader.config import UniverseConfig
 from leveraged_trader.universe import (
     AUDIT_UNIVERSE_SOURCES,
+    EXCLUDED_UNIVERSE_SYMBOLS,
     ISSUER_UNIVERSE_SOURCES,
     WORKFLOW_ETN_SOURCES,
     ActiveListedSymbols,
@@ -375,6 +376,31 @@ class UniverseTests(unittest.TestCase):
                 mapping = infer_rsi_mapping(asset_symbol, name)
                 self.assertEqual(mapping.rsi_symbol, expected)
                 self.assertEqual(mapping.confidence, "curated")
+
+    def test_reviewed_inverse_products_use_unlevered_rsi_proxies(self) -> None:
+        expected = {
+            "AIQD": "AIQ", "BERZ": "FNGS", "BIS": "IBB", "BNKD": "KBWB",
+            "BZQ": "EWZ", "DUG": "XLE", "EEV": "EEM", "EFU": "EFA",
+            "EPV": "VGK", "EUO": "FXE", "EWV": "EWJ", "FLYD": "PEJ",
+            "FNGD": "FNGS", "FXP": "FXI", "KOLD": "UNG", "MZZ": "MDY",
+            "NRGD": "XLE", "OILD": "XOP", "QID": "QQQ", "QQDN": "QQQ",
+            "REW": "XLK", "RXD": "XLV", "SCC": "XLY", "SCO": "USO",
+            "SDD": "IJR", "SDP": "XLU", "SIJ": "XLI", "SKF": "XLF",
+            "SKRE": "KRE", "SMDD": "MDY", "SMN": "XLB", "SRS": "IYR",
+            "SSG": "SOXX", "SZK": "XLP", "WTID": "XLE", "YCS": "FXY",
+        }
+
+        for asset_symbol, rsi_symbol in expected.items():
+            with self.subTest(asset_symbol=asset_symbol):
+                mapping = infer_rsi_mapping(asset_symbol, "Inverse leveraged product")
+                self.assertEqual(mapping.rsi_symbol, rsi_symbol)
+                self.assertEqual(mapping.confidence, "curated")
+
+    def test_ultrashort_duration_and_unstable_basket_products_are_excluded(self) -> None:
+        self.assertTrue(
+            {"AMUN", "RBIL", "SGVA", "SLTY", "UYLD", "VGUS", "ZMUN"}
+            <= EXCLUDED_UNIVERSE_SYMBOLS
+        )
 
     def test_common_words_that_are_tickers_do_not_win_generic_rsi_inference(self) -> None:
         cases = {

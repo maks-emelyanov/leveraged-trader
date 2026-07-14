@@ -670,7 +670,7 @@ class WorkflowAsyncTests(unittest.TestCase):
 
             workflow_assets = pd.DataFrame([{"symbol": "SQQQ", "name": "S", "rsi_symbol": "QQQ"}])
 
-            optimization_summary, curves, buy_signals, _eligible, _sell_signals, _pnl = _build_reports_for_db(
+            optimization_summary, curves, buy_signals, _eligible, _sell_signals, pnl = _build_reports_for_db(
                 db_path,
                 workflow_assets,
                 BacktestConfig(),
@@ -681,6 +681,7 @@ class WorkflowAsyncTests(unittest.TestCase):
         self.assertEqual(optimization_summary["Workflow"].tolist(), ["Short"])
         self.assertEqual(curves.columns.tolist(), ["Short_SQQQ_RSI_Strategy"])
         self.assertEqual(buy_signals["Workflow"].tolist(), ["Short"])
+        self.assertNotIn("Workflow", pnl.columns)
 
     def test_workflow_reconciles_again_after_submitting_a_buy(self) -> None:
         workflow_assets = pd.DataFrame([{"symbol": "TQQQ", "name": "T", "rsi_symbol": "QQQ"}])

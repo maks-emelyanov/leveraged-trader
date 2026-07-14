@@ -155,6 +155,10 @@ symbol cannot be mapped confidently are excluded from the executable workflow an
 `universe_rsi_mapping_review`; curated proxy mappings and long-product self-RSI fallbacks remain
 executable and are annotated in `nasdaq_etf_universe`. Inverse-product self-RSI fallbacks are instead
 marked for review and excluded because the high-RSI inverse entry rule requires an underlying proxy.
+Curated inverse mappings use an unlevered ETF or spot-market proxy for the product's benchmark rather
+than the inverse product's own RSI. Products are excluded when leveraged-looking wording is not actual
+inverse exposure (for example, "ultra-short" bond-duration funds), or when a changing basket means no
+stable single RSI proxy exists.
 A universe discovery or active listing source
 failure, or a successful response that cannot be parsed, leaves the run marked as degraded in terminal
 output. A successfully parsed source with zero leveraged matches remains healthy; use

@@ -462,7 +462,7 @@ def _build_reports_for_db(
             ].copy()
         realized_pnl_summary = build_alpaca_realized_pnl_summary(
             conn,
-            include_workflow=workflow_label is not None,
+            include_workflow=False,
         )
 
     if workflow_label is not None:
