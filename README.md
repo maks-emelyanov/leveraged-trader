@@ -4,6 +4,8 @@ Leveraged Trader is a research and paper-trading workflow for RSI-based leverage
 
 This project is intended for research and paper trading. It is not financial advice, and it should not be connected to live trading without additional review, testing, and risk controls.
 
+Licensed under the MIT License. See [LICENSE](LICENSE).
+
 ## Features
 
 - Discovers current long and inverse leveraged ETFs/ETNs from Nasdaq ETF definitions plus best-effort issuer and ETN pages; source health distinguishes fetch/parser failures from healthy zero-match pages, and issuer-only products are filtered only when both active-listing sources load successfully.
@@ -24,24 +26,163 @@ This project is intended for research and paper trading. It is not financial adv
 - Submits and renews managed Alpaca GTC limit sells from actual fill price times the original sell multiple, including partial buy fills.
 - Guards Alpaca buys against already-held symbols, active managed positions, and open buy or sell orders.
 
-## Quickstart
+## Setup
+
+The automated schedule requires a Unix-like system with `bash` and per-user `crontab` support.
+Run all setup commands from the repository root.
+
+### 1. Get the project
+
+Clone or download the repository, then enter its directory:
 
 ```bash
-uv sync
-cp .env.example .env
-uv run leveraged-trader --help
+cd /path/to/project
 ```
 
-Edit `.env` with Alpaca paper credentials before running the default Alpaca submission workflow.
+The checkout can live anywhere. The cron setup derives its paths from the repository location.
+
+### 2. Install uv
+
+Install `uv` on Linux or macOS using its official standalone installer:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Restart the shell if requested by the installer, then verify that `uv` is available:
+
+```bash
+uv --version
+```
+
+Other supported installation methods are documented in the
+[official uv installation guide](https://docs.astral.sh/uv/getting-started/installation/).
+
+### 3. Install Python and project dependencies
+
+Synchronize the locked environment:
+
+```bash
+uv sync --locked
+```
+
+`uv` installs a compatible Python version when necessary and creates the local `.venv` environment.
+The virtual environment does not need to be activated when commands are run through `uv run`.
+
+### 4. Configure API credentials
+
+Copy the tracked example instead of renaming or editing it, then restrict access to the personal
+configuration file:
+
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+Edit `.env` and replace the placeholder Alpaca values with credentials from an Alpaca **paper**
+trading account:
 
 ```env
-ALPACA_API_KEY_ID=your_alpaca_paper_api_key_id
-ALPACA_API_SECRET_KEY=your_alpaca_paper_api_secret_key
+ALPACA_API_KEY_ID=replace_with_your_paper_api_key_id
+ALPACA_API_SECRET_KEY=replace_with_your_paper_api_secret_key
 ALPACA_BASE_URL=https://paper-api.alpaca.markets
 ALPACA_BUY_LIMIT_BUFFER_BPS=500
 ALPACA_GTC_SELL_RENEWAL_ENABLED=true
 ALPACA_GTC_SELL_RENEWAL_DAYS_BEFORE_EXPIRATION=7
-TRADIER_ACCESS_TOKEN=your_tradier_access_token
+TRADIER_ACCESS_TOKEN=replace_with_your_tradier_access_token
+```
+
+`TRADIER_ACCESS_TOKEN` is optional and is used for market-data fallback. Remove that line or disable
+fallback with `--no-tradier-fallback` if no Tradier account is configured. `.env` is ignored by Git;
+do not commit it or share its contents.
+
+### 5. Validate the installation safely
+
+Confirm that the CLI loads, then perform a run with all Alpaca submissions disabled:
+
+```bash
+uv run leveraged-trader --help
+uv run leveraged-trader --no-alpaca-submit-buy-orders --no-alpaca-submit-sell-orders
+```
+
+Review the generated reports and configuration before enabling paper-order submission. The default
+command enables both managed buy and sell submission:
+
+```bash
+uv run leveraged-trader
+```
+
+### 6. Install the automated schedule
+
+The automated schedule is optional and requires `cron`. Check whether `crontab` is already
+available:
+
+```bash
+command -v crontab
+```
+
+If it is missing, install and start cron using the commands for the system:
+
+```bash
+# Debian or Ubuntu
+sudo apt update
+sudo apt install cron
+sudo systemctl enable --now cron
+
+# Fedora or RHEL
+sudo dnf install cronie
+sudo systemctl enable --now crond
+```
+
+On macOS, `crontab` is normally preinstalled, although macOS may request permission for cron to
+access files in protected locations. Native Windows Task Scheduler is not supported by these
+scripts. Under WSL, cron must be installed and started, WSL must remain running when the jobs are
+due, and service management availability depends on the WSL configuration.
+
+Confirm that the applicable service is running:
+
+```bash
+# Debian or Ubuntu
+systemctl status cron
+
+# Fedora or RHEL
+systemctl status crond
+```
+
+Install the project's managed entries into the current user's crontab:
+
+```bash
+./scripts/cron/install-crontab
+```
+
+The installer preserves unrelated entries and installs these schedules in the
+`America/New_York` timezone:
+
+- 8:45 a.m. Monday-Friday: run the full workflow with Alpaca paper buy and managed sell submission.
+- 10:15 a.m. Monday-Friday: reconcile fills and managed sells without submitting new buys.
+
+Verify the installed entries and inspect the shared log:
+
+```bash
+crontab -l
+tail -f outputs/cron.log
+```
+
+The installer is idempotent: run it again after moving the checkout, moving the `uv` executable, or
+changing the managed schedule. It records the detected `uv` path in the managed crontab block, and
+the wrapper resolves the repository relative to its own location.
+
+To operate without cron, skip this step and run the commands in the recommended operating schedule
+manually.
+
+### 7. Updating an existing installation
+
+After pulling project changes, resynchronize the locked environment and reinstall the managed cron
+block if its schedule or checkout location changed:
+
+```bash
+uv sync --locked
+./scripts/cron/install-crontab
 ```
 
 The CLI also supports `--alpaca-timeout-seconds` for request timeout tuning (default: `30`),
@@ -99,6 +240,13 @@ premarket after the signal day has settled.
   status and closes the managed intent without a position.
 - Extra reconciliation runs are intended to be idempotent: deterministic client order IDs, active
   managed-position checks, and live open-order checks protect against duplicate managed buys or sells.
+
+The underlying `scripts/cron/run-leveraged-trader` wrapper can also be called directly. It accepts
+normal CLI arguments and forwards them to `uv run leveraged-trader`:
+
+```bash
+./scripts/cron/run-leveraged-trader --no-alpaca-submit-buy-orders
+```
 
 ## CLI Reference
 

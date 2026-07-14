@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$repo_dir"
+
+if [[ -n "${UV_BIN:-}" ]]; then
+    uv_bin="$UV_BIN"
+elif command -v uv >/dev/null 2>&1; then
+    uv_bin="$(command -v uv)"
+elif [[ -x "$HOME/.local/bin/uv" ]]; then
+    uv_bin="$HOME/.local/bin/uv"
+else
+    echo "Unable to find uv. Install uv or set UV_BIN to its executable path." >&2
+    exit 127
+fi
+
+exec "$uv_bin" run leveraged-trader "$@"

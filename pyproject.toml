@@ -4,7 +4,8 @@ version = "0.1.0"
 description = "Research and paper-trading workflow for leveraged ETF RSI strategies."
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 keywords = ["alpaca", "leveraged-etfs", "paper-trading", "rsi", "trading", "yfinance"]
 dependencies = [
     "lxml>=6.0.2",

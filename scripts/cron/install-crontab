@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_dir="$(cd -- "$script_dir/../.." && pwd)"
+runner="$script_dir/run-leveraged-trader"
+log_file="$repo_dir/outputs/cron.log"
+marker_start="# BEGIN leveraged-trader managed schedule"
+marker_end="# END leveraged-trader managed schedule"
+
+if command -v uv >/dev/null 2>&1; then
+    uv_bin="$(command -v uv)"
+elif [[ -x "$HOME/.local/bin/uv" ]]; then
+    uv_bin="$HOME/.local/bin/uv"
+else
+    echo "Unable to find uv. Install uv before installing the crontab." >&2
+    exit 127
+fi
+
+mkdir -p "$repo_dir/outputs"
+
+existing_crontab="$(crontab -l 2>/dev/null || true)"
+filtered_crontab="$(printf '%s\n' "$existing_crontab" | awk -v start="$marker_start" -v end="$marker_end" '
+    $0 == start { managed = 1; next }
+    $0 == end { managed = 0; next }
+    !managed { print }
+')"
+
+{
+    printf '%s\n' "$filtered_crontab"
+    printf '%s\n' "$marker_start"
+    printf '%s\n' 'CRON_TZ=America/New_York'
+    printf 'UV_BIN=%q\n' "$uv_bin"
+    printf '45 8 * * 1-5 %q >> %q 2>&1\n' "$runner" "$log_file"
+    printf '15 10 * * 1-5 %q --no-alpaca-submit-buy-orders >> %q 2>&1\n' "$runner" "$log_file"
+    printf '%s\n' "$marker_end"
+} | crontab -
+
+echo "Installed the leveraged-trader schedules:"
+echo "  Weekdays at 8:45 AM America/New_York: full workflow with buy submission"
+echo "  Weekdays at 10:15 AM America/New_York: reconciliation without buy submission"
+echo "  uv: $uv_bin"
+echo "  Log: $log_file"
