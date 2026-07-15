@@ -14,6 +14,9 @@ from requests import HTTPError
 from leveraged_trader.alpaca import (
     AlpacaClient,
     _alpaca_dynamic_batch_cash_fraction,
+    _record_observed_managed_sell_order,
+    _recover_managed_sell_submission,
+    migrate_alpaca_managed_position_symbols,
     reconcile_alpaca_managed_positions,
     submit_alpaca_paper_buy_orders,
     submit_alpaca_paper_sell_orders,
@@ -21,15 +24,22 @@ from leveraged_trader.alpaca import (
 from leveraged_trader.config import AlpacaOrderConfig
 from leveraged_trader.storage import (
     active_alpaca_managed_symbols,
+    attach_alpaca_managed_sell_order_if_current,
+    claim_alpaca_managed_sell_renewal,
+    claim_alpaca_managed_sell_replacement,
+    claim_alpaca_managed_sell_submission_retry,
+    close_alpaca_managed_position_if_current_and_complete,
     claim_alpaca_managed_buy_intent,
     fail_alpaca_managed_buy_submission_if_pending,
     init_state_db,
     load_alpaca_managed_positions,
     mark_alpaca_managed_buy_filled,
     mark_alpaca_managed_sell_filled,
+    mark_alpaca_managed_sell_filled_if_current,
     record_alpaca_managed_sell_order,
     save_alpaca_managed_buy_order,
     update_alpaca_managed_sell_status,
+    update_alpaca_managed_sell_status_if_current,
 )
 
 
@@ -59,6 +69,1164 @@ class AlpacaTests(unittest.TestCase):
             api_secret_key="secret",
             **kwargs,
         )
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_ticker_rename_migrates_managed_position_and_renews_with_current_symbol(
+        self, mock_get: Mock, mock_post: Mock,
+    ) -> None:
+        asset_id = "asset-echo"
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="SATG",
+                signal_symbol="SATS",
+                buy_rsi=30,
+                profit_target_multiple=1.1,
+                buy_signal_date="2026-06-18",
+                buy_client_order_id="rsi-buy-SATG-20260618",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-06-22T13:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=73,
+                filled_avg_price=12.203151,
+                filled_at="2026-06-22T13:36:51Z",
+                target_sell_price=13.42,
+            )
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-SATG-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-06-22T17:30:44Z",
+                sell_status="new",
+                sell_expires_at="2026-09-18T20:00:00Z",
+            )
+            mock_get.side_effect = [
+                response(200, [{"asset_id": asset_id, "symbol": "ECHX", "qty": "73"}]),
+                response(
+                    200,
+                    {
+                        "id": "sell-1",
+                        "client_order_id": "rsi-exit-SATG-1",
+                        "asset_id": asset_id,
+                        "symbol": "SATG",
+                    },
+                ),
+                response(
+                    200,
+                    {
+                        "id": "sell-1",
+                        "client_order_id": "rsi-exit-SATG-1",
+                        "asset_id": asset_id,
+                        "symbol": "SATG",
+                        "status": "expired",
+                    },
+                ),
+                response(200, []),
+            ]
+            mock_post.return_value = response(
+                200,
+                {
+                    "id": "sell-2",
+                    "client_order_id": "rsi-exit-ECHX-1-r1",
+                    "asset_id": asset_id,
+                    "symbol": "ECHX",
+                    "status": "accepted",
+                    "expires_at": "2027-06-30T20:00:00Z",
+                },
+            )
+
+            migrations = migrate_alpaca_managed_position_symbols(conn, self.cfg(buy=True, sell=True))
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+            protected_symbols = active_alpaca_managed_symbols(conn)
+
+        self.assertEqual(migrations, {"SATG": "ECHX"})
+        self.assertEqual(result.loc[0, "Status"], "renewed")
+        self.assertEqual(managed.loc[0, "symbol"], "ECHX")
+        self.assertEqual(managed.loc[0, "alpaca_asset_id"], asset_id)
+        self.assertEqual(managed.loc[0, "sell_client_order_id"], "rsi-exit-ECHX-1-r1")
+        self.assertEqual(protected_symbols, {"SATG", "ECHX"})
+        self.assertEqual(mock_post.call_args.kwargs["json"]["symbol"], "ECHX")
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_ticker_rename_recovers_unattached_open_sell_by_asset_id(
+        self, mock_get: Mock, mock_post: Mock,
+    ) -> None:
+        asset_id = "asset-echo"
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="SATG",
+                signal_symbol="SATS",
+                buy_rsi=30,
+                profit_target_multiple=1.1,
+                buy_signal_date="2026-06-18",
+                buy_client_order_id="rsi-buy-SATG-20260618",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-06-22T13:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=73,
+                filled_avg_price=12.203151,
+                filled_at="2026-06-22T13:36:51Z",
+                target_sell_price=13.42,
+            )
+            mock_get.side_effect = [
+                response(200, [{"asset_id": asset_id, "symbol": "ECHX", "qty": "73"}]),
+                response(
+                    200,
+                    {
+                        "id": "buy-1",
+                        "client_order_id": "rsi-buy-SATG-20260618",
+                        "asset_id": asset_id,
+                        "symbol": "SATG",
+                    },
+                ),
+                response(
+                    200,
+                    [
+                        {
+                            "id": "sell-1",
+                            "client_order_id": "rsi-exit-SATG-1",
+                            "asset_id": asset_id,
+                            "symbol": "SATG",
+                            "side": "sell",
+                            "status": "new",
+                            "qty": "73",
+                            "filled_qty": "0",
+                            "limit_price": "13.42",
+                            "expires_at": "2027-06-30T20:00:00Z",
+                        }
+                    ],
+                ),
+            ]
+
+            migrate_alpaca_managed_position_symbols(conn, self.cfg(buy=True, sell=True))
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "new")
+        self.assertIn("recovered existing", result.loc[0, "Message"])
+        self.assertEqual(managed.loc[0, "symbol"], "ECHX")
+        self.assertEqual(managed.loc[0, "sell_client_order_id"], "rsi-exit-SATG-1")
+        self.assertEqual(managed.loc[0, "sell_alpaca_order_id"], "sell-1")
+        mock_post.assert_not_called()
+
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_ticker_migration_rejects_two_active_rows_resolving_to_same_asset(
+        self, mock_get: Mock,
+    ) -> None:
+        asset_id = "asset-echo"
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            for symbol, order_id, signal_date in [
+                ("SATG", "buy-1", "2026-06-18"),
+                ("LEGACY", "buy-2", "2026-06-19"),
+            ]:
+                save_alpaca_managed_buy_order(
+                    conn,
+                    symbol=symbol,
+                    signal_symbol="SATS",
+                    buy_rsi=30,
+                    profit_target_multiple=1.1,
+                    buy_signal_date=signal_date,
+                    buy_client_order_id=f"rsi-buy-{symbol}-{signal_date.replace('-', '')}",
+                    buy_alpaca_order_id=order_id,
+                    buy_submitted_at="2026-06-22T13:30:00Z",
+                    buy_status="filled",
+                )
+            mock_get.side_effect = [
+                response(200, [{"asset_id": asset_id, "symbol": "ECHX", "qty": "73"}]),
+                response(200, {"id": "buy-1", "client_order_id": "rsi-buy-SATG-20260618", "asset_id": asset_id, "symbol": "SATG"}),
+                response(200, {"id": "buy-2", "client_order_id": "rsi-buy-LEGACY-20260619", "asset_id": asset_id, "symbol": "LEGACY"}),
+            ]
+
+            with self.assertRaisesRegex(ValueError, "resolve to the same Alpaca asset"):
+                migrate_alpaca_managed_position_symbols(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+            aliases = conn.execute("SELECT COUNT(*) FROM alpaca_symbol_aliases").fetchone()[0]
+
+        self.assertEqual(managed["symbol"].tolist(), ["SATG", "LEGACY"])
+        self.assertTrue(managed["alpaca_asset_id"].isna().all())
+        self.assertEqual(aliases, 0)
+
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_ticker_migration_rolls_back_entire_batch_when_later_update_fails(
+        self, mock_get: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            for symbol, order_id, signal_date in [
+                ("OLD1", "buy-1", "2026-06-18"),
+                ("OLD2", "buy-2", "2026-06-19"),
+            ]:
+                save_alpaca_managed_buy_order(
+                    conn,
+                    symbol=symbol,
+                    signal_symbol="QQQ",
+                    buy_rsi=30,
+                    profit_target_multiple=1.1,
+                    buy_signal_date=signal_date,
+                    buy_client_order_id=f"rsi-buy-{symbol}-{signal_date.replace('-', '')}",
+                    buy_alpaca_order_id=order_id,
+                    buy_submitted_at="2026-06-22T13:30:00Z",
+                    buy_status="filled",
+                )
+            conn.execute(
+                """
+                CREATE TRIGGER fail_second_symbol_migration
+                BEFORE UPDATE OF symbol ON alpaca_managed_positions
+                WHEN NEW.id = 2
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced second migration failure');
+                END
+                """
+            )
+            mock_get.side_effect = [
+                response(
+                    200,
+                    [
+                        {"asset_id": "asset-1", "symbol": "NEW1", "qty": "1"},
+                        {"asset_id": "asset-2", "symbol": "NEW2", "qty": "1"},
+                    ],
+                ),
+                response(200, {"id": "buy-1", "client_order_id": "rsi-buy-OLD1-20260618", "asset_id": "asset-1", "symbol": "OLD1"}),
+                response(200, {"id": "buy-2", "client_order_id": "rsi-buy-OLD2-20260619", "asset_id": "asset-2", "symbol": "OLD2"}),
+            ]
+
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "forced second migration failure"):
+                migrate_alpaca_managed_position_symbols(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+            aliases = conn.execute("SELECT COUNT(*) FROM alpaca_symbol_aliases").fetchone()[0]
+
+        self.assertEqual(managed["symbol"].tolist(), ["OLD1", "OLD2"])
+        self.assertTrue(managed["alpaca_asset_id"].isna().all())
+        self.assertEqual(aliases, 0)
+
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_ticker_migration_blocks_mismatched_order_identity_without_fallback(
+        self, mock_get: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="SATG",
+                signal_symbol="SATS",
+                buy_rsi=30,
+                profit_target_multiple=1.1,
+                buy_signal_date="2026-06-18",
+                buy_client_order_id="rsi-buy-SATG-20260618",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-06-22T13:30:00Z",
+                buy_status="filled",
+            )
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-SATG-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-06-22T17:30:44Z",
+                sell_status="new",
+            )
+            mock_get.side_effect = [
+                response(200, [{"asset_id": "wrong-asset", "symbol": "WRONG", "qty": "1"}]),
+                response(
+                    200,
+                    {
+                        "id": "sell-1",
+                        "client_order_id": "unrelated-sell",
+                        "asset_id": "wrong-asset",
+                        "symbol": "WRONG",
+                    },
+                ),
+            ]
+
+            with self.assertRaisesRegex(ValueError, "identity does not match"):
+                migrate_alpaca_managed_position_symbols(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+            aliases = conn.execute("SELECT COUNT(*) FROM alpaca_symbol_aliases").fetchone()[0]
+
+        self.assertEqual(managed.loc[0, "symbol"], "SATG")
+        self.assertTrue(pd.isna(managed.loc[0, "alpaca_asset_id"]))
+        self.assertEqual(aliases, 0)
+        self.assertEqual(mock_get.call_count, 2)
+
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_ticker_migration_revalidates_persisted_asset_id_against_attached_order(
+        self, mock_get: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="SATG",
+                signal_symbol="SATS",
+                buy_rsi=30,
+                profit_target_multiple=1.1,
+                buy_signal_date="2026-06-18",
+                buy_client_order_id="rsi-buy-SATG-20260618",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-06-22T13:30:00Z",
+                buy_status="filled",
+            )
+            conn.execute("UPDATE alpaca_managed_positions SET alpaca_asset_id = 'persisted-asset'")
+            conn.commit()
+            mock_get.side_effect = [
+                response(200, [{"asset_id": "persisted-asset", "symbol": "ECHX", "qty": "73"}]),
+                response(
+                    200,
+                    {
+                        "id": "buy-1",
+                        "client_order_id": "rsi-buy-SATG-20260618",
+                        "asset_id": "different-asset",
+                        "symbol": "SATG",
+                    },
+                ),
+            ]
+
+            with self.assertRaisesRegex(ValueError, "asset identity does not match"):
+                migrate_alpaca_managed_position_symbols(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(managed.loc[0, "symbol"], "SATG")
+        self.assertEqual(managed.loc[0, "alpaca_asset_id"], "persisted-asset")
+
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_ticker_migration_blocks_mismatched_asset_lookup_response(
+        self, mock_get: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="OLD",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.1,
+                buy_signal_date="2026-06-18",
+                buy_client_order_id="rsi-buy-OLD-20260618",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-06-22T13:30:00Z",
+                buy_status="filled",
+            )
+            mock_get.side_effect = [
+                response(200, []),
+                response(
+                    200,
+                    {
+                        "id": "buy-1",
+                        "client_order_id": "rsi-buy-OLD-20260618",
+                        "asset_id": "expected-asset",
+                        "symbol": "OLD",
+                    },
+                ),
+                response(200, {"id": "different-asset", "symbol": "WRONG"}),
+            ]
+
+            with self.assertRaisesRegex(ValueError, "asset lookup.*does not match"):
+                migrate_alpaca_managed_position_symbols(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+            aliases = conn.execute("SELECT COUNT(*) FROM alpaca_symbol_aliases").fetchone()[0]
+
+        self.assertEqual(managed.loc[0, "symbol"], "OLD")
+        self.assertTrue(pd.isna(managed.loc[0, "alpaca_asset_id"]))
+        self.assertEqual(aliases, 0)
+
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_ticker_migration_skips_order_lookup_for_unchanged_persisted_asset(
+        self, mock_get: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="ECHX",
+                signal_symbol="ECHO",
+                buy_rsi=30,
+                profit_target_multiple=1.1,
+                buy_signal_date="2026-06-18",
+                buy_client_order_id="rsi-buy-SATG-20260618",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-06-22T13:30:00Z",
+                buy_status="filled",
+            )
+            conn.execute("UPDATE alpaca_managed_positions SET alpaca_asset_id = 'asset-echo'")
+            conn.commit()
+            mock_get.return_value = response(
+                200,
+                [{"asset_id": "asset-echo", "symbol": "ECHX", "qty": "73"}],
+            )
+
+            migrations = migrate_alpaca_managed_position_symbols(conn, self.cfg(buy=True, sell=True))
+
+        self.assertEqual(migrations, {})
+        self.assertEqual(mock_get.call_count, 1)
+        self.assertTrue(mock_get.call_args.args[0].endswith("/v2/positions"))
+
+    def test_managed_sell_renewal_claim_is_exclusive_until_lease_expires(self) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="accepted",
+            )
+
+            first = claim_alpaca_managed_sell_renewal(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                requested_at="2026-03-25T14:32:00Z",
+                reclaim_before="2026-03-25T14:27:00Z",
+                notes="first claim",
+            )
+            overlapping = claim_alpaca_managed_sell_renewal(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                requested_at="2026-03-25T14:33:00Z",
+                reclaim_before="2026-03-25T14:28:00Z",
+                notes="overlapping claim",
+            )
+            reclaimed = claim_alpaca_managed_sell_renewal(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                requested_at="2026-03-25T14:38:00Z",
+                reclaim_before="2026-03-25T14:33:00Z",
+                notes="reclaimed",
+            )
+            conn.execute(
+                """
+                UPDATE alpaca_managed_positions
+                SET sell_status = 'pending_cancel', sell_renewal_requested_at = 'not-a-timestamp'
+                WHERE id = 1
+                """
+            )
+            malformed_timestamp_reclaimed = claim_alpaca_managed_sell_renewal(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                requested_at="2026-03-25T14:39:00Z",
+                reclaim_before="2026-03-25T14:34:00Z",
+                notes="reclaimed malformed timestamp",
+            )
+            conn.execute(
+                """
+                UPDATE alpaca_managed_positions
+                SET sell_status = 'pending_cancel', sell_renewal_requested_at = '2026-03-25 14:30:00'
+                WHERE id = 1
+                """
+            )
+            legacy_timestamp_reclaimed = claim_alpaca_managed_sell_renewal(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                requested_at="2026-03-25T14:40:00Z",
+                reclaim_before="2026-03-25T14:35:00Z",
+                notes="reclaimed legacy timestamp",
+            )
+            conn.execute(
+                "UPDATE alpaca_managed_positions SET sell_client_order_id = ? WHERE id = 1",
+                ("rsi-exit-TQQQ-1-r1",),
+            )
+            stale_generation = claim_alpaca_managed_sell_renewal(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                requested_at="2026-03-25T14:44:00Z",
+                reclaim_before="2026-03-25T14:39:00Z",
+                notes="stale generation",
+            )
+            conn.execute(
+                """
+                UPDATE alpaca_managed_positions
+                SET sell_client_order_id = ?, closed_at = CURRENT_TIMESTAMP,
+                    sell_status = 'accepted', sell_renewal_requested_at = NULL
+                WHERE id = 1
+                """,
+                ("rsi-exit-TQQQ-1",),
+            )
+            closed_position = claim_alpaca_managed_sell_renewal(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                requested_at="2026-03-25T14:44:00Z",
+                reclaim_before="2026-03-25T14:39:00Z",
+                notes="closed position",
+            )
+            conn.execute(
+                """
+                UPDATE alpaca_managed_positions
+                SET closed_at = NULL, remaining_qty = 0, sell_status = 'accepted'
+                WHERE id = 1
+                """
+            )
+            completed_position = claim_alpaca_managed_sell_renewal(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                requested_at="2026-03-25T14:44:00Z",
+                reclaim_before="2026-03-25T14:39:00Z",
+                notes="completed position",
+            )
+            conn.execute(
+                """
+                UPDATE alpaca_managed_positions
+                SET remaining_qty = 2, sell_status = 'incomplete_fill_metadata'
+                WHERE id = 1
+                """
+            )
+            safety_blocked = claim_alpaca_managed_sell_renewal(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                requested_at="2026-03-25T14:44:00Z",
+                reclaim_before="2026-03-25T14:39:00Z",
+                notes="safety-blocked position",
+            )
+
+        self.assertTrue(first)
+        self.assertFalse(overlapping)
+        self.assertTrue(reclaimed)
+        self.assertTrue(malformed_timestamp_reclaimed)
+        self.assertTrue(legacy_timestamp_reclaimed)
+        self.assertFalse(stale_generation)
+        self.assertFalse(closed_position)
+        self.assertFalse(completed_position)
+        self.assertFalse(safety_blocked)
+
+    def test_managed_sell_replacement_claim_is_atomic_across_connections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.db"
+            with sqlite3.connect(db_path) as setup_conn:
+                init_state_db(setup_conn)
+                save_alpaca_managed_buy_order(
+                    setup_conn,
+                    symbol="TQQQ",
+                    signal_symbol="QQQ",
+                    buy_rsi=30,
+                    profit_target_multiple=1.5,
+                    buy_signal_date="2026-01-02",
+                    buy_client_order_id="rsi-buy-TQQQ-20260102",
+                    buy_alpaca_order_id="buy-1",
+                    buy_submitted_at="2026-01-02T14:30:00Z",
+                    buy_status="filled",
+                )
+                mark_alpaca_managed_buy_filled(
+                    setup_conn,
+                    1,
+                    buy_status="filled",
+                    filled_qty=2,
+                    filled_avg_price=100,
+                    filled_at="2026-01-02T14:31:00Z",
+                    target_sell_price=150,
+                )
+                record_alpaca_managed_sell_order(
+                    setup_conn,
+                    1,
+                    sell_client_order_id="rsi-exit-TQQQ-1",
+                    sell_alpaca_order_id="sell-1",
+                    sell_submitted_at="2026-01-02T14:32:00Z",
+                    sell_status="expired",
+                )
+
+            with sqlite3.connect(db_path) as first_conn, sqlite3.connect(db_path) as second_conn:
+                first = claim_alpaca_managed_sell_replacement(
+                    first_conn,
+                    1,
+                    prior_sell_client_order_id="rsi-exit-TQQQ-1",
+                    prior_sell_alpaca_order_id="sell-1",
+                    prior_renewal_count=0,
+                    replacement_sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                    requested_remaining_qty=2,
+                    notes="first replacement claim",
+                )
+                overlapping = claim_alpaca_managed_sell_replacement(
+                    second_conn,
+                    1,
+                    prior_sell_client_order_id="rsi-exit-TQQQ-1",
+                    prior_sell_alpaca_order_id="sell-1",
+                    prior_renewal_count=0,
+                    replacement_sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                    requested_remaining_qty=2,
+                    notes="overlapping replacement claim",
+                )
+                stale_observation_updated = update_alpaca_managed_sell_status_if_current(
+                    second_conn,
+                    1,
+                    expected_sell_client_order_id="rsi-exit-TQQQ-1",
+                    sell_status="expired",
+                    sell_alpaca_order_id="sell-1",
+                    sell_expires_at="2026-03-30T20:15:00Z",
+                )
+                stale_manual_review_updated = update_alpaca_managed_sell_status_if_current(
+                    second_conn,
+                    1,
+                    expected_sell_client_order_id="rsi-exit-TQQQ-1",
+                    sell_status="quantity_mismatch",
+                    notes="stale manual review result",
+                )
+                stale_null_generation_updated = update_alpaca_managed_sell_status_if_current(
+                    second_conn,
+                    1,
+                    expected_sell_client_order_id=None,
+                    sell_status="fractional_qty",
+                    notes="stale initial-submission result",
+                )
+                _, _, stale_submission_response_updated = _record_observed_managed_sell_order(
+                    conn=second_conn,
+                    position_id=1,
+                    sell_client_order_id="rsi-exit-TQQQ-1",
+                    sell_order={
+                        "id": "sell-1",
+                        "status": "accepted",
+                        "submitted_at": "2026-03-30T19:30:00Z",
+                    },
+                )
+                stale_open_order_attached = attach_alpaca_managed_sell_order_if_current(
+                    second_conn,
+                    1,
+                    expected_sell_client_order_id="rsi-exit-TQQQ-1",
+                    expected_sell_alpaca_order_id="sell-1",
+                    expected_renewal_count=0,
+                    sell_renewal_count=0,
+                    sell_client_order_id="rsi-exit-TQQQ-1",
+                    sell_alpaca_order_id="sell-1",
+                    sell_submitted_at="2026-01-02T14:32:00Z",
+                    sell_status="accepted",
+                    sell_expires_at="2026-03-30T20:15:00Z",
+                    notes="stale open-order recovery",
+                )
+                remaining_qty, stale_fill_updated_generation = mark_alpaca_managed_sell_filled_if_current(
+                    second_conn,
+                    1,
+                    expected_sell_client_order_id="rsi-exit-TQQQ-1",
+                    sell_status="expired",
+                    sell_filled_qty=1,
+                    sell_filled_avg_price=150,
+                    sell_filled_at="2026-03-30T19:00:00Z",
+                    sell_alpaca_order_id="sell-1",
+                    sell_expires_at="2026-03-30T20:15:00Z",
+                )
+                oversized_retry = claim_alpaca_managed_sell_submission_retry(
+                    second_conn,
+                    1,
+                    sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                    claimed_at="2026-03-30T19:01:00Z",
+                    reclaim_before="2026-03-30T18:56:00Z",
+                    notes="over-sized retry",
+                )
+                row = second_conn.execute(
+                    """
+                    SELECT sell_client_order_id, sell_alpaca_order_id, sell_status,
+                           sell_renewal_count, sold_qty, remaining_qty
+                    FROM alpaca_managed_positions WHERE id = 1
+                    """
+                ).fetchone()
+
+        self.assertTrue(first)
+        self.assertFalse(overlapping)
+        self.assertFalse(stale_observation_updated)
+        self.assertFalse(stale_manual_review_updated)
+        self.assertFalse(stale_null_generation_updated)
+        self.assertFalse(stale_submission_response_updated)
+        self.assertFalse(stale_open_order_attached)
+        self.assertFalse(stale_fill_updated_generation)
+        self.assertIsNone(oversized_retry)
+        self.assertEqual(remaining_qty, 1)
+        self.assertEqual(row, ("rsi-exit-TQQQ-1-r1", None, "submission_pending", 1, 1, 1))
+
+    def test_managed_sell_replacement_claim_rejects_concurrently_closed_position(self) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="canceled",
+            )
+            conn.execute(
+                "UPDATE alpaca_managed_positions SET closed_at = CURRENT_TIMESTAMP WHERE id = 1"
+            )
+
+            claimed_qty = claim_alpaca_managed_sell_replacement(
+                conn,
+                1,
+                prior_sell_client_order_id="rsi-exit-TQQQ-1",
+                prior_sell_alpaca_order_id="sell-1",
+                prior_renewal_count=0,
+                replacement_sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                requested_remaining_qty=2,
+                notes="stale replacement after concurrent close",
+            )
+            conn.execute(
+                """
+                UPDATE alpaca_managed_positions
+                SET closed_at = NULL, sell_status = 'stopped'
+                WHERE id = 1
+                """
+            )
+            stopped_claimed_qty = claim_alpaca_managed_sell_replacement(
+                conn,
+                1,
+                prior_sell_client_order_id="rsi-exit-TQQQ-1",
+                prior_sell_alpaca_order_id="sell-1",
+                prior_renewal_count=0,
+                replacement_sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                requested_remaining_qty=2,
+                notes="unsafe stopped replacement",
+            )
+            row = conn.execute(
+                "SELECT sell_client_order_id, sell_status, sell_renewal_count FROM alpaca_managed_positions WHERE id = 1"
+            ).fetchone()
+
+        self.assertIsNone(claimed_qty)
+        self.assertIsNone(stopped_claimed_qty)
+        self.assertEqual(row, ("rsi-exit-TQQQ-1", "stopped", 0))
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_recovered_r2_managed_sell_advances_next_replacement_to_r3(
+        self, mock_get: Mock, mock_post: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
+            )
+            attached = attach_alpaca_managed_sell_order_if_current(
+                conn,
+                1,
+                expected_sell_client_order_id=None,
+                expected_sell_alpaca_order_id=None,
+                expected_renewal_count=0,
+                sell_renewal_count=2,
+                sell_client_order_id="rsi-exit-TQQQ-1-r2",
+                sell_alpaca_order_id="sell-2",
+                sell_submitted_at="2026-03-25T14:32:00Z",
+                sell_status="canceled",
+                sell_expires_at="2026-03-30T20:15:00Z",
+            )
+            backward_attached = attach_alpaca_managed_sell_order_if_current(
+                conn,
+                1,
+                expected_sell_client_order_id="rsi-exit-TQQQ-1-r2",
+                expected_sell_alpaca_order_id="sell-2",
+                expected_renewal_count=2,
+                sell_renewal_count=1,
+                sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-03-25T14:31:00Z",
+                sell_status="accepted",
+                sell_expires_at="2026-03-30T20:15:00Z",
+            )
+            update_alpaca_managed_sell_status_if_current(
+                conn,
+                1,
+                expected_sell_client_order_id="rsi-exit-TQQQ-1-r2",
+                sell_status="canceled",
+                sell_renewal_requested_at="2026-03-25T14:32:00Z",
+            )
+            mock_get.side_effect = [
+                response(200, {"id": "sell-2", "status": "canceled"}),
+                response(200, []),
+            ]
+            mock_post.return_value = response(200, {"id": "sell-3", "status": "accepted"})
+
+            result = reconcile_alpaca_managed_positions(
+                conn,
+                self.cfg(buy=True, sell=True, gtc_sell_renewal_enabled=False),
+            )
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertTrue(attached)
+        self.assertFalse(backward_attached)
+        self.assertEqual(result.loc[0, "Status"], "renewed")
+        self.assertEqual(mock_post.call_args.kwargs["json"]["client_order_id"], "rsi-exit-TQQQ-1-r3")
+        self.assertEqual(managed.loc[0, "sell_renewal_count"], 3)
+        self.assertEqual(managed.loc[0, "sell_client_order_id"], "rsi-exit-TQQQ-1-r3")
+
+    def test_open_sell_attachment_rejects_closed_or_completed_position(self) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
+            )
+            conn.execute(
+                "UPDATE alpaca_managed_positions SET closed_at = CURRENT_TIMESTAMP WHERE id = 1"
+            )
+            closed_attached = attach_alpaca_managed_sell_order_if_current(
+                conn,
+                1,
+                expected_sell_client_order_id=None,
+                expected_sell_alpaca_order_id=None,
+                expected_renewal_count=0,
+                sell_renewal_count=1,
+                sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-03-25T14:32:00Z",
+                sell_status="accepted",
+                sell_expires_at="2026-06-23T20:15:00Z",
+            )
+            conn.execute(
+                "UPDATE alpaca_managed_positions SET closed_at = NULL, remaining_qty = 0 WHERE id = 1"
+            )
+            completed_attached = attach_alpaca_managed_sell_order_if_current(
+                conn,
+                1,
+                expected_sell_client_order_id=None,
+                expected_sell_alpaca_order_id=None,
+                expected_renewal_count=0,
+                sell_renewal_count=1,
+                sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-03-25T14:32:00Z",
+                sell_status="accepted",
+                sell_expires_at="2026-06-23T20:15:00Z",
+            )
+            row = conn.execute(
+                "SELECT sell_client_order_id, sell_alpaca_order_id, sell_renewal_count FROM alpaca_managed_positions WHERE id = 1"
+            ).fetchone()
+
+        self.assertFalse(closed_attached)
+        self.assertFalse(completed_attached)
+        self.assertEqual(row, (None, None, 0))
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_initial_recovery_rejects_multiple_managed_sell_generations(
+        self, mock_get: Mock, mock_post: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
+            )
+            mock_get.return_value = response(
+                200,
+                [
+                    {"id": "sell-1", "symbol": "TQQQ", "side": "sell", "client_order_id": "rsi-exit-TQQQ-1-r1"},
+                    {"id": "sell-2", "symbol": "TQQQ", "side": "sell", "client_order_id": "rsi-exit-TQQQ-1-r2"},
+                ],
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "managed_order_conflict")
+        self.assertTrue(pd.isna(managed.loc[0, "sell_client_order_id"]))
+        self.assertEqual(managed.loc[0, "sell_renewal_count"], 0)
+        mock_post.assert_not_called()
+
+    def test_final_fill_blocks_stale_replacement_claim_and_allows_guarded_close(self) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="expired",
+            )
+            remaining, current = mark_alpaca_managed_sell_filled_if_current(
+                conn, 1, expected_sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_status="filled", sell_filled_qty=2, sell_filled_avg_price=150,
+                sell_filled_at="2026-03-30T19:00:00Z", sell_alpaca_order_id="sell-1",
+            )
+            stale_claim = claim_alpaca_managed_sell_replacement(
+                conn, 1, prior_sell_client_order_id="rsi-exit-TQQQ-1",
+                prior_sell_alpaca_order_id="sell-1", prior_renewal_count=0,
+                replacement_sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                requested_remaining_qty=2, notes="stale replacement",
+            )
+            stale_retry = claim_alpaca_managed_sell_submission_retry(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                claimed_at="2026-03-30T19:01:00Z",
+                reclaim_before="2026-03-30T18:56:00Z",
+                notes="stale 404 retry",
+            )
+            closed = close_alpaca_managed_position_if_current_and_complete(
+                conn, 1, expected_sell_client_order_id="rsi-exit-TQQQ-1",
+                closed_at="2026-03-30T19:00:00Z", notes="filled",
+            )
+
+        self.assertTrue(current)
+        self.assertEqual(remaining, 0)
+        self.assertIsNone(stale_claim)
+        self.assertIsNone(stale_retry)
+        self.assertTrue(closed)
+
+    def test_parent_buy_fill_cannot_move_backward(self) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="partially_filled",
+            )
+            current = mark_alpaca_managed_buy_filled(
+                conn, 1, buy_status="partially_filled", filled_qty=3,
+                filled_avg_price=101, filled_at=None, target_sell_price=151.5,
+            )
+            stale = mark_alpaca_managed_buy_filled(
+                conn, 1, buy_status="partially_filled", filled_qty=2,
+                filled_avg_price=100, filled_at=None, target_sell_price=150,
+            )
+            row = conn.execute(
+                "SELECT filled_qty, filled_avg_price, target_sell_price, remaining_qty "
+                "FROM alpaca_managed_positions WHERE id = 1"
+            ).fetchone()
+
+        self.assertTrue(current)
+        self.assertFalse(stale)
+        self.assertEqual(row, (3, 101, 151.5, 3))
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_replacement_404_recovery_uses_persisted_remaining_quantity(
+        self, mock_get: Mock, mock_post: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
+                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="expired", sell_order_qty=2,
+            )
+            mark_alpaca_managed_sell_filled(
+                conn, 1, sell_status="expired", sell_filled_qty=1,
+                sell_filled_avg_price=150, sell_filled_at="2026-03-30T19:00:00Z",
+                sell_alpaca_order_id="sell-1",
+            )
+            claimed_qty = claim_alpaca_managed_sell_replacement(
+                conn, 1, prior_sell_client_order_id="rsi-exit-TQQQ-1",
+                prior_sell_alpaca_order_id="sell-1", prior_renewal_count=0,
+                replacement_sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                requested_remaining_qty=1, notes="replacement claimed",
+            )
+            conn.execute(
+                """
+                UPDATE alpaca_managed_positions
+                SET sell_status = 'submission_retrying',
+                    sell_submission_retry_claimed_at = 'not-a-timestamp'
+                WHERE id = 1
+                """
+            )
+            malformed_retry_qty = claim_alpaca_managed_sell_submission_retry(
+                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                claimed_at="2026-03-30T19:10:00Z",
+                reclaim_before="2026-03-30T19:05:00Z",
+                notes="reclaimed malformed retry timestamp",
+            )
+            conn.execute(
+                """
+                UPDATE alpaca_managed_positions
+                SET sell_status = 'submission_retrying',
+                    sell_submission_retry_claimed_at = '2026-03-30 19:00:00'
+                WHERE id = 1
+                """
+            )
+            legacy_retry_qty = claim_alpaca_managed_sell_submission_retry(
+                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                claimed_at="2026-03-30T19:11:00Z",
+                reclaim_before="2026-03-30T19:06:00Z",
+                notes="reclaimed legacy retry timestamp",
+            )
+            conn.execute(
+                """
+                UPDATE alpaca_managed_positions
+                SET sell_status = 'submission_pending', sell_submission_retry_claimed_at = NULL
+                WHERE id = 1
+                """
+            )
+            parent_fill_increased = mark_alpaca_managed_buy_filled(
+                conn, 1, buy_status="filled", filled_qty=3, filled_avg_price=100,
+                filled_at="2026-01-02T14:31:30Z", target_sell_price=150,
+            )
+            mock_get.return_value = error_response(404, {})
+            competing_claims: list[float | None] = []
+
+            def submit_while_competing_claim_is_attempted(*args: object, **kwargs: object) -> Mock:
+                competing_claims.append(
+                    claim_alpaca_managed_sell_submission_retry(
+                        conn, 1, sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                        claimed_at="2099-01-01T00:00:00Z",
+                        reclaim_before="2000-01-01T00:00:00Z",
+                        notes="competing retry",
+                    )
+                )
+                return response(200, {"id": "sell-2", "status": "accepted", "qty": "1"})
+
+            mock_post.side_effect = submit_while_competing_claim_is_attempted
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+
+        self.assertEqual(claimed_qty, 1)
+        self.assertEqual(malformed_retry_qty, 1)
+        self.assertEqual(legacy_retry_qty, 1)
+        self.assertTrue(parent_fill_increased)
+        self.assertEqual(result.loc[0, "Status"], "renewed")
+        self.assertEqual(mock_post.call_args.kwargs["json"]["qty"], "1")
+        self.assertEqual(competing_claims, [None])
 
     @patch("leveraged_trader.alpaca._latest_market_price")
     @patch("leveraged_trader.alpaca.requests.post")
@@ -1233,6 +2401,7 @@ class AlpacaTests(unittest.TestCase):
                         "limit_price": "150",
                     },
                 ),
+                response(200, []),
             ]
             mock_delete.return_value = response(200, {})
             mock_post.side_effect = [
@@ -1794,6 +2963,294 @@ class AlpacaTests(unittest.TestCase):
 
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
+    def test_immediate_filled_sell_with_nonfinite_metadata_preserves_accounting(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
+            )
+            mock_get.return_value = response(200, [])
+            mock_post.return_value = response(
+                200,
+                {
+                    "id": "sell-1",
+                    "status": "filled",
+                    "filled_qty": "nan",
+                    "filled_avg_price": "inf",
+                },
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.iloc[-1]["Status"], "incomplete_fill_metadata")
+        self.assertEqual(managed.loc[0, "sell_status"], "incomplete_fill_metadata")
+        self.assertEqual(managed.loc[0, "sold_qty"], 0)
+        self.assertEqual(managed.loc[0, "remaining_qty"], 2)
+        self.assertTrue(pd.isna(managed.loc[0, "realized_pl"]))
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_immediate_filled_sell_without_broker_id_preserves_accounting(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
+            )
+            mock_get.return_value = response(200, [])
+            mock_post.return_value = response(
+                200,
+                {
+                    "status": "filled",
+                    "filled_qty": "2",
+                    "filled_avg_price": "150",
+                },
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.iloc[-1]["Status"], "incomplete_order_metadata")
+        self.assertEqual(managed.loc[0, "sell_status"], "incomplete_order_metadata")
+        self.assertEqual(managed.loc[0, "sold_qty"], 0)
+        self.assertEqual(managed.loc[0, "remaining_qty"], 2)
+        self.assertTrue(pd.isna(managed.loc[0, "closed_at"]))
+
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_polled_sell_fill_without_broker_id_preserves_accounting(
+        self,
+        mock_get: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id=None,
+                sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="accepted",
+            )
+            mock_get.return_value = response(
+                200,
+                {
+                    "status": "filled",
+                    "filled_qty": "2",
+                    "filled_avg_price": "150",
+                },
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "incomplete_order_metadata")
+        self.assertEqual(managed.loc[0, "sell_status"], "incomplete_order_metadata")
+        self.assertEqual(managed.loc[0, "sold_qty"], 0)
+        self.assertEqual(managed.loc[0, "remaining_qty"], 2)
+        self.assertTrue(pd.isna(managed.loc[0, "closed_at"]))
+
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_conflicting_polled_sell_identity_preserves_managed_generation(
+        self,
+        mock_get: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="accepted",
+            )
+            mock_get.return_value = response(
+                200,
+                {
+                    "id": "different-sell",
+                    "client_order_id": "different-generation",
+                    "status": "filled",
+                    "filled_qty": "2",
+                    "filled_avg_price": "150",
+                },
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "incomplete_order_metadata")
+        self.assertEqual(managed.loc[0, "sell_status"], "incomplete_order_metadata")
+        self.assertEqual(managed.loc[0, "sell_alpaca_order_id"], "sell-1")
+        self.assertEqual(managed.loc[0, "sell_client_order_id"], "rsi-exit-TQQQ-1")
+        self.assertEqual(managed.loc[0, "sold_qty"], 0)
+        self.assertTrue(pd.isna(managed.loc[0, "closed_at"]))
+
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_submission_recovery_fill_regression_preserves_accounting_for_review(
+        self,
+        mock_get: Mock,
+    ) -> None:
+        rows: list[dict] = []
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="partially_filled",
+            )
+            mark_alpaca_managed_sell_filled(
+                conn,
+                1,
+                sell_status="partially_filled",
+                sell_filled_qty=1,
+                sell_filled_avg_price=150,
+                sell_filled_at="2026-01-02T14:33:00Z",
+                sell_alpaca_order_id="sell-1",
+            )
+            mock_get.return_value = response(
+                200,
+                {
+                    "id": "sell-1",
+                    "status": "filled",
+                    "filled_qty": "0.5",
+                    "filled_avg_price": "150",
+                },
+            )
+
+            recovered = _recover_managed_sell_submission(
+                conn=conn,
+                client=AlpacaClient(self.cfg(sell=True)),
+                rows=rows,
+                position_id=1,
+                symbol="TQQQ",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                filled_qty=2,
+                target_sell_price=150,
+                message="submission response lost",
+                close_on_complete=True,
+            )
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertTrue(recovered)
+        self.assertEqual(rows[0]["Status"], "fill_quantity_regression")
+        self.assertEqual(managed.loc[0, "sell_status"], "fill_quantity_regression")
+        self.assertEqual(managed.loc[0, "sold_qty"], 1)
+        self.assertEqual(managed.loc[0, "remaining_qty"], 1)
+        self.assertEqual(managed.loc[0, "realized_pl"], 50)
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
     def test_ambiguous_managed_sell_submission_persists_intent_for_recovery(
         self,
         mock_get: Mock,
@@ -1832,6 +3289,9 @@ class AlpacaTests(unittest.TestCase):
                         "client_order_id": "rsi-exit-TQQQ-1",
                         "status": "accepted",
                         "submitted_at": "2026-01-02T14:32:00Z",
+                        "qty": "2",
+                        "limit_price": "150",
+                        "expires_at": "2027-06-30T20:15:00Z",
                     },
                 ),
             ]
@@ -1906,6 +3366,97 @@ class AlpacaTests(unittest.TestCase):
 
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
+    def test_open_sell_recovery_without_broker_id_is_blocked_for_review(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
+            )
+            mock_get.return_value = response(
+                200,
+                [
+                    {
+                        "symbol": "TQQQ",
+                        "side": "sell",
+                        "client_order_id": "rsi-exit-TQQQ-1",
+                        "status": "accepted",
+                    }
+                ],
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "incomplete_order_metadata")
+        self.assertEqual(managed.loc[0, "sell_status"], "incomplete_order_metadata")
+        self.assertTrue(pd.isna(managed.loc[0, "sell_client_order_id"]))
+        self.assertTrue(pd.isna(managed.loc[0, "sell_alpaca_order_id"]))
+        mock_post.assert_not_called()
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_open_sell_recovery_accounts_fill_before_intent_mismatch(
+        self, mock_get: Mock, mock_post: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
+                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+            )
+            mock_get.return_value = response(
+                200,
+                [
+                    {
+                        "id": "sell-1", "symbol": "TQQQ", "side": "sell",
+                        "client_order_id": "rsi-exit-TQQQ-1", "status": "partially_filled",
+                        "qty": "3", "limit_price": "149", "filled_qty": "1",
+                        "filled_avg_price": "149",
+                    }
+                ],
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "quantity_mismatch")
+        self.assertEqual(managed.loc[0, "sell_status"], "quantity_mismatch")
+        self.assertEqual(managed.loc[0, "sell_alpaca_order_id"], "sell-1")
+        self.assertEqual(managed.loc[0, "sold_qty"], 1)
+        self.assertEqual(managed.loc[0, "remaining_qty"], 1)
+        self.assertEqual(managed.loc[0, "realized_pl"], 49)
+        mock_post.assert_not_called()
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
     def test_expired_partial_sell_without_average_price_blocks_renewal(
         self,
         mock_get: Mock,
@@ -1959,6 +3510,113 @@ class AlpacaTests(unittest.TestCase):
         self.assertEqual(managed.loc[0, "sell_status"], "incomplete_fill_metadata")
         self.assertTrue(pd.isna(managed.loc[0, "closed_at"]))
         mock_post.assert_not_called()
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_invalid_numeric_sell_fill_metadata_is_blocked_without_accounting_update(
+        self, mock_get: Mock, mock_post: Mock,
+    ) -> None:
+        cases = [
+            ("-1", "150"),
+            ("not-a-quantity", "150"),
+            ("NaN", "150"),
+            ("1", "Infinity"),
+        ]
+        for filled_qty, filled_avg_price in cases:
+            with self.subTest(filled_qty=filled_qty, filled_avg_price=filled_avg_price), sqlite3.connect(
+                ":memory:"
+            ) as conn:
+                init_state_db(conn)
+                save_alpaca_managed_buy_order(
+                    conn,
+                    symbol="TQQQ",
+                    signal_symbol="QQQ",
+                    buy_rsi=30,
+                    profit_target_multiple=1.5,
+                    buy_signal_date="2026-01-02",
+                    buy_client_order_id="rsi-buy-TQQQ-20260102",
+                    buy_alpaca_order_id="buy-1",
+                    buy_submitted_at="2026-01-02T14:30:00Z",
+                    buy_status="filled",
+                )
+                mark_alpaca_managed_buy_filled(
+                    conn,
+                    1,
+                    buy_status="filled",
+                    filled_qty=2,
+                    filled_avg_price=100,
+                    filled_at="2026-01-02T14:31:00Z",
+                    target_sell_price=150,
+                )
+                record_alpaca_managed_sell_order(
+                    conn,
+                    1,
+                    sell_client_order_id="rsi-exit-TQQQ-1",
+                    sell_alpaca_order_id="sell-1",
+                    sell_submitted_at="2026-01-02T14:32:00Z",
+                    sell_status="accepted",
+                )
+                mock_get.return_value = response(
+                    200,
+                    {
+                        "id": "sell-1",
+                        "status": "partially_filled",
+                        "qty": "2",
+                        "limit_price": "150",
+                        "filled_qty": filled_qty,
+                        "filled_avg_price": filled_avg_price,
+                    },
+                )
+
+                result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+                managed = load_alpaca_managed_positions(conn)
+
+            self.assertEqual(result.loc[0, "Status"], "incomplete_fill_metadata")
+            self.assertEqual(managed.loc[0, "sell_status"], "incomplete_fill_metadata")
+            self.assertEqual(managed.loc[0, "sold_qty"], 0)
+            self.assertEqual(managed.loc[0, "remaining_qty"], 2)
+            mock_post.assert_not_called()
+
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_cumulative_sell_fill_regression_preserves_accounting_for_review(self, mock_get: Mock) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
+                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="partially_filled", sell_order_qty=2,
+            )
+            mark_alpaca_managed_sell_filled(
+                conn, 1, sell_status="partially_filled", sell_filled_qty=1,
+                sell_filled_avg_price=150, sell_filled_at="2026-01-02T14:33:00Z",
+                sell_alpaca_order_id="sell-1",
+            )
+            mock_get.return_value = response(
+                200,
+                {
+                    "id": "sell-1", "status": "partially_filled", "qty": "2",
+                    "limit_price": "150", "filled_qty": "0.5", "filled_avg_price": "150",
+                },
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "fill_quantity_regression")
+        self.assertEqual(managed.loc[0, "sell_status"], "fill_quantity_regression")
+        self.assertEqual(managed.loc[0, "sold_qty"], 1)
+        self.assertEqual(managed.loc[0, "remaining_qty"], 1)
+        self.assertEqual(managed.loc[0, "realized_pl"], 50)
 
     @patch("leveraged_trader.alpaca.requests.get")
     def test_overfilled_managed_sell_remains_active_for_review(self, mock_get: Mock) -> None:
@@ -2177,7 +3835,7 @@ class AlpacaTests(unittest.TestCase):
                     "id": "sell-2",
                     "status": "accepted",
                     "submitted_at": "2026-04-01T14:32:00Z",
-                    "expires_at": "2026-06-30T20:15:00Z",
+                    "expires_at": "2027-06-30T20:15:00Z",
                 },
             )
 
@@ -2191,10 +3849,239 @@ class AlpacaTests(unittest.TestCase):
         self.assertEqual(managed.loc[0, "sell_client_order_id"], "rsi-exit-TQQQ-1-r1")
         self.assertEqual(managed.loc[0, "sell_alpaca_order_id"], "sell-2")
         self.assertEqual(managed.loc[0, "sell_renewal_count"], 1)
-        self.assertEqual(managed.loc[0, "sell_expires_at"], "2026-06-30T20:15:00Z")
+        self.assertEqual(managed.loc[0, "sell_expires_at"], "2027-06-30T20:15:00Z")
         self.assertEqual(mock_post.call_args.kwargs["json"]["client_order_id"], "rsi-exit-TQQQ-1-r1")
         self.assertEqual(mock_post.call_args.kwargs["json"]["limit_price"], "150")
         mock_delete.assert_not_called()
+
+    @patch("leveraged_trader.alpaca._utc_now")
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_replacement_expiring_inside_renewal_window_is_blocked_for_review(
+        self, mock_get: Mock, mock_post: Mock, mock_utc_now: Mock,
+    ) -> None:
+        mock_utc_now.return_value = datetime(2026, 4, 1, tzinfo=UTC)
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
+                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="expired",
+            )
+            mock_get.side_effect = [
+                response(200, {"id": "sell-1", "status": "expired"}),
+                response(200, []),
+            ]
+            mock_post.return_value = response(
+                200,
+                {
+                    "id": "sell-2", "client_order_id": "rsi-exit-TQQQ-1-r1",
+                    "status": "accepted", "expires_at": "2026-04-05T20:15:00Z",
+                },
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "incomplete_order_metadata")
+        self.assertEqual(managed.loc[0, "sell_status"], "incomplete_order_metadata")
+        self.assertEqual(managed.loc[0, "sell_alpaca_order_id"], "sell-2")
+        self.assertIn("inside the renewal window", result.loc[0, "Message"])
+        mock_post.assert_called_once()
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_rejected_replacement_is_not_reported_as_renewed(
+        self, mock_get: Mock, mock_post: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
+                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="expired",
+            )
+            mock_get.side_effect = [
+                response(200, {"id": "sell-1", "status": "expired"}),
+                response(200, []),
+            ]
+            mock_post.return_value = response(
+                200,
+                {
+                    "id": "sell-2",
+                    "client_order_id": "rsi-exit-TQQQ-1-r1",
+                    "status": "rejected",
+                },
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "rejected")
+        self.assertIn("no active replacement", result.loc[0, "Message"])
+        self.assertEqual(managed.loc[0, "sell_status"], "rejected")
+        self.assertEqual(managed.loc[0, "sell_client_order_id"], "rsi-exit-TQQQ-1-r1")
+        mock_post.assert_called_once()
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_partially_filled_replacement_is_accounted_immediately(
+        self, mock_get: Mock, mock_post: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
+                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="expired",
+            )
+            mock_get.side_effect = [
+                response(200, {"id": "sell-1", "status": "expired"}),
+                response(200, []),
+            ]
+            mock_post.return_value = response(
+                200,
+                {
+                    "id": "sell-2",
+                    "client_order_id": "rsi-exit-TQQQ-1-r1",
+                    "status": "partially_filled",
+                    "filled_qty": "1",
+                    "filled_avg_price": "150",
+                    "qty": "2",
+                    "limit_price": "150",
+                },
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "renewed")
+        self.assertEqual(managed.loc[0, "sell_status"], "partially_filled")
+        self.assertEqual(managed.loc[0, "sold_qty"], 1)
+        self.assertEqual(managed.loc[0, "remaining_qty"], 1)
+        self.assertEqual(managed.loc[0, "realized_pl"], 50)
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_active_partial_replacement_covering_position_does_not_close(
+        self, mock_get: Mock, mock_post: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
+                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="expired",
+            )
+            mock_get.side_effect = [
+                response(200, {"id": "sell-1", "status": "expired"}),
+                response(200, []),
+            ]
+            mock_post.return_value = response(
+                200,
+                {
+                    "id": "sell-2",
+                    "client_order_id": "rsi-exit-TQQQ-1-r1",
+                    "status": "partially_filled",
+                    "filled_qty": "2",
+                    "filled_avg_price": "150",
+                    "qty": "2",
+                    "limit_price": "150",
+                },
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "quantity_mismatch")
+        self.assertEqual(managed.loc[0, "sell_status"], "quantity_mismatch")
+        self.assertEqual(managed.loc[0, "remaining_qty"], 0)
+        self.assertTrue(pd.isna(managed.loc[0, "closed_at"]))
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_oversized_replacement_response_is_blocked_before_accounting(
+        self, mock_get: Mock, mock_post: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
+                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="expired",
+            )
+            mock_get.side_effect = [
+                response(200, {"id": "sell-1", "status": "expired"}),
+                response(200, []),
+            ]
+            mock_post.return_value = response(
+                200,
+                {
+                    "id": "sell-2", "client_order_id": "rsi-exit-TQQQ-1-r1",
+                    "status": "partially_filled", "qty": "3", "limit_price": "149",
+                    "filled_qty": "1", "filled_avg_price": "149",
+                },
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "quantity_mismatch")
+        self.assertEqual(managed.loc[0, "sell_status"], "quantity_mismatch")
+        self.assertEqual(managed.loc[0, "sell_alpaca_order_id"], "sell-2")
+        self.assertEqual(managed.loc[0, "remaining_qty"], 1)
+        self.assertEqual(managed.loc[0, "sold_qty"], 1)
+        self.assertEqual(managed.loc[0, "realized_pl"], 49)
 
     @patch("leveraged_trader.alpaca._utc_now")
     @patch("leveraged_trader.alpaca.requests.delete")
@@ -2247,6 +4134,8 @@ class AlpacaTests(unittest.TestCase):
                         "status": "accepted",
                         "submitted_at": "2026-01-02T14:32:00Z",
                         "expires_at": "2026-03-30T20:15:00Z",
+                        "qty": "2",
+                        "limit_price": "150",
                     },
                 ),
                 response(
@@ -2258,6 +4147,7 @@ class AlpacaTests(unittest.TestCase):
                         "expires_at": "2026-03-30T20:15:00Z",
                     },
                 ),
+                response(200, []),
             ]
             mock_delete.return_value = response(204, {})
             mock_post.return_value = response(
@@ -2286,7 +4176,462 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca.requests.delete")
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
-    def test_managed_sell_cancel_timeout_preserves_renewal_intent_for_later_resubmission(
+    def test_cancellation_refresh_fill_regression_blocks_replacement(
+        self, mock_get: Mock, mock_post: Mock, mock_delete: Mock, mock_utc_now: Mock,
+    ) -> None:
+        mock_utc_now.return_value = datetime(2026, 3, 25, tzinfo=UTC)
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
+                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="partially_filled", sell_order_qty=2,
+            )
+            mark_alpaca_managed_sell_filled(
+                conn, 1, sell_status="partially_filled", sell_filled_qty=1,
+                sell_filled_avg_price=150, sell_filled_at="2026-01-02T14:33:00Z",
+                sell_alpaca_order_id="sell-1",
+            )
+            mock_get.side_effect = [
+                response(
+                    200,
+                    {
+                        "id": "sell-1", "status": "partially_filled", "qty": "2",
+                        "limit_price": "150", "filled_qty": "1", "filled_avg_price": "150",
+                        "expires_at": "2026-03-30T20:15:00Z",
+                    },
+                ),
+                response(
+                    200,
+                    {
+                        "id": "sell-1", "status": "canceled", "filled_qty": "0.5",
+                        "filled_avg_price": "150",
+                    },
+                ),
+            ]
+            mock_delete.return_value = response(204, {})
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "fill_quantity_regression")
+        self.assertEqual(managed.loc[0, "sell_status"], "fill_quantity_regression")
+        self.assertEqual(managed.loc[0, "sold_qty"], 1)
+        self.assertEqual(managed.loc[0, "remaining_qty"], 1)
+        mock_delete.assert_called_once()
+        mock_post.assert_not_called()
+
+    @patch("leveraged_trader.alpaca._utc_now")
+    @patch("leveraged_trader.alpaca.requests.delete")
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_managed_sell_renewal_uses_persisted_expiration_when_broker_value_is_invalid(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+        mock_delete: Mock,
+        mock_utc_now: Mock,
+    ) -> None:
+        mock_utc_now.return_value = datetime(2026, 3, 25, tzinfo=UTC)
+        for broker_expires_at in [None, "not-a-timestamp"]:
+            with self.subTest(broker_expires_at=broker_expires_at), sqlite3.connect(":memory:") as conn:
+                mock_get.reset_mock()
+                mock_post.reset_mock()
+                mock_delete.reset_mock()
+                init_state_db(conn)
+                save_alpaca_managed_buy_order(
+                    conn,
+                    symbol="TQQQ",
+                    signal_symbol="QQQ",
+                    buy_rsi=30,
+                    profit_target_multiple=1.5,
+                    buy_signal_date="2026-01-02",
+                    buy_client_order_id="rsi-buy-TQQQ-20260102",
+                    buy_alpaca_order_id="buy-1",
+                    buy_submitted_at="2026-01-02T14:30:00Z",
+                    buy_status="filled",
+                )
+                mark_alpaca_managed_buy_filled(
+                    conn,
+                    1,
+                    buy_status="filled",
+                    filled_qty=2,
+                    filled_avg_price=100,
+                    filled_at="2026-01-02T14:31:00Z",
+                    target_sell_price=150,
+                )
+                record_alpaca_managed_sell_order(
+                    conn,
+                    1,
+                    sell_client_order_id="rsi-exit-TQQQ-1",
+                    sell_alpaca_order_id="sell-1",
+                    sell_submitted_at="2026-01-02T14:32:00Z",
+                    sell_status="accepted",
+                    sell_expires_at="2026-03-30T20:15:00Z",
+                )
+                broker_order = {
+                    "id": "sell-1", "status": "accepted", "qty": "2", "limit_price": "150"
+                }
+                if broker_expires_at is not None:
+                    broker_order["expires_at"] = broker_expires_at
+                mock_get.side_effect = [
+                    response(200, broker_order),
+                    response(200, {"id": "sell-1", "status": "canceled"}),
+                    response(200, []),
+                ]
+                mock_delete.return_value = response(204, {})
+                mock_post.return_value = response(200, {"id": "sell-2", "status": "accepted"})
+
+                result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+                managed = load_alpaca_managed_positions(conn)
+
+            self.assertEqual(result.loc[0, "Status"], "renewed")
+            self.assertEqual(managed.loc[0, "sell_client_order_id"], "rsi-exit-TQQQ-1-r1")
+            mock_delete.assert_called_once()
+            mock_post.assert_called_once()
+
+    @patch("leveraged_trader.alpaca.requests.delete")
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_active_sell_without_any_valid_expiration_is_blocked_for_review(
+        self, mock_get: Mock, mock_post: Mock, mock_delete: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
+                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="accepted", sell_expires_at=None,
+            )
+            mock_get.return_value = response(
+                200,
+                {
+                    "id": "sell-1", "status": "accepted", "qty": "2",
+                    "limit_price": "150", "expires_at": "not-a-timestamp",
+                },
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "incomplete_order_metadata")
+        self.assertEqual(managed.loc[0, "sell_status"], "incomplete_order_metadata")
+        mock_delete.assert_not_called()
+        mock_post.assert_not_called()
+
+    @patch("leveraged_trader.alpaca.requests.delete")
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_active_managed_sell_with_invalid_order_metadata_is_blocked_for_review(
+        self, mock_get: Mock, mock_post: Mock, mock_delete: Mock,
+    ) -> None:
+        cases = [
+            (None, "150"),
+            ("not-a-quantity", "150"),
+            ("0", "150"),
+            ("2", "-1"),
+        ]
+        for qty, limit_price in cases:
+            with self.subTest(qty=qty, limit_price=limit_price), sqlite3.connect(":memory:") as conn:
+                mock_get.reset_mock()
+                mock_post.reset_mock()
+                mock_delete.reset_mock()
+                init_state_db(conn)
+                save_alpaca_managed_buy_order(
+                    conn,
+                    symbol="TQQQ",
+                    signal_symbol="QQQ",
+                    buy_rsi=30,
+                    profit_target_multiple=1.5,
+                    buy_signal_date="2026-01-02",
+                    buy_client_order_id="rsi-buy-TQQQ-20260102",
+                    buy_alpaca_order_id="buy-1",
+                    buy_submitted_at="2026-01-02T14:30:00Z",
+                    buy_status="filled",
+                )
+                mark_alpaca_managed_buy_filled(
+                    conn,
+                    1,
+                    buy_status="filled",
+                    filled_qty=2,
+                    filled_avg_price=100,
+                    filled_at="2026-01-02T14:31:00Z",
+                    target_sell_price=150,
+                )
+                record_alpaca_managed_sell_order(
+                    conn,
+                    1,
+                    sell_client_order_id="rsi-exit-TQQQ-1",
+                    sell_alpaca_order_id="sell-1",
+                    sell_submitted_at="2026-01-02T14:32:00Z",
+                    sell_status="accepted",
+                )
+                broker_order = {
+                    "id": "sell-1",
+                    "status": "accepted",
+                    "limit_price": limit_price,
+                    "expires_at": "2026-06-30T20:15:00Z",
+                }
+                if qty is not None:
+                    broker_order["qty"] = qty
+                mock_get.return_value = response(200, broker_order)
+
+                result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+                managed = load_alpaca_managed_positions(conn)
+
+            self.assertEqual(result.loc[0, "Status"], "incomplete_order_metadata")
+            self.assertEqual(managed.loc[0, "sell_status"], "incomplete_order_metadata")
+            mock_delete.assert_not_called()
+            mock_post.assert_not_called()
+
+    @patch("leveraged_trader.alpaca.requests.delete")
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_partial_fill_is_recorded_before_invalid_order_metadata_blocks_renewal(
+        self, mock_get: Mock, mock_post: Mock, mock_delete: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=3,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="accepted",
+            )
+            mock_get.return_value = response(
+                200,
+                {
+                    "id": "sell-1",
+                    "status": "partially_filled",
+                    "filled_qty": "1",
+                    "filled_avg_price": "150",
+                    "limit_price": "150",
+                    "expires_at": "2026-06-30T20:15:00Z",
+                },
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "incomplete_order_metadata")
+        self.assertEqual(managed.loc[0, "sell_status"], "incomplete_order_metadata")
+        self.assertEqual(managed.loc[0, "sold_qty"], 1)
+        self.assertEqual(managed.loc[0, "remaining_qty"], 2)
+        self.assertEqual(managed.loc[0, "realized_pl"], 50)
+        mock_delete.assert_not_called()
+        mock_post.assert_not_called()
+
+    @patch("leveraged_trader.alpaca._utc_now")
+    @patch("leveraged_trader.alpaca.requests.delete")
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_managed_sell_renewal_rejects_multiple_newer_generations(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+        mock_delete: Mock,
+        mock_utc_now: Mock,
+    ) -> None:
+        mock_utc_now.return_value = datetime(2026, 3, 25, tzinfo=UTC)
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="accepted",
+            )
+            mock_get.side_effect = [
+                response(
+                    200,
+                    {
+                        "id": "sell-1",
+                        "status": "accepted",
+                        "expires_at": "2026-03-30T20:15:00Z",
+                        "qty": "2",
+                        "limit_price": "150",
+                    },
+                ),
+                response(200, {"id": "sell-1", "status": "canceled"}),
+                response(
+                    200,
+                    [
+                        {
+                            "id": "sell-1",
+                            "symbol": "TQQQ",
+                            "side": "sell",
+                            "client_order_id": "rsi-exit-TQQQ-1",
+                        },
+                        {
+                            "id": "sell-2",
+                            "symbol": "TQQQ",
+                            "side": "sell",
+                            "client_order_id": "rsi-exit-TQQQ-1-r1",
+                        },
+                        {
+                            "id": "sell-3",
+                            "symbol": "TQQQ",
+                            "side": "sell",
+                            "client_order_id": "rsi-exit-TQQQ-1-r2",
+                        },
+                    ],
+                ),
+            ]
+            mock_delete.return_value = response(204, {})
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "managed_order_conflict")
+        self.assertEqual(managed.loc[0, "sell_client_order_id"], "rsi-exit-TQQQ-1")
+        self.assertEqual(managed.loc[0, "sell_status"], "canceled")
+        self.assertFalse(pd.isna(managed.loc[0, "sell_renewal_requested_at"]))
+        mock_delete.assert_called_once()
+        mock_post.assert_not_called()
+
+    @patch("leveraged_trader.alpaca._utc_now")
+    @patch("leveraged_trader.alpaca.requests.delete")
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_managed_sell_renewal_does_not_replace_stopped_or_suspended_order(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+        mock_delete: Mock,
+        mock_utc_now: Mock,
+    ) -> None:
+        mock_utc_now.return_value = datetime(2026, 3, 25, tzinfo=UTC)
+        for broker_status in ["stopped", "suspended"]:
+            with self.subTest(broker_status=broker_status), sqlite3.connect(":memory:") as conn:
+                mock_get.reset_mock()
+                mock_post.reset_mock()
+                mock_delete.reset_mock()
+                init_state_db(conn)
+                save_alpaca_managed_buy_order(
+                    conn,
+                    symbol="TQQQ",
+                    signal_symbol="QQQ",
+                    buy_rsi=30,
+                    profit_target_multiple=1.5,
+                    buy_signal_date="2026-01-02",
+                    buy_client_order_id="rsi-buy-TQQQ-20260102",
+                    buy_alpaca_order_id="buy-1",
+                    buy_submitted_at="2026-01-02T14:30:00Z",
+                    buy_status="filled",
+                )
+                mark_alpaca_managed_buy_filled(
+                    conn,
+                    1,
+                    buy_status="filled",
+                    filled_qty=2,
+                    filled_avg_price=100,
+                    filled_at="2026-01-02T14:31:00Z",
+                    target_sell_price=150,
+                )
+                record_alpaca_managed_sell_order(
+                    conn,
+                    1,
+                    sell_client_order_id="rsi-exit-TQQQ-1",
+                    sell_alpaca_order_id="sell-1",
+                    sell_submitted_at="2026-01-02T14:32:00Z",
+                    sell_status="accepted",
+                )
+                mock_get.side_effect = [
+                    response(
+                        200,
+                        {
+                            "id": "sell-1",
+                            "status": "accepted",
+                            "expires_at": "2026-03-30T20:15:00Z",
+                            "qty": "2",
+                            "limit_price": "150",
+                        },
+                    ),
+                    response(200, {"id": "sell-1", "status": broker_status}),
+                ]
+                mock_delete.return_value = response(204, {})
+
+                result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+                managed = load_alpaca_managed_positions(conn)
+
+            self.assertEqual(result.loc[0, "Status"], broker_status)
+            self.assertIn("replacement was not submitted", result.loc[0, "Message"])
+            self.assertEqual(managed.loc[0, "sell_client_order_id"], "rsi-exit-TQQQ-1")
+            self.assertEqual(managed.loc[0, "sell_status"], broker_status)
+            mock_delete.assert_called_once()
+            mock_post.assert_not_called()
+
+    @patch("leveraged_trader.alpaca._utc_now")
+    @patch("leveraged_trader.alpaca.requests.delete")
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_managed_sell_cancel_timeout_refreshes_and_renews_immediately(
         self,
         mock_get: Mock,
         mock_post: Mock,
@@ -2333,6 +4678,8 @@ class AlpacaTests(unittest.TestCase):
                         "status": "accepted",
                         "submitted_at": "2026-01-02T14:32:00Z",
                         "expires_at": "2026-03-30T20:15:00Z",
+                        "qty": "2",
+                        "limit_price": "150",
                     },
                 ),
                 response(
@@ -2357,20 +4704,15 @@ class AlpacaTests(unittest.TestCase):
                 },
             )
 
-            first_result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
-            after_timeout = load_alpaca_managed_positions(conn)
-            mock_delete.reset_mock()
-            second_result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
             renewed = load_alpaca_managed_positions(conn)
 
-        self.assertEqual(first_result.loc[0, "Status"], "error")
-        self.assertEqual(after_timeout.loc[0, "sell_status"], "pending_cancel")
-        self.assertFalse(pd.isna(after_timeout.loc[0, "sell_renewal_requested_at"]))
-        self.assertEqual(second_result.loc[0, "Status"], "renewed")
+        self.assertEqual(result.loc[0, "Status"], "renewed")
         self.assertEqual(renewed.loc[0, "sell_client_order_id"], "rsi-exit-TQQQ-1-r1")
         self.assertEqual(renewed.loc[0, "sell_alpaca_order_id"], "sell-2")
         self.assertTrue(pd.isna(renewed.loc[0, "sell_renewal_requested_at"]))
-        mock_delete.assert_not_called()
+        mock_delete.assert_called_once()
+        mock_post.assert_called_once()
 
     @patch("leveraged_trader.alpaca._utc_now")
     @patch("leveraged_trader.alpaca.requests.delete")
@@ -2437,6 +4779,163 @@ class AlpacaTests(unittest.TestCase):
         self.assertIn("replacement not submitted yet", result.loc[0, "Message"])
         mock_delete.assert_not_called()
         mock_post.assert_not_called()
+
+    @patch("leveraged_trader.alpaca._utc_now")
+    @patch("leveraged_trader.alpaca.requests.delete")
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_stale_pending_cancel_claim_retries_cancellation_and_replaces_order(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+        mock_delete: Mock,
+        mock_utc_now: Mock,
+    ) -> None:
+        mock_utc_now.return_value = datetime(2026, 3, 25, 15, 0, tzinfo=UTC)
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="accepted",
+            )
+            update_alpaca_managed_sell_status(
+                conn,
+                1,
+                sell_status="pending_cancel",
+                sell_renewal_requested_at="2026-03-25T14:50:00Z",
+            )
+            mock_get.side_effect = [
+                response(
+                    200,
+                    {
+                        "id": "sell-1",
+                        "status": "pending_cancel",
+                        "qty": "2",
+                        "limit_price": "150",
+                    },
+                ),
+                response(200, {"id": "sell-1", "status": "canceled"}),
+                response(200, []),
+            ]
+            mock_delete.return_value = response(204, {})
+            mock_post.return_value = response(
+                200,
+                {
+                    "id": "sell-2",
+                    "status": "accepted",
+                    "submitted_at": "2026-03-25T15:00:00Z",
+                    "expires_at": "2026-06-23T20:15:00Z",
+                },
+            )
+
+            result = reconcile_alpaca_managed_positions(
+                conn,
+                self.cfg(buy=True, sell=True, gtc_sell_renewal_enabled=False),
+            )
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "renewed")
+        self.assertEqual(managed.loc[0, "sell_client_order_id"], "rsi-exit-TQQQ-1-r1")
+        self.assertEqual(managed.loc[0, "sell_alpaca_order_id"], "sell-2")
+        mock_delete.assert_called_once()
+        mock_post.assert_called_once()
+
+    @patch("leveraged_trader.alpaca.requests.delete")
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_expired_sell_with_persisted_renewal_intent_is_replaced_when_renewal_is_disabled(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+        mock_delete: Mock,
+    ) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
+            )
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="pending_cancel",
+            )
+            update_alpaca_managed_sell_status(
+                conn,
+                1,
+                sell_status="pending_cancel",
+                sell_renewal_requested_at="2026-03-25T14:50:00Z",
+            )
+            mock_get.side_effect = [
+                response(200, {"id": "sell-1", "status": "expired"}),
+                response(200, []),
+            ]
+            mock_post.return_value = response(
+                200,
+                {
+                    "id": "sell-2",
+                    "status": "accepted",
+                    "submitted_at": "2026-04-01T14:32:00Z",
+                    "expires_at": "2027-06-30T20:15:00Z",
+                },
+            )
+
+            result = reconcile_alpaca_managed_positions(
+                conn,
+                self.cfg(buy=True, sell=True, gtc_sell_renewal_enabled=False),
+            )
+            managed = load_alpaca_managed_positions(conn)
+
+        self.assertEqual(result.loc[0, "Status"], "renewed")
+        self.assertEqual(managed.loc[0, "sell_client_order_id"], "rsi-exit-TQQQ-1-r1")
+        self.assertEqual(managed.loc[0, "sell_alpaca_order_id"], "sell-2")
+        mock_delete.assert_not_called()
+        mock_post.assert_called_once()
 
     @patch("leveraged_trader.alpaca.requests.delete")
     @patch("leveraged_trader.alpaca.requests.post")

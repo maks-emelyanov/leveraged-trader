@@ -294,8 +294,10 @@ Use `--output-dir` to choose a different location:
 uv run leveraged-trader --output-dir outputs/dev
 ```
 
-The SQLite state database defaults to `strategy_state.sqlite`; use `--db` to override it. Universe
-generation also persists `nasdaq_etf_universe`, `universe_audit_rows`,
+The SQLite state database defaults to `strategy_state.sqlite`; use `--db` to override it. Managed
+Alpaca rows persist `alpaca_asset_id`, while `alpaca_symbol_aliases` retains every ticker observed for
+that asset so historical symbols remain protected after a rename. Universe generation also persists
+`nasdaq_etf_universe`, `universe_audit_rows`,
 `universe_audit_missing_candidates`, `universe_audit_source_status`,
 `universe_workflow_source_status`, `universe_active_listing_source_status`, and
 `universe_rsi_mapping_review` tables for source and RSI-mapping review. Leveraged workflow rows whose RSI
@@ -385,6 +387,7 @@ Managed sell orders:
 - Persist the deterministic sell client order ID before broker submission. Ambiguous sell POST outcomes are recovered by client order ID on later reconciliation, and matching open `rsi-exit-...` orders can be reattached to the managed row.
 - Reconcile immediately after each submitted buy batch, so fills can receive their managed sell in the same workflow run.
 - Renew active GTC sells before Alpaca's aged-order expiration, using the remaining managed quantity and frozen target price. The renewal-cancel intent is persisted before requesting cancellation, so a timeout can still be completed after Alpaca later reports the order canceled.
+- Track managed holdings by Alpaca asset ID across ticker changes. Before changing a managed ticker, the workflow validates attached broker/client-order identity and Alpaca's asset response, rejects asset or ticker collisions, and applies the complete migration batch transactionally. Existing broker order IDs remain attached to their original lineage, old-ticker open sells can be recovered by asset ID, every observed ticker alias blocks duplicate buys, and replacement exits use Alpaca's current ticker. Unchanged positions avoid historical-order lookups. A `symbol_migrated` row appears in reconciliation output only on the run that applies the change.
 - Resubmit expired GTC sells when renewal is enabled and the managed position is still open.
 - Are not resubmitted automatically after a sell order is rejected or manually canceled.
 - Skip GTC sell submission for legacy fractional managed quantities and keep the managed position active for review.
@@ -397,7 +400,7 @@ The raw `sell_signals.csv` report remains a strategy recommendation report. Dire
 
 Managed position lifecycle:
 
-- Active rows have `closed_at` unset and block new buys for the same symbol.
+- Active rows have `closed_at` unset and block new buys for the current symbol and every ticker alias recorded for the same Alpaca asset ID.
 - Filled managed sells set `sell_status="filled"`, store actual sell fill data, and populate `closed_at`; rows are retained as trade history.
 - Closed rows missing actual sell fill data are counted as incomplete and excluded from realized P/L totals.
 - Existing Alpaca positions that predate this table are not managed automatically unless imported into `alpaca_managed_positions`.

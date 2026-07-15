@@ -15,7 +15,11 @@ from rich.console import Console
 from leveraged_trader.benchmark import WorkflowPhaseTimings, WorkflowTimer
 from leveraged_trader.config import AlpacaOrderConfig, BacktestConfig, UniverseConfig
 from leveraged_trader.output import WorkflowReporter
-from leveraged_trader.storage import _synchronize_market_data_history, init_state_db
+from leveraged_trader.storage import (
+    _synchronize_market_data_history,
+    init_state_db,
+    save_alpaca_managed_buy_order,
+)
 from leveraged_trader.workflow import (
     AssetRunJob,
     AssetRunPlan,
@@ -26,6 +30,7 @@ from leveraged_trader.workflow import (
     _prepare_asset_run,
     _prepare_workflow_asset,
     _process_asset_grid_for_db,
+    _reconcile_alpaca_managed_positions_for_db,
     _run_asset_pipeline,
     _state_connection,
     _terminal_alpaca_display_results,
@@ -36,6 +41,51 @@ from leveraged_trader.workflow import (
 
 
 class WorkflowAsyncTests(unittest.TestCase):
+    @patch("leveraged_trader.workflow.reconcile_alpaca_managed_positions")
+    @patch("leveraged_trader.workflow.migrate_alpaca_managed_position_symbols")
+    def test_reconciliation_output_mentions_only_migrations_from_current_run(
+        self, mock_migrate: Mock, mock_reconcile: Mock,
+    ) -> None:
+        columns = [
+            "Position ID", "Workflow", "Asset", "Action", "Status",
+            "Buy Client Order ID", "Sell Client Order ID", "Qty", "Limit Price",
+            "Alpaca Order ID", "Message",
+        ]
+        mock_reconcile.return_value = pd.DataFrame(columns=columns)
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "state.sqlite")
+            with sqlite3.connect(db_path) as conn:
+                init_state_db(conn)
+                save_alpaca_managed_buy_order(
+                    conn,
+                    symbol="SATG",
+                    signal_symbol="SATS",
+                    buy_rsi=30,
+                    profit_target_multiple=1.1,
+                    buy_signal_date="2026-06-18",
+                    buy_client_order_id="rsi-buy-SATG-20260618",
+                    buy_alpaca_order_id="buy-1",
+                    buy_submitted_at="2026-06-22T13:30:00Z",
+                    buy_status="filled",
+                )
+
+            def migrate(conn: sqlite3.Connection, _cfg: AlpacaOrderConfig) -> dict[str, str]:
+                conn.execute(
+                    "UPDATE alpaca_managed_positions SET symbol = 'ECHX', alpaca_asset_id = 'asset-echo'"
+                )
+                conn.commit()
+                return {"SATG": "ECHX"}
+
+            mock_migrate.side_effect = migrate
+            result = _reconcile_alpaca_managed_positions_for_db(db_path, AlpacaOrderConfig())
+            self.assertEqual(result["Status"].tolist(), ["symbol_migrated"])
+            self.assertIn("SATG to ECHX", result.loc[0, "Message"])
+
+            mock_migrate.side_effect = None
+            mock_migrate.return_value = {}
+            result = _reconcile_alpaca_managed_positions_for_db(db_path, AlpacaOrderConfig())
+            self.assertTrue(result.empty)
+
     @staticmethod
     def _symbol_history(symbol: str, offset: float = 0.0) -> pd.DataFrame:
         dates = pd.date_range("2026-01-02", periods=20, freq="B")

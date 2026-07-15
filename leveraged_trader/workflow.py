@@ -15,7 +15,11 @@ from typing import Any
 
 import pandas as pd
 
-from .alpaca import reconcile_alpaca_managed_positions, submit_alpaca_paper_buy_orders
+from .alpaca import (
+    migrate_alpaca_managed_position_symbols,
+    reconcile_alpaca_managed_positions,
+    submit_alpaca_paper_buy_orders,
+)
 from .benchmark import WorkflowPhase, WorkflowPhaseTimings, WorkflowTimer
 from .config import (
     RISK_FREE_SYMBOL,
@@ -309,7 +313,40 @@ def _reconcile_alpaca_managed_positions_for_db(
     alpaca_cfg: AlpacaOrderConfig,
 ) -> pd.DataFrame:
     with _state_connection(db_path) as conn:
-        return reconcile_alpaca_managed_positions(conn, alpaca_cfg)
+        migrations = migrate_alpaca_managed_position_symbols(conn, alpaca_cfg)
+        reconciliation = reconcile_alpaca_managed_positions(conn, alpaca_cfg)
+        if not migrations:
+            return reconciliation
+        active_positions = load_alpaca_managed_positions(conn, active_only=True)
+        migration_rows = []
+        for prior_symbol, current_symbol in migrations.items():
+            matches = active_positions[
+                active_positions["symbol"].astype(str).str.upper().eq(current_symbol.upper())
+            ]
+            if matches.empty:
+                continue
+            position = matches.iloc[0]
+            migration_rows.append(
+                {
+                    "Position ID": int(position["id"]),
+                    "Workflow": position.get("workflow"),
+                    "Asset": current_symbol,
+                    "Action": "symbol",
+                    "Status": "symbol_migrated",
+                    "Buy Client Order ID": position.get("buy_client_order_id"),
+                    "Sell Client Order ID": position.get("sell_client_order_id"),
+                    "Qty": position.get("filled_qty"),
+                    "Limit Price": position.get("target_sell_price"),
+                    "Alpaca Order ID": position.get("sell_alpaca_order_id"),
+                    "Message": (
+                        f"managed Alpaca symbol migrated from {prior_symbol} to {current_symbol} "
+                        "using stable asset identity"
+                    ),
+                }
+            )
+        if not migration_rows:
+            return reconciliation
+        return pd.concat([pd.DataFrame(migration_rows), reconciliation], ignore_index=True)
 
 
 def _prepare_asset_run(

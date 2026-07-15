@@ -47,6 +47,7 @@ STATUS_STYLES = {
     "managed_only": "cyan",
     "open_order": "cyan",
     "renewed": "green",
+    "symbol_migrated": "cyan",
     "disabled": "yellow",
     "fractional_qty": "yellow",
     "incomplete_fill_metadata": "red",

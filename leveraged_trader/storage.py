@@ -24,6 +24,10 @@ from .optimized_backtest import (
     run_single_equity_curve,
 )
 
+
+class SellFillQuantityRegressionError(ValueError):
+    """Raised when a broker reports less cumulative fill than was already recorded."""
+
 SUMMARY_ROLLUP_COLUMNS = {
     "first_equity": "REAL",
     "last_equity": "REAL",
@@ -38,10 +42,13 @@ SUMMARY_ROLLUP_COLUMNS = {
 }
 
 ALPACA_MANAGED_POSITION_COLUMNS = {
+    "alpaca_asset_id": "TEXT",
     "workflow": "TEXT",
     "buy_submission_claimed_at": "TEXT",
     "buy_submission_attempt_count": "INTEGER NOT NULL DEFAULT 1",
     "sell_expires_at": "TEXT",
+    "sell_order_qty": "REAL",
+    "sell_submission_retry_claimed_at": "TEXT",
     "sell_renewal_count": "INTEGER NOT NULL DEFAULT 0",
     "sell_renewal_requested_at": "TEXT",
     "sell_filled_qty": "REAL",
@@ -217,6 +224,8 @@ def init_state_db(conn: sqlite3.Connection) -> None:
             sell_submitted_at TEXT,
             sell_status TEXT,
             sell_expires_at TEXT,
+            sell_order_qty REAL,
+            sell_submission_retry_claimed_at TEXT,
             sell_renewal_count INTEGER NOT NULL DEFAULT 0,
             sell_renewal_requested_at TEXT,
             sell_filled_qty REAL,
@@ -239,6 +248,14 @@ def init_state_db(conn: sqlite3.Connection) -> None:
             filled_qty REAL NOT NULL,
             filled_value REAL NOT NULL,
             PRIMARY KEY (managed_position_id, alpaca_order_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS alpaca_symbol_aliases (
+            alpaca_asset_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (alpaca_asset_id, symbol)
         );
         """
     )
@@ -366,8 +383,8 @@ def save_strategy_config(
     asset_symbol: str,
     signal_symbol: str,
     fingerprint: str,
-) -> None:
-    conn.execute(
+) -> bool:
+    cursor = conn.execute(
         """
         INSERT INTO strategy_config (asset_symbol, signal_symbol, fingerprint)
         VALUES (?, ?, ?)
@@ -973,13 +990,15 @@ def load_alpaca_managed_positions(conn: sqlite3.Connection, *, active_only: bool
     where = "WHERE closed_at IS NULL" if active_only else ""
     return pd.read_sql_query(
         f"""
-        SELECT id, workflow, symbol, signal_symbol, buy_rsi, profit_target_multiple,
+        SELECT id, workflow, symbol, alpaca_asset_id, signal_symbol, buy_rsi, profit_target_multiple,
                buy_signal_date, buy_client_order_id, buy_alpaca_order_id,
                buy_submitted_at, buy_submission_claimed_at, buy_submission_attempt_count,
                buy_status, filled_qty, filled_avg_price,
                filled_at, target_sell_price, sell_client_order_id,
                sell_alpaca_order_id, sell_submitted_at, sell_status,
                sell_expires_at, sell_renewal_count, sell_renewal_requested_at,
+               sell_order_qty,
+               sell_submission_retry_claimed_at,
                sell_filled_qty, sell_filled_avg_price, sell_filled_at,
                realized_pl, realized_pl_pct, sold_qty, sold_value, remaining_qty,
                closed_at, notes, created_at, updated_at
@@ -997,9 +1016,85 @@ def active_alpaca_managed_symbols(conn: sqlite3.Connection) -> set[str]:
         SELECT DISTINCT UPPER(symbol)
         FROM alpaca_managed_positions
         WHERE closed_at IS NULL
+        UNION
+        SELECT DISTINCT UPPER(a.symbol)
+        FROM alpaca_symbol_aliases AS a
+        JOIN alpaca_managed_positions AS p
+          ON p.alpaca_asset_id = a.alpaca_asset_id
+        WHERE p.closed_at IS NULL
         """
     ).fetchall()
     return {str(row[0]) for row in rows}
+
+
+def migrate_alpaca_managed_position_symbol(
+    conn: sqlite3.Connection,
+    position_id: int,
+    *,
+    alpaca_asset_id: str,
+    current_symbol: str,
+    commit: bool = True,
+) -> bool:
+    """Persist a broker ticker rename while retaining every known alias."""
+    current_symbol = current_symbol.upper()
+    row = conn.execute(
+        "SELECT symbol, alpaca_asset_id FROM alpaca_managed_positions WHERE id = ? AND closed_at IS NULL",
+        (position_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    prior_symbol = str(row[0]).upper()
+    prior_asset_id = None if row[1] is None else str(row[1])
+    if prior_asset_id is not None and prior_asset_id != alpaca_asset_id:
+        return False
+    collision = conn.execute(
+        """
+        SELECT 1 FROM alpaca_managed_positions
+        WHERE id != ? AND closed_at IS NULL
+          AND (UPPER(symbol) = UPPER(?) OR alpaca_asset_id = ?)
+        LIMIT 1
+        """,
+        (position_id, current_symbol, alpaca_asset_id),
+    ).fetchone()
+    if collision is not None:
+        return False
+    cursor = conn.execute(
+        """
+        UPDATE alpaca_managed_positions
+        SET symbol = ?, alpaca_asset_id = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND closed_at IS NULL
+          AND (alpaca_asset_id IS NULL OR alpaca_asset_id = ?)
+          AND NOT EXISTS (
+                SELECT 1 FROM alpaca_managed_positions AS other
+                WHERE other.id != alpaca_managed_positions.id
+                  AND other.closed_at IS NULL
+                  AND (
+                        UPPER(other.symbol) = UPPER(?)
+                        OR other.alpaca_asset_id = ?
+                      )
+              )
+        """,
+        (
+            current_symbol,
+            alpaca_asset_id,
+            position_id,
+            alpaca_asset_id,
+            current_symbol,
+            alpaca_asset_id,
+        ),
+    )
+    if cursor.rowcount == 1:
+        conn.executemany(
+            """
+            INSERT INTO alpaca_symbol_aliases (alpaca_asset_id, symbol)
+            VALUES (?, ?)
+            ON CONFLICT(alpaca_asset_id, symbol) DO UPDATE SET last_seen_at = CURRENT_TIMESTAMP
+            """,
+            [(alpaca_asset_id, prior_symbol), (alpaca_asset_id, current_symbol)],
+        )
+    if commit:
+        conn.commit()
+    return cursor.rowcount == 1
 
 
 def update_alpaca_managed_buy_status(
@@ -1052,8 +1147,8 @@ def mark_alpaca_managed_buy_filled(
     buy_alpaca_order_id: str | None = None,
     buy_submitted_at: str | None = None,
     notes: str | None = None,
-) -> None:
-    conn.execute(
+) -> bool:
+    cursor = conn.execute(
         """
         UPDATE alpaca_managed_positions
         SET buy_status = ?,
@@ -1067,11 +1162,13 @@ def mark_alpaca_managed_buy_filled(
             END,
             filled_qty = ?,
             filled_avg_price = ?,
+            remaining_qty = ? - COALESCE(sold_qty, 0),
             filled_at = COALESCE(?, filled_at),
             target_sell_price = ?,
             notes = COALESCE(?, notes),
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
+          AND (filled_qty IS NULL OR ? + 0.00000001 >= filled_qty)
         """,
         (
             buy_status,
@@ -1081,13 +1178,16 @@ def mark_alpaca_managed_buy_filled(
             buy_status,
             filled_qty,
             filled_avg_price,
+            filled_qty,
             filled_at,
             target_sell_price,
             notes,
             position_id,
+            filled_qty,
         ),
     )
     conn.commit()
+    return cursor.rowcount == 1
 
 
 def record_alpaca_managed_sell_order(
@@ -1099,6 +1199,7 @@ def record_alpaca_managed_sell_order(
     sell_submitted_at: str | None,
     sell_status: str,
     sell_expires_at: str | None = None,
+    sell_order_qty: float | None = None,
     increment_renewal_count: bool = False,
     notes: str | None = None,
 ) -> None:
@@ -1110,8 +1211,10 @@ def record_alpaca_managed_sell_order(
             sell_submitted_at = ?,
             sell_status = ?,
             sell_expires_at = ?,
+            sell_order_qty = COALESCE(?, sell_order_qty),
             sell_renewal_count = sell_renewal_count + ?,
             sell_renewal_requested_at = NULL,
+            sell_submission_retry_claimed_at = NULL,
             notes = COALESCE(?, notes),
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
@@ -1122,6 +1225,7 @@ def record_alpaca_managed_sell_order(
             sell_submitted_at,
             sell_status,
             sell_expires_at,
+            sell_order_qty,
             1 if increment_renewal_count else 0,
             notes,
             position_id,
@@ -1166,7 +1270,260 @@ def update_alpaca_managed_sell_status(
     conn.commit()
 
 
-def mark_alpaca_managed_sell_filled(
+def update_alpaca_managed_sell_status_if_current(
+    conn: sqlite3.Connection,
+    position_id: int,
+    *,
+    expected_sell_client_order_id: str | None,
+    sell_status: str,
+    sell_alpaca_order_id: str | None = None,
+    sell_submitted_at: str | None = None,
+    sell_expires_at: str | None = None,
+    sell_order_qty: float | None = None,
+    sell_renewal_requested_at: str | None = None,
+    clear_sell_submission_retry_claim: bool = False,
+    notes: str | None = None,
+) -> bool:
+    """Record a broker observation only if its managed-sell generation is current."""
+    cursor = conn.execute(
+        """
+        UPDATE alpaca_managed_positions
+        SET sell_status = ?,
+            sell_alpaca_order_id = COALESCE(?, sell_alpaca_order_id),
+            sell_submitted_at = COALESCE(?, sell_submitted_at),
+            sell_expires_at = COALESCE(?, sell_expires_at),
+            sell_order_qty = COALESCE(?, sell_order_qty),
+            sell_renewal_requested_at = COALESCE(?, sell_renewal_requested_at),
+            sell_submission_retry_claimed_at = CASE WHEN ? THEN NULL ELSE sell_submission_retry_claimed_at END,
+            notes = COALESCE(?, notes),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND sell_client_order_id IS ?
+        """,
+        (
+            sell_status,
+            sell_alpaca_order_id,
+            sell_submitted_at,
+            sell_expires_at,
+            sell_order_qty,
+            sell_renewal_requested_at,
+            1 if clear_sell_submission_retry_claim else 0,
+            notes,
+            position_id,
+            expected_sell_client_order_id,
+        ),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
+
+
+def claim_alpaca_managed_sell_renewal(
+    conn: sqlite3.Connection,
+    position_id: int,
+    *,
+    sell_client_order_id: str,
+    sell_alpaca_order_id: str,
+    requested_at: str,
+    reclaim_before: str,
+    notes: str,
+) -> bool:
+    """Atomically claim cancellation of a managed sell for renewal.
+
+    An abandoned claim may be reclaimed after the caller-provided lease cutoff.
+    The generation and active-position predicates prevent a stale reconciler
+    from canceling an order whose managed state has already advanced.
+    """
+    cursor = conn.execute(
+        """
+        UPDATE alpaca_managed_positions
+        SET sell_status = 'pending_cancel',
+            sell_renewal_requested_at = ?,
+            notes = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND sell_client_order_id = ?
+          AND sell_alpaca_order_id = ?
+          AND closed_at IS NULL
+          AND COALESCE(remaining_qty, filled_qty - COALESCE(sold_qty, 0)) > 0.00000001
+          AND LOWER(sell_status) IN
+              ('accepted', 'accepted_for_bidding', 'new', 'partially_filled', 'pending_new',
+               'pending_cancel')
+          AND (
+                sell_renewal_requested_at IS NULL
+                OR julianday(sell_renewal_requested_at) IS NULL
+                OR julianday(sell_renewal_requested_at) <= julianday(?)
+              )
+        """,
+        (
+            requested_at,
+            notes,
+            position_id,
+            sell_client_order_id,
+            sell_alpaca_order_id,
+            reclaim_before,
+        ),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
+
+
+def claim_alpaca_managed_sell_replacement(
+    conn: sqlite3.Connection,
+    position_id: int,
+    *,
+    prior_sell_client_order_id: str,
+    prior_sell_alpaca_order_id: str,
+    prior_renewal_count: int,
+    replacement_sell_client_order_id: str,
+    requested_remaining_qty: float,
+    notes: str,
+) -> float | None:
+    """Claim a replacement and return the authoritative remaining quantity."""
+    cursor = conn.execute(
+        """
+        UPDATE alpaca_managed_positions
+        SET sell_client_order_id = ?,
+            sell_alpaca_order_id = NULL,
+            sell_submitted_at = NULL,
+            sell_status = 'submission_pending',
+            sell_expires_at = NULL,
+            sell_order_qty = COALESCE(remaining_qty, filled_qty - COALESCE(sold_qty, 0)),
+            sell_renewal_count = sell_renewal_count + 1,
+            remaining_qty = COALESCE(remaining_qty, filled_qty - COALESCE(sold_qty, 0)),
+            sell_renewal_requested_at = NULL,
+            sell_submission_retry_claimed_at = NULL,
+            notes = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND sell_client_order_id = ?
+          AND sell_alpaca_order_id = ?
+          AND sell_renewal_count = ?
+          AND closed_at IS NULL
+          AND COALESCE(remaining_qty, filled_qty - COALESCE(sold_qty, 0)) > 0.00000001
+          AND ABS(COALESCE(remaining_qty, filled_qty - COALESCE(sold_qty, 0)) - ?) <= 0.00000001
+          AND LOWER(sell_status) IN
+              ('canceled', 'expired', 'filled')
+        RETURNING remaining_qty
+        """,
+        (
+            replacement_sell_client_order_id,
+            notes,
+            position_id,
+            prior_sell_client_order_id,
+            prior_sell_alpaca_order_id,
+            prior_renewal_count,
+            requested_remaining_qty,
+        ),
+    )
+    row = cursor.fetchone()
+    conn.commit()
+    return None if row is None else float(row[0])
+
+
+def claim_alpaca_managed_sell_submission_retry(
+    conn: sqlite3.Connection,
+    position_id: int,
+    *,
+    sell_client_order_id: str,
+    claimed_at: str,
+    reclaim_before: str,
+    notes: str,
+) -> float | None:
+    """Claim a missing sell retry and return its persisted safe quantity."""
+    cursor = conn.execute(
+        """
+        UPDATE alpaca_managed_positions
+        SET sell_status = 'submission_retrying',
+            sell_order_qty = COALESCE(
+                sell_order_qty, remaining_qty, filled_qty - COALESCE(sold_qty, 0)
+            ),
+            sell_submission_retry_claimed_at = ?,
+            notes = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND sell_client_order_id = ?
+          AND sell_alpaca_order_id IS NULL
+          AND closed_at IS NULL
+          AND LOWER(sell_status) IN
+              ('submission_pending', 'submission_unknown', 'submission_not_found', 'submission_retrying')
+          AND (
+                sell_submission_retry_claimed_at IS NULL
+                OR julianday(sell_submission_retry_claimed_at) IS NULL
+                OR julianday(sell_submission_retry_claimed_at) <= julianday(?)
+              )
+          AND COALESCE(sell_order_qty, remaining_qty, filled_qty - COALESCE(sold_qty, 0)) > 0.00000001
+          AND COALESCE(remaining_qty, filled_qty - COALESCE(sold_qty, 0)) > 0.00000001
+          AND COALESCE(sell_order_qty, remaining_qty, filled_qty - COALESCE(sold_qty, 0))
+              <= COALESCE(remaining_qty, filled_qty - COALESCE(sold_qty, 0)) + 0.00000001
+        RETURNING sell_order_qty
+        """,
+        (claimed_at, notes, position_id, sell_client_order_id, reclaim_before),
+    )
+    row = cursor.fetchone()
+    conn.commit()
+    return None if row is None else float(row[0])
+
+
+def attach_alpaca_managed_sell_order_if_current(
+    conn: sqlite3.Connection,
+    position_id: int,
+    *,
+    expected_sell_client_order_id: str | None,
+    expected_sell_alpaca_order_id: str | None,
+    expected_renewal_count: int,
+    sell_renewal_count: int,
+    sell_client_order_id: str,
+    sell_alpaca_order_id: str | None,
+    sell_submitted_at: str | None,
+    sell_status: str,
+    sell_expires_at: str | None,
+    sell_order_qty: float | None = None,
+    notes: str | None = None,
+) -> bool:
+    """Attach a discovered open sell only while the caller's snapshot is current."""
+    cursor = conn.execute(
+        """
+        UPDATE alpaca_managed_positions
+        SET sell_client_order_id = ?,
+            sell_alpaca_order_id = ?,
+            sell_submitted_at = ?,
+            sell_status = ?,
+            sell_expires_at = ?,
+            sell_order_qty = COALESCE(?, sell_order_qty),
+            sell_renewal_count = ?,
+            sell_renewal_requested_at = NULL,
+            sell_submission_retry_claimed_at = NULL,
+            notes = COALESCE(?, notes),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND sell_client_order_id IS ?
+          AND sell_alpaca_order_id IS ?
+          AND sell_renewal_count = ?
+          AND ? >= sell_renewal_count
+          AND closed_at IS NULL
+          AND COALESCE(remaining_qty, filled_qty - COALESCE(sold_qty, 0)) > 0.00000001
+        """,
+        (
+            sell_client_order_id,
+            sell_alpaca_order_id,
+            sell_submitted_at,
+            sell_status,
+            sell_expires_at,
+            sell_order_qty,
+            sell_renewal_count,
+            notes,
+            position_id,
+            expected_sell_client_order_id,
+            expected_sell_alpaca_order_id,
+            expected_renewal_count,
+            sell_renewal_count,
+        ),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
+
+
+def _mark_alpaca_managed_sell_filled(
     conn: sqlite3.Connection,
     position_id: int,
     *,
@@ -1178,7 +1535,8 @@ def mark_alpaca_managed_sell_filled(
     sell_submitted_at: str | None = None,
     sell_expires_at: str | None = None,
     notes: str | None = None,
-) -> float:
+    expected_sell_client_order_id: str | None = None,
+) -> tuple[float, bool]:
     """Record an order's cumulative fills and return the remaining buy quantity."""
     row = conn.execute(
         """
@@ -1208,7 +1566,9 @@ def mark_alpaca_managed_sell_filled(
         (position_id, order_key),
     ).fetchone()
     if prior is not None and observed_qty + 1e-8 < float(prior[0]):
-        raise ValueError("Alpaca sell filled quantity moved backwards for a managed order.")
+        raise SellFillQuantityRegressionError(
+            "Alpaca sell filled quantity moved backwards for a managed order."
+        )
 
     conn.execute(
         """
@@ -1239,6 +1599,13 @@ def mark_alpaca_managed_sell_filled(
     realized_pl = sold_value - matched_qty * buy_avg_price
     realized_pl_pct = realized_pl / (matched_qty * buy_avg_price) * 100.0 if matched_qty > 0 else None
     cumulative_sell_avg_price = sold_value / sold_qty if sold_qty > 0 else None
+    current = conn.execute(
+        "SELECT sell_client_order_id, sell_status FROM alpaca_managed_positions WHERE id = ?",
+        (position_id,),
+    ).fetchone()
+    generation_is_current = expected_sell_client_order_id is None or (
+        current is not None and current[0] == expected_sell_client_order_id
+    )
 
     conn.execute(
         """
@@ -1260,10 +1627,10 @@ def mark_alpaca_managed_sell_filled(
         WHERE id = ?
         """,
         (
-            sell_status,
-            sell_alpaca_order_id,
-            sell_submitted_at,
-            sell_expires_at,
+            sell_status if generation_is_current else current[1],
+            sell_alpaca_order_id if generation_is_current else None,
+            sell_submitted_at if generation_is_current else None,
+            sell_expires_at if generation_is_current else None,
             sold_qty,
             cumulative_sell_avg_price,
             sell_filled_at,
@@ -1277,7 +1644,31 @@ def mark_alpaca_managed_sell_filled(
         ),
     )
     conn.commit()
+    return remaining_qty, generation_is_current
+
+
+def mark_alpaca_managed_sell_filled(
+    conn: sqlite3.Connection,
+    position_id: int,
+    **kwargs: object,
+) -> float:
+    remaining_qty, _ = _mark_alpaca_managed_sell_filled(conn, position_id, **kwargs)
     return remaining_qty
+
+
+def mark_alpaca_managed_sell_filled_if_current(
+    conn: sqlite3.Connection,
+    position_id: int,
+    *,
+    expected_sell_client_order_id: str,
+    **kwargs: object,
+) -> tuple[float, bool]:
+    return _mark_alpaca_managed_sell_filled(
+        conn,
+        position_id,
+        expected_sell_client_order_id=expected_sell_client_order_id,
+        **kwargs,
+    )
 
 
 def close_alpaca_managed_position(
@@ -1298,6 +1689,30 @@ def close_alpaca_managed_position(
         (closed_at, notes, position_id),
     )
     conn.commit()
+
+
+def close_alpaca_managed_position_if_current_and_complete(
+    conn: sqlite3.Connection,
+    position_id: int,
+    *,
+    expected_sell_client_order_id: str,
+    closed_at: str | None,
+    notes: str | None = None,
+) -> bool:
+    cursor = conn.execute(
+        """
+        UPDATE alpaca_managed_positions
+        SET closed_at = COALESCE(?, CURRENT_TIMESTAMP),
+            notes = COALESCE(?, notes),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND sell_client_order_id = ?
+          AND ABS(COALESCE(remaining_qty, 1)) <= 0.00000001
+        """,
+        (closed_at, notes, position_id, expected_sell_client_order_id),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
 
 
 def save_equity_records(conn: sqlite3.Connection, records: list[dict]) -> None:
