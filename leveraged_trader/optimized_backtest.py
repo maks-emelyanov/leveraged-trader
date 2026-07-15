@@ -150,11 +150,7 @@ def run_grid_summary(
 
             next_action = deferred_action
             if deferred_action == ACTION_NONE and not np.isnan(rsi):
-                entry_signal = (
-                    rsi >= buy_rsi
-                    if rsi_entry_rule == RSI_ENTRY_UPPER
-                    else rsi <= buy_rsi
-                )
+                entry_signal = rsi >= buy_rsi if rsi_entry_rule == RSI_ENTRY_UPPER else rsi <= buy_rsi
                 if (not in_position) and entry_signal:
                     next_action = ACTION_BUY
                 elif (
@@ -303,11 +299,7 @@ def run_single_equity_curve(
 
         next_action = deferred_action
         if deferred_action == ACTION_NONE and not np.isnan(rsi):
-            entry_signal = (
-                rsi >= buy_rsi
-                if rsi_entry_rule == RSI_ENTRY_UPPER
-                else rsi <= buy_rsi
-            )
+            entry_signal = rsi >= buy_rsi if rsi_entry_rule == RSI_ENTRY_UPPER else rsi <= buy_rsi
             if (not in_position) and entry_signal:
                 next_action = ACTION_BUY
             elif (

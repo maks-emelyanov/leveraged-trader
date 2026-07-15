@@ -28,6 +28,7 @@ from .optimized_backtest import (
 class SellFillQuantityRegressionError(ValueError):
     """Raised when a broker reports less cumulative fill than was already recorded."""
 
+
 SUMMARY_ROLLUP_COLUMNS = {
     "first_equity": "REAL",
     "last_equity": "REAL",
@@ -265,20 +266,14 @@ def init_state_db(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_strategy_summary_rollup_columns(conn: sqlite3.Connection) -> None:
-    existing_columns = {
-        str(row[1])
-        for row in conn.execute("PRAGMA table_info(strategy_summary)").fetchall()
-    }
+    existing_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(strategy_summary)").fetchall()}
     for column_name, column_type in SUMMARY_ROLLUP_COLUMNS.items():
         if column_name not in existing_columns:
             conn.execute(f"ALTER TABLE strategy_summary ADD COLUMN {column_name} {column_type}")
 
 
 def _ensure_alpaca_managed_position_columns(conn: sqlite3.Connection) -> None:
-    existing_columns = {
-        str(row[1])
-        for row in conn.execute("PRAGMA table_info(alpaca_managed_positions)").fetchall()
-    }
+    existing_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(alpaca_managed_positions)").fetchall()}
     for column_name, column_type in ALPACA_MANAGED_POSITION_COLUMNS.items():
         if column_name not in existing_columns:
             conn.execute(f"ALTER TABLE alpaca_managed_positions ADD COLUMN {column_name} {column_type}")
@@ -384,7 +379,7 @@ def save_strategy_config(
     signal_symbol: str,
     fingerprint: str,
 ) -> bool:
-    cursor = conn.execute(
+    conn.execute(
         """
         INSERT INTO strategy_config (asset_symbol, signal_symbol, fingerprint)
         VALUES (?, ?, ?)
@@ -530,9 +525,7 @@ def _synchronize_market_data_history(
     # A new tail date is a normal incremental update.  A newly discovered date
     # at or before the prior tail changes historical inputs and needs replay.
     prior_tail = max(existing_dates) if existing_dates else None
-    historical_additions = {
-        date for date in new_dates if prior_tail is not None and date <= prior_tail
-    }
+    historical_additions = {date for date in new_dates if prior_tail is not None and date <= prior_tail}
     if removed_dates:
         conn.executemany(
             "DELETE FROM market_data WHERE symbol = ? AND date = ?",
@@ -553,11 +546,7 @@ def _synchronize_market_data_history(
                 close = excluded.close,
                 volume = excluded.volume
             """,
-            [
-                (symbol, date, *values)
-                for date, values in incoming_by_date.items()
-                if date in dates_to_write
-            ],
+            [(symbol, date, *values) for date, values in incoming_by_date.items() if date in dates_to_write],
         )
 
     return bool(changed_dates or removed_dates or historical_additions)
@@ -759,10 +748,7 @@ def _load_strategy_states_for_asset(
         """,
         (asset_symbol, signal_symbol),
     ).fetchall()
-    return {
-        (float(row[0]), float(row[1])): _strategy_state_from_row(row[2:])
-        for row in rows
-    }
+    return {(float(row[0]), float(row[1])): _strategy_state_from_row(row[2:]) for row in rows}
 
 
 _STRATEGY_STATE_UPSERT_SQL = """
@@ -1566,9 +1552,7 @@ def _mark_alpaca_managed_sell_filled(
         (position_id, order_key),
     ).fetchone()
     if prior is not None and observed_qty + 1e-8 < float(prior[0]):
-        raise SellFillQuantityRegressionError(
-            "Alpaca sell filled quantity moved backwards for a managed order."
-        )
+        raise SellFillQuantityRegressionError("Alpaca sell filled quantity moved backwards for a managed order.")
 
     conn.execute(
         """
@@ -2124,8 +2108,7 @@ def refresh_strategy_summaries_for_asset(
         return
 
     state_by_config = {
-        (float(row.buy_rsi), float(row.profit_target_multiple)): row
-        for row in states.itertuples(index=False)
+        (float(row.buy_rsi), float(row.profit_target_multiple)): row for row in states.itertuples(index=False)
     }
     grouped = equity_df.groupby(["buy_rsi", "profit_target_multiple"], sort=False)
     for (buy_rsi, profit_target_multiple), group in grouped:
@@ -2148,6 +2131,8 @@ def refresh_strategy_summaries_for_asset(
             },
             rollup,
         )
+
+
 def clear_asset_state(conn: sqlite3.Connection, asset_symbol: str, signal_symbol: str) -> None:
     params = (asset_symbol, signal_symbol)
     conn.execute("DELETE FROM strategy_state WHERE asset_symbol = ? AND signal_symbol = ?", params)
@@ -2165,21 +2150,15 @@ def clear_signal_state(conn: sqlite3.Connection, signal_symbol: str) -> None:
 
 
 def strategy_state_generation(conn: sqlite3.Connection) -> int:
-    row = conn.execute(
-        "SELECT generation FROM strategy_state_generation WHERE id = 1"
-    ).fetchone()
+    row = conn.execute("SELECT generation FROM strategy_state_generation WHERE id = 1").fetchone()
     if row is None:
-        conn.execute(
-            "INSERT INTO strategy_state_generation (id, generation) VALUES (1, 0)"
-        )
+        conn.execute("INSERT INTO strategy_state_generation (id, generation) VALUES (1, 0)")
         return 0
     return int(row[0])
 
 
 def _bump_strategy_state_generation(conn: sqlite3.Connection) -> int:
-    conn.execute(
-        "UPDATE strategy_state_generation SET generation = generation + 1 WHERE id = 1"
-    )
+    conn.execute("UPDATE strategy_state_generation SET generation = generation + 1 WHERE id = 1")
     return strategy_state_generation(conn)
 
 
@@ -2707,16 +2686,8 @@ def process_asset_grid(
     positive_return_count_values = np.empty(config_count, dtype=np.int64)
     max_drawdown_values = np.empty(config_count, dtype=np.float64)
     state_start_dates: list[str | None] = []
-    states_by_config = (
-        {}
-        if rebuild
-        else _load_strategy_states_for_asset(conn, asset_symbol, signal_symbol)
-    )
-    rollups_by_config = (
-        {}
-        if rebuild
-        else _load_strategy_summary_rollups_for_asset(conn, asset_symbol, signal_symbol)
-    )
+    states_by_config = {} if rebuild else _load_strategy_states_for_asset(conn, asset_symbol, signal_symbol)
+    rollups_by_config = {} if rebuild else _load_strategy_summary_rollups_for_asset(conn, asset_symbol, signal_symbol)
 
     for config_idx, (buy_rsi, profit_target_multiple) in enumerate(config_pairs):
         config_key = (buy_rsi, profit_target_multiple)

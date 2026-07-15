@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import sqlite3
 import tempfile
 import threading
@@ -34,6 +35,10 @@ from leveraged_trader.workflow import (
     _run_asset_pipeline,
     _state_connection,
     _terminal_alpaca_display_results,
+    _validate_database_path,
+    _validate_optimization_grids,
+    _validate_workflow_mode,
+    _workflow_run_lock,
     _WorkflowStrategySession,
     _write_workflow_outputs,
     run_resumable_optimizations_async,
@@ -41,15 +46,237 @@ from leveraged_trader.workflow import (
 
 
 class WorkflowAsyncTests(unittest.TestCase):
+    def test_workflow_database_path_rejects_nonpersistent_values(self) -> None:
+        for db_path, message in [
+            ("", "nonempty filesystem path"),
+            (":memory:", "persistent filesystem path"),
+        ]:
+            with (
+                self.subTest(db_path=db_path),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                _validate_database_path(db_path)
+
+    def test_nonpersistent_database_is_rejected_before_filesystem_changes(self) -> None:
+        for db_path in ["", ":memory:"]:
+            with tempfile.TemporaryDirectory() as tmp, self.subTest(db_path=db_path):
+                output_dir = Path(tmp) / "reports"
+                with self.assertRaises(ValueError):
+                    asyncio.run(
+                        run_resumable_optimizations_async(
+                            mode="update",
+                            db_path=db_path,
+                            base_cfg=BacktestConfig(),
+                            universe_cfg=UniverseConfig(),
+                            buy_rsi_values=[30.0],
+                            profit_target_values=[1.5],
+                            alpaca_cfg=AlpacaOrderConfig(),
+                            output_dir=str(output_dir),
+                        )
+                    )
+
+                self.assertFalse(output_dir.exists())
+
+    def test_invalid_endpoint_and_grids_are_rejected_before_filesystem_changes(self) -> None:
+        cases = [
+            {
+                "buy_rsi_values": [],
+                "short_buy_rsi_values": [70.0],
+                "profit_target_values": [1.5],
+                "alpaca_cfg": AlpacaOrderConfig(),
+            },
+            {
+                "buy_rsi_values": [30.0],
+                "short_buy_rsi_values": [],
+                "profit_target_values": [1.5],
+                "alpaca_cfg": AlpacaOrderConfig(),
+            },
+            {
+                "buy_rsi_values": [30.0],
+                "short_buy_rsi_values": [70.0],
+                "profit_target_values": [1.0],
+                "alpaca_cfg": AlpacaOrderConfig(),
+            },
+            {
+                "buy_rsi_values": [30.0],
+                "short_buy_rsi_values": [70.0],
+                "profit_target_values": [1.5],
+                "alpaca_cfg": AlpacaOrderConfig(
+                    enabled=True,
+                    base_url="https://api.alpaca.markets",
+                ),
+            },
+        ]
+        for case in cases:
+            with tempfile.TemporaryDirectory() as tmp, self.subTest(case=case):
+                db_path = Path(tmp) / "state.sqlite"
+                output_dir = Path(tmp) / "reports"
+                with self.assertRaises(ValueError):
+                    asyncio.run(
+                        run_resumable_optimizations_async(
+                            mode="update",
+                            db_path=str(db_path),
+                            base_cfg=BacktestConfig(),
+                            universe_cfg=UniverseConfig(),
+                            buy_rsi_values=case["buy_rsi_values"],
+                            short_buy_rsi_values=case["short_buy_rsi_values"],
+                            profit_target_values=case["profit_target_values"],
+                            alpaca_cfg=case["alpaca_cfg"],
+                            output_dir=str(output_dir),
+                        )
+                    )
+
+                self.assertFalse(Path(f"{db_path}.lock").exists())
+                self.assertFalse(output_dir.exists())
+
+    def test_workflow_mode_rejects_unknown_value(self) -> None:
+        with self.assertRaisesRegex(ValueError, "mode must be 'update' or 'rebuild'"):
+            _validate_workflow_mode("refresh")
+
+    def test_invalid_workflow_mode_is_rejected_before_lock_files_are_created(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.db"
+            output_dir = Path(tmp) / "reports"
+            with self.assertRaisesRegex(ValueError, "mode must be 'update' or 'rebuild'"):
+                asyncio.run(
+                    run_resumable_optimizations_async(
+                        mode="refresh",
+                        db_path=str(db_path),
+                        base_cfg=BacktestConfig(),
+                        universe_cfg=UniverseConfig(),
+                        buy_rsi_values=[30.0],
+                        profit_target_values=[1.5],
+                        alpaca_cfg=AlpacaOrderConfig(),
+                        output_dir=str(output_dir),
+                    )
+                )
+
+            self.assertFalse(Path(f"{db_path}.lock").exists())
+            self.assertFalse(output_dir.exists())
+
+    def test_workflow_uses_legacy_compatible_database_lock_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.db"
+            output_dir = Path(tmp) / "reports"
+            with _workflow_run_lock(str(db_path), str(output_dir)):
+                self.assertTrue(Path(f"{db_path}.lock").exists())
+                self.assertFalse(Path(f"{db_path}.leveraged-trader.lock").exists())
+
+    def test_workflow_lock_canonicalizes_symlinked_database_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            real_db_path = Path(tmp) / "real.sqlite"
+            real_db_path.touch()
+            alias_db_path = Path(tmp) / "alias.sqlite"
+            alias_db_path.symlink_to(real_db_path)
+            with (
+                _workflow_run_lock(str(real_db_path), str(Path(tmp) / "outputs-one")),
+                self.assertRaisesRegex(WorkflowRunError, "Another workflow"),
+                _workflow_run_lock(str(alias_db_path), str(Path(tmp) / "outputs-two")),
+            ):
+                self.fail("symlinked database unexpectedly acquired a separate lock")
+
+    def test_symlinked_database_acquires_legacy_and_canonical_lock_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            real_db_path = Path(tmp) / "real.sqlite"
+            real_db_path.touch()
+            alias_db_path = Path(tmp) / "alias.sqlite"
+            alias_db_path.symlink_to(real_db_path)
+            with _workflow_run_lock(str(alias_db_path), str(Path(tmp) / "outputs")):
+                self.assertTrue(Path(f"{alias_db_path}.lock").exists())
+                self.assertTrue(Path(f"{real_db_path}.lock").exists())
+
+    def test_workflow_rejects_hardlinked_database_without_creating_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            first_db_path = Path(tmp) / "first.sqlite"
+            first_db_path.touch()
+            second_db_path = Path(tmp) / "second.sqlite"
+            os.link(first_db_path, second_db_path)
+            output_dir = Path(tmp) / "outputs"
+
+            with (
+                self.assertRaisesRegex(WorkflowRunError, "multiple hard links"),
+                _workflow_run_lock(str(second_db_path), str(output_dir)),
+            ):
+                self.fail("hardlinked database unexpectedly acquired workflow locks")
+
+            self.assertFalse(Path(f"{first_db_path}.lock").exists())
+            self.assertFalse(Path(f"{second_db_path}.lock").exists())
+            self.assertFalse(output_dir.exists())
+
+    def test_optimization_grid_rejects_out_of_range_values(self) -> None:
+        for buy_values, target_values, message in [
+            ([-1.0], [1.1], "between 0 and 100"),
+            ([101.0], [1.1], "between 0 and 100"),
+            ([30.0], [1.0], "greater than 1.0"),
+            ([30.0], [0.5], "greater than 1.0"),
+        ]:
+            with (
+                self.subTest(buy_values=buy_values, target_values=target_values),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                _validate_optimization_grids(buy_values, target_values)
+
+    def test_workflow_lock_rejects_overlapping_run_for_same_database(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "state.sqlite")
+            first_output = str(Path(tmp) / "outputs-one")
+            second_output = str(Path(tmp) / "outputs-two")
+            with (
+                _workflow_run_lock(db_path, first_output),
+                self.assertRaisesRegex(WorkflowRunError, "Another workflow"),
+                _workflow_run_lock(db_path, second_output),
+            ):
+                self.fail("overlapping workflow unexpectedly acquired the lock")
+
+    def test_workflow_lock_rejects_overlapping_run_for_same_output_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = str(Path(tmp) / "outputs")
+            with (
+                _workflow_run_lock(str(Path(tmp) / "state-one.sqlite"), output_dir),
+                self.assertRaisesRegex(WorkflowRunError, "Another workflow"),
+                _workflow_run_lock(str(Path(tmp) / "state-two.sqlite"), output_dir),
+            ):
+                self.fail("overlapping workflow unexpectedly acquired the output lock")
+
+    def test_workflow_lock_cleans_up_after_non_contention_acquisition_error(self) -> None:
+        first_lock_file = Mock()
+        first_lock_file.fileno.return_value = 42
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        tmp = temporary_directory.name
+        with (
+            patch.object(Path, "open", side_effect=[first_lock_file, PermissionError("denied")]),
+            patch("leveraged_trader.workflow.fcntl.flock") as mock_flock,
+            self.assertRaisesRegex(PermissionError, "denied"),
+            _workflow_run_lock(
+                str(Path(tmp) / "state.sqlite"),
+                str(Path(tmp) / "outputs"),
+            ),
+        ):
+            self.fail("workflow unexpectedly acquired both locks")
+
+        mock_flock.assert_called_once()
+        first_lock_file.close.assert_called_once_with()
+
     @patch("leveraged_trader.workflow.reconcile_alpaca_managed_positions")
     @patch("leveraged_trader.workflow.migrate_alpaca_managed_position_symbols")
     def test_reconciliation_output_mentions_only_migrations_from_current_run(
-        self, mock_migrate: Mock, mock_reconcile: Mock,
+        self,
+        mock_migrate: Mock,
+        mock_reconcile: Mock,
     ) -> None:
         columns = [
-            "Position ID", "Workflow", "Asset", "Action", "Status",
-            "Buy Client Order ID", "Sell Client Order ID", "Qty", "Limit Price",
-            "Alpaca Order ID", "Message",
+            "Position ID",
+            "Workflow",
+            "Asset",
+            "Action",
+            "Status",
+            "Buy Client Order ID",
+            "Sell Client Order ID",
+            "Qty",
+            "Limit Price",
+            "Alpaca Order ID",
+            "Message",
         ]
         mock_reconcile.return_value = pd.DataFrame(columns=columns)
         with tempfile.TemporaryDirectory() as tmp:
@@ -70,9 +297,7 @@ class WorkflowAsyncTests(unittest.TestCase):
                 )
 
             def migrate(conn: sqlite3.Connection, _cfg: AlpacaOrderConfig) -> dict[str, str]:
-                conn.execute(
-                    "UPDATE alpaca_managed_positions SET symbol = 'ECHX', alpaca_asset_id = 'asset-echo'"
-                )
+                conn.execute("UPDATE alpaca_managed_positions SET symbol = 'ECHX', alpaca_asset_id = 'asset-echo'")
                 conn.commit()
                 return {"SATG": "ECHX"}
 
@@ -132,18 +357,19 @@ class WorkflowAsyncTests(unittest.TestCase):
         buy_rsi_values: list[float],
         profit_target_values: list[float],
     ) -> None:
-        asyncio.run(
-            run_resumable_optimizations_async(
-                mode="update",
-                db_path="unused.sqlite",
-                base_cfg=BacktestConfig(),
-                universe_cfg=UniverseConfig(),
-                buy_rsi_values=buy_rsi_values,
-                profit_target_values=profit_target_values,
-                alpaca_cfg=AlpacaOrderConfig(),
-                output_dir="outputs",
+        with tempfile.TemporaryDirectory() as tmp:
+            asyncio.run(
+                run_resumable_optimizations_async(
+                    mode="update",
+                    db_path=str(Path(tmp) / "unused.sqlite"),
+                    base_cfg=BacktestConfig(),
+                    universe_cfg=UniverseConfig(),
+                    buy_rsi_values=buy_rsi_values,
+                    profit_target_values=profit_target_values,
+                    alpaca_cfg=AlpacaOrderConfig(),
+                    output_dir=str(Path(tmp) / "outputs"),
+                )
             )
-        )
 
     def test_empty_buy_rsi_grid_is_rejected_before_workflow_starts(self) -> None:
         with self.assertRaisesRegex(ValueError, "buy_rsi_values must not be empty"):

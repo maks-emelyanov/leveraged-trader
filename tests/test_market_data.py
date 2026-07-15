@@ -118,9 +118,7 @@ class MarketDataTests(unittest.TestCase):
             tradier_cfg=TradierMarketDataConfig(access_token="token"),
         )
 
-        self.assertEqual(data.columns.tolist(), [
-            "AAA_Open", "AAA_High", "AAA_Low", "AAA_Close", "AAA_Volume"
-        ])
+        self.assertEqual(data.columns.tolist(), ["AAA_Open", "AAA_High", "AAA_Low", "AAA_Close", "AAA_Volume"])
         self.assertEqual(data.attrs[TRADIER_RECOVERED_SYMBOLS_ATTR], ["AAA"])
 
     @patch("leveraged_trader.market_data.requests.get")
@@ -161,18 +159,21 @@ class MarketDataTests(unittest.TestCase):
             tradier_cfg=TradierMarketDataConfig(access_token="token"),
         )
 
-        self.assertEqual(list(data.columns), [
-            "AAA_Open",
-            "AAA_High",
-            "AAA_Low",
-            "AAA_Close",
-            "AAA_Volume",
-            "MISSING_Open",
-            "MISSING_High",
-            "MISSING_Low",
-            "MISSING_Close",
-            "MISSING_Volume",
-        ])
+        self.assertEqual(
+            list(data.columns),
+            [
+                "AAA_Open",
+                "AAA_High",
+                "AAA_Low",
+                "AAA_Close",
+                "AAA_Volume",
+                "MISSING_Open",
+                "MISSING_High",
+                "MISSING_Low",
+                "MISSING_Close",
+                "MISSING_Volume",
+            ],
+        )
         self.assertEqual(data.attrs[TRADIER_RECOVERED_SYMBOLS_ATTR], ["MISSING"])
         self.assertEqual(mock_get.call_args.kwargs["params"]["symbol"], "MISSING")
         self.assertEqual(mock_get.call_args.kwargs["headers"]["Authorization"], "Bearer token")

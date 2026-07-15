@@ -108,11 +108,7 @@ def summarize_saved_results(
             na_position="last",
         )
 
-    curves = (
-        pd.concat(best_curves, axis=1, join="outer", sort=False).sort_index()
-        if best_curves
-        else pd.DataFrame()
-    )
+    curves = pd.concat(best_curves, axis=1, join="outer", sort=False).sort_index() if best_curves else pd.DataFrame()
 
     return optimization_summary, curves
 
@@ -339,9 +335,8 @@ def build_pending_action_report(
         start_date = summary_row.get("Start Date", state["start_date"])
         trading_days = summary_row.get("Trading Days", pd.NA)
 
-        should_include = (
-            (pending_action_filter == "buy" and not in_position)
-            or (pending_action_filter == "sell" and in_position)
+        should_include = (pending_action_filter == "buy" and not in_position) or (
+            pending_action_filter == "sell" and in_position
         )
         if should_include:
             rows.append(

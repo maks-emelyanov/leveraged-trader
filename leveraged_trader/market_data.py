@@ -31,10 +31,7 @@ _NEW_YORK = ZoneInfo("America/New_York")
 class MarketDataDownloadError(RuntimeError):
     def __init__(self, symbol_reasons: Mapping[str, str], source: str = "Yahoo Finance") -> None:
         self.source = source
-        self.symbol_reasons = {
-            symbol: _clean_yfinance_error(reason)
-            for symbol, reason in symbol_reasons.items()
-        }
+        self.symbol_reasons = {symbol: _clean_yfinance_error(reason) for symbol, reason in symbol_reasons.items()}
         super().__init__(self._format_message())
 
     @property
@@ -51,10 +48,7 @@ class MarketDataDownloadError(RuntimeError):
             symbol_list = ", ".join(sorted(symbols))
             details.append(f"{symbol_list}: {reason}")
 
-        return (
-            f"{self.source} did not return usable daily data. "
-            f"Impacted symbols: {'; '.join(details)}."
-        )
+        return f"{self.source} did not return usable daily data. Impacted symbols: {'; '.join(details)}."
 
 
 @contextmanager
@@ -79,7 +73,7 @@ def _clean_yfinance_error(message: str) -> str:
     cleaned = cleaned.strip(" .")
     for prefix in ("possibly delisted; ",):
         if cleaned.lower().startswith(prefix):
-            cleaned = cleaned[len(prefix):]
+            cleaned = cleaned[len(prefix) :]
     return cleaned or "No data returned"
 
 
@@ -280,11 +274,7 @@ def _yfinance_symbol_frames(
     download_errors: Mapping[str, str],
 ) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
     frames: dict[str, pd.DataFrame] = {}
-    errors: dict[str, str] = {
-        symbol: str(reason)
-        for symbol, reason in download_errors.items()
-        if symbol in symbols
-    }
+    errors: dict[str, str] = {symbol: str(reason) for symbol, reason in download_errors.items() if symbol in symbols}
 
     if raw is None or raw.empty:
         for symbol in symbols:
@@ -302,10 +292,7 @@ def _yfinance_symbol_frames(
 
         missing_fields = [column for column in _OHLCV_FIELDS if column not in df.columns]
         if missing_fields:
-            errors[symbol] = (
-                "Yahoo Finance response was missing required OHLCV columns: "
-                f"{', '.join(missing_fields)}"
-            )
+            errors[symbol] = f"Yahoo Finance response was missing required OHLCV columns: {', '.join(missing_fields)}"
             continue
 
         df = df[_OHLCV_FIELDS].copy().dropna(subset=_OHLCV_FIELDS)
@@ -462,10 +449,7 @@ def load_market_data(
             }
             source = "Yahoo Finance and Tradier"
         else:
-            symbol_reasons = {
-                symbol: yahoo_errors.get(symbol, "No data returned")
-                for symbol in unresolved_symbols
-            }
+            symbol_reasons = {symbol: yahoo_errors.get(symbol, "No data returned") for symbol in unresolved_symbols}
             source = "Yahoo Finance"
         raise MarketDataDownloadError(
             symbol_reasons,

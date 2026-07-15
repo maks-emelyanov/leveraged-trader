@@ -17,8 +17,8 @@ class BacktestConfig:
     rsi_period: int = 14
     buy_rsi: float = 30.0
     profit_target_multiple: float = 10.0
-    fee_bps: float = 1.0        # commission-like cost per trade notional
-    slippage_bps: float = 2.0   # slippage per trade notional
+    fee_bps: float = 1.0  # commission-like cost per trade notional
+    slippage_bps: float = 2.0  # slippage per trade notional
     auto_adjust: bool = True
 
 
@@ -66,3 +66,19 @@ def load_dotenv(path: str = DOTENV_PATH) -> None:
             value = value.strip().strip('"').strip("'")
             if key and key not in os.environ:
                 os.environ[key] = value
+
+
+def validate_alpaca_paper_endpoint(
+    cfg: AlpacaOrderConfig,
+    *,
+    unconditional: bool = False,
+) -> None:
+    """Refuse non-paper endpoints when orders are enabled or validation is unconditional."""
+    if not unconditional and not (cfg.enabled or cfg.sell_enabled):
+        return
+    normalized_base_url = cfg.base_url[:-1] if cfg.base_url.endswith("/") else cfg.base_url
+    if normalized_base_url != ALPACA_PAPER_BASE_URL:
+        raise ValueError(
+            "Alpaca order submission is restricted to https://paper-api.alpaca.markets; "
+            "live and other custom trading endpoints are not supported."
+        )

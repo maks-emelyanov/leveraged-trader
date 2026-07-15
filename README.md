@@ -2,7 +2,8 @@
 
 Leveraged Trader is a research and paper-trading workflow for RSI-based leveraged ETF/ETN strategies. It builds current long and inverse leveraged product universes, optimizes simple buy/sell rules against daily market data, writes recommendation reports, and queues guarded Alpaca paper-trading buy orders by default.
 
-This project is intended for research and paper trading. It is not financial advice, and it should not be connected to live trading without additional review, testing, and risk controls.
+This project is intended for research and paper trading. It is not financial advice. Alpaca clients
+enforce the exact paper endpoint and reject live or custom trading endpoints.
 
 Licensed under the MIT License. See [LICENSE](LICENSE).
 
@@ -20,7 +21,9 @@ Licensed under the MIT License. See [LICENSE](LICENSE).
 - Uses bounded async download workers feeding serialized SQLite strategy-state updates.
 - Renders width-aware terminal progress and tables with semantic status coloring.
 - Persists strategy state in SQLite for resumable updates, with transactional cross-process invalidation safety.
+- Prevents overlapping runs that share a database or output directory with process-level file locks.
 - Writes buy and sell recommendation reports.
+- Publishes each CSV atomically so readers never observe a partially written file.
 - Submits guarded, budget-capped whole-share Alpaca paper buy limit orders by default.
 - Atomically claims a durable Alpaca buy intent before submission, preventing concurrent workers from submitting or closing the same client order ID.
 - Submits and renews managed Alpaca GTC limit sells from actual fill price times the original sell multiple, including partial buy fills.
@@ -91,6 +94,10 @@ ALPACA_GTC_SELL_RENEWAL_ENABLED=true
 ALPACA_GTC_SELL_RENEWAL_DAYS_BEFORE_EXPIRATION=7
 TRADIER_ACCESS_TOKEN=replace_with_your_tradier_access_token
 ```
+
+`ALPACA_BASE_URL` must remain exactly `https://paper-api.alpaca.markets` (one trailing slash is also
+accepted). The application rejects live endpoints, alternate ports, paths, queries, and other custom
+trading URLs whenever an Alpaca client is created.
 
 `TRADIER_ACCESS_TOKEN` is optional and is used for market-data fallback. Remove that line or disable
 fallback with `--no-tradier-fallback` if no Tradier account is configured. `.env` is ignored by Git;
@@ -253,13 +260,15 @@ normal CLI arguments and forwards them to `uv run leveraged-trader`:
 Common options:
 
 - `--mode {update,rebuild}`: resume from SQLite state (`update`) or recompute from scratch (`rebuild`).
-- `--db PATH`: SQLite state file path (default: `strategy_state.sqlite`).
+- `--db PATH`: persistent SQLite state file path (default: `strategy_state.sqlite`); empty paths,
+  `:memory:`, and hard-linked database files are rejected.
 - `--output-dir DIR`: output directory for generated CSV files (default: `outputs`).
 - `--alpaca-submit-buy-orders / --no-alpaca-submit-buy-orders`: enable or skip buy order submission (default: enabled).
 - `--alpaca-submit-sell-orders / --no-alpaca-submit-sell-orders`: enable or skip managed limit sell reconciliation/submission (default: enabled).
 - `--alpaca-api-key-id VALUE`: override `ALPACA_API_KEY_ID`.
 - `--alpaca-api-secret-key VALUE`: override `ALPACA_API_SECRET_KEY`.
-- `--alpaca-base-url URL`: override `ALPACA_BASE_URL` (defaults to Alpaca paper endpoint).
+- `--alpaca-base-url URL`: override `ALPACA_BASE_URL`; Alpaca access is restricted to the exact paper
+  endpoint `https://paper-api.alpaca.markets`.
 - `--alpaca-timeout-seconds INT`: Alpaca request timeout in seconds (default: `30`).
 - `--alpaca-buy-limit-buffer-bps FLOAT`: price buffer for whole-share day buy limits in basis points (default: `500`).
 - `--alpaca-gtc-sell-renewal / --no-alpaca-gtc-sell-renewal`: renew managed Alpaca GTC sells before expiration.
@@ -294,7 +303,11 @@ Use `--output-dir` to choose a different location:
 uv run leveraged-trader --output-dir outputs/dev
 ```
 
-The SQLite state database defaults to `strategy_state.sqlite`; use `--db` to override it. Managed
+The SQLite state database defaults to `strategy_state.sqlite`; use `--db` to override it. Workflow
+runs create an adjacent `<database>.lock` file. Lock files for conventional `.sqlite`, `.sqlite3`,
+and `.db` names are ignored by Git; a custom database suffix may require a local ignore rule. The
+database must be a persistent file and must not have hard links. Symlink aliases are supported and
+acquire both the supplied-path lock and a lock for the resolved database target. Managed
 Alpaca rows persist `alpaca_asset_id`, while `alpaca_symbol_aliases` retains every ticker observed for
 that asset so historical symbols remain protected after a rename. Universe generation also persists
 `nasdaq_etf_universe`, `universe_audit_rows`,
@@ -425,6 +438,12 @@ Strategy-state updates use a thread-confined SQLite connection with a separate i
 and persisted generation check for every asset. A benchmark invalidation and the dependent
 asset/config updates therefore commit as one serialized operation even if two workflow processes use
 the same database. Failed transactions do not populate the shared-history synchronization cache.
+
+Each top-level workflow also acquires nonblocking process locks for its database and output directory.
+Runs sharing either resource fail fast instead of overlapping; this includes direct callers of the
+public asynchronous API. Database locks retain the legacy `<database>.lock` name and additionally use
+the resolved target for symlink aliases. CSVs are written to same-directory temporary files and
+atomically replaced, so a reader sees either the previous complete file or the new complete file.
 
 If every asset workflow fails, the command exits with an error before it writes reports or submits
 new buys. Partial asset failures remain visible in the final asset summary while successful assets

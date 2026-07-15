@@ -8,12 +8,66 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from leveraged_trader.alpaca import _alpaca_headers
+from leveraged_trader.alpaca import AlpacaClient, _alpaca_headers
 from leveraged_trader.cli import parse_args
-from leveraged_trader.config import AlpacaOrderConfig, load_dotenv
+from leveraged_trader.config import AlpacaOrderConfig, load_dotenv, validate_alpaca_paper_endpoint
 
 
 class ConfigTests(unittest.TestCase):
+    def test_order_submission_rejects_non_paper_alpaca_endpoint(self) -> None:
+        cfg = AlpacaOrderConfig(
+            enabled=True,
+            base_url="https://api.alpaca.markets",
+        )
+
+        with self.assertRaisesRegex(ValueError, "restricted to https://paper-api.alpaca.markets"):
+            validate_alpaca_paper_endpoint(cfg)
+
+        with self.assertRaisesRegex(ValueError, "restricted to https://paper-api.alpaca.markets"):
+            AlpacaClient(cfg)
+
+    def test_non_paper_endpoint_is_allowed_when_order_submission_is_disabled(self) -> None:
+        cfg = AlpacaOrderConfig(
+            api_key_id="key",
+            api_secret_key="secret",
+            base_url="https://api.alpaca.markets",
+        )
+
+        validate_alpaca_paper_endpoint(cfg)
+        with self.assertRaisesRegex(ValueError, "restricted to https://paper-api.alpaca.markets"):
+            AlpacaClient(cfg)
+
+    def test_alpaca_endpoint_validation_rejects_non_root_paper_urls(self) -> None:
+        for base_url in [
+            "https://paper-api.alpaca.markets:8443",
+            "https://paper-api.alpaca.markets/custom",
+            "https://user:secret@paper-api.alpaca.markets",
+            "https://paper-api.alpaca.markets?mode=paper",
+            "https://paper-api.alpaca.markets#paper",
+        ]:
+            with (
+                self.subTest(base_url=base_url),
+                self.assertRaisesRegex(ValueError, "restricted to https://paper-api.alpaca.markets"),
+            ):
+                AlpacaClient(
+                    AlpacaOrderConfig(
+                        api_key_id="key",
+                        api_secret_key="secret",
+                        base_url=base_url,
+                    )
+                )
+
+    def test_alpaca_endpoint_validation_allows_one_trailing_slash(self) -> None:
+        client = AlpacaClient(
+            AlpacaOrderConfig(
+                api_key_id="key",
+                api_secret_key="secret",
+                base_url="https://paper-api.alpaca.markets/",
+            )
+        )
+
+        self.assertEqual(client.base_url, "https://paper-api.alpaca.markets")
+
     def test_workflow_concurrency_defaults_to_four_and_accepts_override(self) -> None:
         with (
             patch.dict(os.environ, {}, clear=True),

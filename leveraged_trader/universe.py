@@ -52,9 +52,7 @@ class ActiveListedSymbols(set[str]):
 
     @property
     def is_complete(self) -> bool:
-        return bool(self.source_status) and all(
-            status.get("status") == "loaded" for status in self.source_status
-        )
+        return bool(self.source_status) and all(status.get("status") == "loaded" for status in self.source_status)
 
 
 WORKFLOW_SOURCE_STATUS_COLUMNS = [
@@ -883,9 +881,7 @@ def _has_unrecognized_product_leverage(normalized_name: str) -> bool:
         for match in re.finditer(pattern, normalized_name):
             raw_value = abs(float(match.group(1)))
             leverage = raw_value / 100.0 if pattern == NUMERIC_PERCENT_LEVERAGE_PATTERN else raw_value
-            if leverage > MAX_RECOGNIZED_LEVERAGE and product_context_pattern.match(
-                normalized_name[match.end():]
-            ):
+            if leverage > MAX_RECOGNIZED_LEVERAGE and product_context_pattern.match(normalized_name[match.end() :]):
                 return True
     return False
 
@@ -909,9 +905,7 @@ def infer_leverage_and_direction(name: str) -> tuple[float | None, str | None]:
     if curated_leverage is not None:
         return curated_leverage
     leverage = (
-        None
-        if _has_unrecognized_product_leverage(normalized_name)
-        else _recognized_numeric_leverage(normalized_name)
+        None if _has_unrecognized_product_leverage(normalized_name) else _recognized_numeric_leverage(normalized_name)
     )
     if leverage is None:
         if re.search(r"\bULTRAPRO\b", normalized_name):
@@ -938,9 +932,8 @@ def _has_unrecognized_numeric_leverage(normalized_name: str) -> bool:
     if _has_unrecognized_product_leverage(normalized_name):
         return True
     numeric_leverages = [leverage for _position, leverage in _numeric_leverage_matches(normalized_name)]
-    return (
-        any(leverage > MAX_RECOGNIZED_LEVERAGE for leverage in numeric_leverages)
-        and not any(1.0 < leverage <= MAX_RECOGNIZED_LEVERAGE for leverage in numeric_leverages)
+    return any(leverage > MAX_RECOGNIZED_LEVERAGE for leverage in numeric_leverages) and not any(
+        1.0 < leverage <= MAX_RECOGNIZED_LEVERAGE for leverage in numeric_leverages
     )
 
 
@@ -959,11 +952,7 @@ def leveraged_name_filter(name: str) -> bool:
 def _read_nasdaq_symbol_file(url: str, timeout: int) -> pd.DataFrame:
     resp = requests.get(url, timeout=timeout, headers=REQUEST_HEADERS)
     resp.raise_for_status()
-    lines = [
-        line
-        for line in resp.text.splitlines()
-        if line and not line.startswith("File Creation Time")
-    ]
+    lines = [line for line in resp.text.splitlines() if line and not line.startswith("File Creation Time")]
     return pd.read_csv(io.StringIO("\n".join(lines)), sep="|")
 
 
@@ -1048,20 +1037,16 @@ def load_current_etf_universe(timeout: int = 30) -> pd.DataFrame:
     symbol_col = _infer_column(cols, r"\bsymbol\b")
     fund_type_col = _infer_column(cols, r"\bfund type\b|^type$")
     if symbol_col is None or fund_type_col is None:
-        raise RuntimeError(
-            f"Could not infer required columns from ETF definitions page. Columns found: {cols}"
-        )
+        raise RuntimeError(f"Could not infer required columns from ETF definitions page. Columns found: {cols}")
 
     try:
         sym_idx = cols.index(symbol_col)
         type_idx = cols.index(fund_type_col)
-        candidate_name_cols = cols[sym_idx + 1:type_idx]
+        candidate_name_cols = cols[sym_idx + 1 : type_idx]
         if candidate_name_cols:
             name_col = candidate_name_cols[0]
         else:
-            object_cols = [
-                c for c in cols if df[c].dtype == object and c not in {symbol_col, fund_type_col}
-            ]
+            object_cols = [c for c in cols if df[c].dtype == object and c not in {symbol_col, fund_type_col}]
             name_col = max(object_cols, key=lambda c: df[c].astype(str).str.len().mean())
     except Exception as exc:
         raise RuntimeError(f"Could not infer fund name column. Columns found: {cols}") from exc
@@ -1111,7 +1096,7 @@ def _html_text(value: object) -> str:
 
 def _decode_quoted_js_text(value: str) -> str:
     text = value.replace(r"\/", "/")
-    text = text.replace(r"\'", "'").replace(r'\"', '"')
+    text = text.replace(r"\'", "'").replace(r"\"", '"')
     text = text.replace(r"\u0026", "&").replace(r"\u00ae", "®").replace(r"\u2122", "™")
     return text
 
@@ -1196,8 +1181,7 @@ def _fund_table_to_universe(
         return pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
 
     rows = (
-        {"symbol": row[symbol_col], "name": row[name_col]}
-        for _idx, row in table[[symbol_col, name_col]].iterrows()
+        {"symbol": row[symbol_col], "name": row[name_col]} for _idx, row in table[[symbol_col, name_col]].iterrows()
     )
     return _fund_rows_to_universe(
         rows,
@@ -1220,11 +1204,7 @@ def _defiance_json_to_universe(
     if not isinstance(payload, list):
         return pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
 
-    rows = (
-        {"symbol": item.get("ticker"), "name": item.get("name")}
-        for item in payload
-        if isinstance(item, dict)
-    )
+    rows = ({"symbol": item.get("ticker"), "name": item.get("name")} for item in payload if isinstance(item, dict))
     return _fund_rows_to_universe(
         rows,
         source.name,
@@ -1266,7 +1246,7 @@ def _graniteshares_html_to_universe(
     rows = []
     product_pattern = re.compile(
         r'etf-table-cell--ticker__symbol">\s*(?P<symbol>[A-Z][A-Z0-9.-]{0,7})\s*</span>'
-        r'.{0,1800}?etf-table-cell--name-title[^>]*>\s*(?P<name>.*?)\s*</span>',
+        r".{0,1800}?etf-table-cell--name-title[^>]*>\s*(?P<name>.*?)\s*</span>",
         re.I | re.S,
     )
     for match in product_pattern.finditer(html):
@@ -1696,10 +1676,7 @@ def _sec_company_tickers_to_universe(json_text: str, source: UniverseSource) -> 
     if not {"ticker", "title"}.issubset(raw.columns):
         return pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
 
-    rows = (
-        {"symbol": row["ticker"], "name": row["title"]}
-        for _idx, row in raw[["ticker", "title"]].iterrows()
-    )
+    rows = ({"symbol": row["ticker"], "name": row["title"]} for _idx, row in raw[["ticker", "title"]].iterrows())
     return _fund_rows_to_universe(
         rows,
         source.name,
@@ -1926,14 +1903,13 @@ def build_universe_audit_report(
 
     out = audit_rows.copy()
     if "is_short_leveraged_candidate" not in out.columns:
-        out["is_short_leveraged_candidate"] = out["direction"].eq("inverse") & out[
-            "is_leveraged_candidate"
-        ].astype(bool)
+        out["is_short_leveraged_candidate"] = out["direction"].eq("inverse") & out["is_leveraged_candidate"].astype(
+            bool
+        )
     out["in_merged_universe"] = out["symbol"].isin(merged_symbols)
     out["in_workflow_universe"] = out["symbol"].isin(workflow_symbols)
-    leveraged_candidate = (
-        out["is_long_leveraged_candidate"].astype(bool)
-        | out["is_short_leveraged_candidate"].astype(bool)
+    leveraged_candidate = out["is_long_leveraged_candidate"].astype(bool) | out["is_short_leveraged_candidate"].astype(
+        bool
     )
     out = out[leveraged_candidate & ~out["in_merged_universe"]].copy()
     out["audit_reason"] = out["is_short_leveraged_candidate"].map(
@@ -2008,15 +1984,9 @@ def select_universes(etf_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     Returns current long leveraged single-stock ETFs and all current long leveraged ETFs.
     """
     eligible = etf_df[~etf_df["symbol"].isin(EXCLUDED_UNIVERSE_SYMBOLS)].copy()
-    single_stock = eligible[
-        eligible["fund_type"].str.contains(r"ETF \(Single Stock\)", regex=True, na=False)
-    ].copy()
-    single_stock_long = single_stock.loc[
-        single_stock["name"].map(is_long_leveraged_name).astype(bool)
-    ].copy()
-    all_long_leveraged = eligible.loc[
-        eligible["name"].map(is_long_leveraged_name).astype(bool)
-    ].copy()
+    single_stock = eligible[eligible["fund_type"].str.contains(r"ETF \(Single Stock\)", regex=True, na=False)].copy()
+    single_stock_long = single_stock.loc[single_stock["name"].map(is_long_leveraged_name).astype(bool)].copy()
+    all_long_leveraged = eligible.loc[eligible["name"].map(is_long_leveraged_name).astype(bool)].copy()
 
     return (
         single_stock_long.sort_values("symbol").reset_index(drop=True),
@@ -2026,16 +1996,12 @@ def select_universes(etf_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 def select_short_workflow_universe(etf_df: pd.DataFrame) -> pd.DataFrame:
     eligible = etf_df[~etf_df["symbol"].isin(EXCLUDED_UNIVERSE_SYMBOLS)].copy()
-    all_short_leveraged = eligible.loc[
-        eligible["name"].map(is_short_leveraged_name).astype(bool)
-    ].copy()
+    all_short_leveraged = eligible.loc[eligible["name"].map(is_short_leveraged_name).astype(bool)].copy()
     return all_short_leveraged.sort_values("symbol").reset_index(drop=True)
 
 
 def determine_workflow_asset_groups(cfg: UniverseConfig) -> dict[str, pd.DataFrame]:
-    if cfg.top_n is not None and (
-        isinstance(cfg.top_n, bool) or not isinstance(cfg.top_n, int) or cfg.top_n <= 0
-    ):
+    if cfg.top_n is not None and (isinstance(cfg.top_n, bool) or not isinstance(cfg.top_n, int) or cfg.top_n <= 0):
         raise ValueError(f"Universe top_n must be a positive integer or None; got {cfg.top_n!r}.")
 
     nasdaq_df = load_current_etf_universe(timeout=cfg.request_timeout_seconds)
@@ -2056,9 +2022,7 @@ def determine_workflow_asset_groups(cfg: UniverseConfig) -> dict[str, pd.DataFra
         getattr(active_symbols, "source_status", []),
         columns=["source", "url", "symbol_column", "status", "symbol_count", "error"],
     )
-    active_listing_failures = active_listing_status[
-        active_listing_status["status"].ne("loaded")
-    ].copy()
+    active_listing_failures = active_listing_status[active_listing_status["status"].ne("loaded")].copy()
     inactive_discovered = pd.DataFrame(columns=[*discovered_df.columns, "inactive_reason"])
     if active_symbol_set and active_listing_complete:
         is_active = discovered_df["symbol"].astype(str).str.upper().isin(active_symbol_set)
@@ -2131,9 +2095,7 @@ def determine_workflow_asset_groups(cfg: UniverseConfig) -> dict[str, pd.DataFra
     )
     rsi_mapping_review = _rsi_mapping_review_table(all_workflow_candidates)
     executable_by_side = {
-        side: candidates.loc[
-            ~candidates["confidence"].eq("needs_review")
-        ].copy()
+        side: candidates.loc[~candidates["confidence"].eq("needs_review")].copy()
         for side, candidates in workflow_candidates_by_side.items()
     }
     save_table_to_sqlite(
@@ -2152,9 +2114,9 @@ def determine_workflow_asset_groups(cfg: UniverseConfig) -> dict[str, pd.DataFra
         "Current issuer-discovered leveraged ETFs found": len(issuer_df),
         "Current issuer-discovered leveraged ETNs found": len(etn_df),
         "Inactive issuer-discovered ETFs/ETNs skipped": len(inactive_discovered),
-        "Active listing sources loaded": int(
-            (active_listing_status["status"] == "loaded").sum()
-        ) if not active_listing_status.empty else 0,
+        "Active listing sources loaded": int((active_listing_status["status"] == "loaded").sum())
+        if not active_listing_status.empty
+        else 0,
         "Active listing snapshot complete": active_listing_complete,
         "Active listing sources failed": len(active_listing_failures),
         "Workflow universe sources failed": len(workflow_source_failures),
@@ -2171,9 +2133,7 @@ def determine_workflow_asset_groups(cfg: UniverseConfig) -> dict[str, pd.DataFra
     }
     common_attrs = {
         "universe_degraded": (
-            not workflow_source_failures.empty
-            or not active_listing_failures.empty
-            or not audit_source_failures.empty
+            not workflow_source_failures.empty or not active_listing_failures.empty or not audit_source_failures.empty
         ),
         "workflow_source_failures": workflow_source_failures.to_dict("records"),
         "active_listing_source_failures": active_listing_failures.to_dict("records"),
@@ -2256,11 +2216,7 @@ def _workflow_assets_output(
     common_counts: dict[str, object],
     common_attrs: dict[str, object],
 ) -> pd.DataFrame:
-    selected_assets = (
-        workflow_assets
-        if cfg.top_n is None
-        else workflow_assets.head(cfg.top_n).copy()
-    )
+    selected_assets = workflow_assets if cfg.top_n is None else workflow_assets.head(cfg.top_n).copy()
 
     universe_title = universe_title_base if cfg.top_n is None else f"First {cfg.top_n} {universe_title_base}"
 

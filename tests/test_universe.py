@@ -54,9 +54,7 @@ class UniverseTests(unittest.TestCase):
                 self.subTest(top_n=invalid_limit),
                 self.assertRaisesRegex(ValueError, "positive integer or None"),
             ):
-                determine_workflow_assets(
-                    UniverseConfig(sqlite_db_path="state.sqlite", top_n=invalid_limit)
-                )
+                determine_workflow_assets(UniverseConfig(sqlite_db_path="state.sqlite", top_n=invalid_limit))
 
         mock_load_current.assert_not_called()
 
@@ -84,9 +82,7 @@ class UniverseTests(unittest.TestCase):
             ),
             patch("leveraged_trader.universe.save_table_to_sqlite"),
         ):
-            workflow_assets = determine_workflow_assets(
-                UniverseConfig(sqlite_db_path="state.sqlite", top_n=1)
-            )
+            workflow_assets = determine_workflow_assets(UniverseConfig(sqlite_db_path="state.sqlite", top_n=1))
 
         self.assertEqual(len(workflow_assets), 1)
         self.assertIn("rsi_symbol", workflow_assets.columns)
@@ -115,9 +111,7 @@ class UniverseTests(unittest.TestCase):
             ),
             patch("leveraged_trader.universe.save_table_to_sqlite"),
         ):
-            workflow_asset_groups = determine_workflow_asset_groups(
-                UniverseConfig(sqlite_db_path="state.sqlite")
-            )
+            workflow_asset_groups = determine_workflow_asset_groups(UniverseConfig(sqlite_db_path="state.sqlite"))
 
         self.assertEqual(workflow_asset_groups["long"]["symbol"].tolist(), ["TQQQ"])
         self.assertEqual(workflow_asset_groups["short"]["symbol"].tolist(), ["SQQQ"])
@@ -148,9 +142,7 @@ class UniverseTests(unittest.TestCase):
             ),
             patch("leveraged_trader.universe.save_table_to_sqlite"),
         ):
-            workflow_asset_groups = determine_workflow_asset_groups(
-                UniverseConfig(sqlite_db_path="state.sqlite")
-            )
+            workflow_asset_groups = determine_workflow_asset_groups(UniverseConfig(sqlite_db_path="state.sqlite"))
 
         self.assertTrue(workflow_asset_groups["long"].empty)
         self.assertEqual(workflow_asset_groups["short"]["symbol"].tolist(), ["SQQQ"])
@@ -191,17 +183,21 @@ class UniverseTests(unittest.TestCase):
 
     def test_nasdaq_metadata_wins_duplicate_issuer_symbol(self) -> None:
         merged = _merge_universe_sources(
-            pd.DataFrame([
-                {"symbol": "TQQQ", "name": "Nasdaq Current Name", "fund_type": "ETF"},
-            ]),
-            pd.DataFrame([
-                {
-                    "symbol": "TQQQ",
-                    "name": "Issuer Stale Name",
-                    "fund_type": "ETF (Issuer)",
-                    "source": "Issuer table",
-                },
-            ]),
+            pd.DataFrame(
+                [
+                    {"symbol": "TQQQ", "name": "Nasdaq Current Name", "fund_type": "ETF"},
+                ]
+            ),
+            pd.DataFrame(
+                [
+                    {
+                        "symbol": "TQQQ",
+                        "name": "Issuer Stale Name",
+                        "fund_type": "ETF (Issuer)",
+                        "source": "Issuer table",
+                    },
+                ]
+            ),
         )
 
         self.assertEqual(merged.loc[0, "name"], "Nasdaq Current Name")
@@ -409,15 +405,42 @@ class UniverseTests(unittest.TestCase):
 
     def test_reviewed_inverse_products_use_unlevered_rsi_proxies(self) -> None:
         expected = {
-            "AIQD": "AIQ", "BERZ": "FNGS", "BIS": "IBB", "BNKD": "KBWB",
-            "BZQ": "EWZ", "DUG": "XLE", "EEV": "EEM", "EFU": "EFA",
-            "EPV": "VGK", "EUO": "FXE", "EWV": "EWJ", "FLYD": "PEJ",
-            "FNGD": "FNGS", "FXP": "FXI", "KOLD": "UNG", "MZZ": "MDY",
-            "NRGD": "XLE", "OILD": "XOP", "QID": "QQQ", "QQDN": "QQQ",
-            "REW": "XLK", "RXD": "XLV", "SCC": "XLY", "SCO": "USO",
-            "SDD": "IJR", "SDP": "XLU", "SIJ": "XLI", "SKF": "XLF",
-            "SKRE": "KRE", "SMDD": "MDY", "SMN": "XLB", "SRS": "IYR",
-            "SSG": "SOXX", "SZK": "XLP", "WTID": "XLE", "YCS": "FXY",
+            "AIQD": "AIQ",
+            "BERZ": "FNGS",
+            "BIS": "IBB",
+            "BNKD": "KBWB",
+            "BZQ": "EWZ",
+            "DUG": "XLE",
+            "EEV": "EEM",
+            "EFU": "EFA",
+            "EPV": "VGK",
+            "EUO": "FXE",
+            "EWV": "EWJ",
+            "FLYD": "PEJ",
+            "FNGD": "FNGS",
+            "FXP": "FXI",
+            "KOLD": "UNG",
+            "MZZ": "MDY",
+            "NRGD": "XLE",
+            "OILD": "XOP",
+            "QID": "QQQ",
+            "QQDN": "QQQ",
+            "REW": "XLK",
+            "RXD": "XLV",
+            "SCC": "XLY",
+            "SCO": "USO",
+            "SDD": "IJR",
+            "SDP": "XLU",
+            "SIJ": "XLI",
+            "SKF": "XLF",
+            "SKRE": "KRE",
+            "SMDD": "MDY",
+            "SMN": "XLB",
+            "SRS": "IYR",
+            "SSG": "SOXX",
+            "SZK": "XLP",
+            "WTID": "XLE",
+            "YCS": "FXY",
         }
 
         for asset_symbol, rsi_symbol in expected.items():
@@ -427,10 +450,7 @@ class UniverseTests(unittest.TestCase):
                 self.assertEqual(mapping.confidence, "curated")
 
     def test_ultrashort_duration_and_unstable_basket_products_are_excluded(self) -> None:
-        self.assertTrue(
-            {"AMUN", "RBIL", "SGVA", "SLTY", "UYLD", "VGUS", "ZMUN"}
-            <= EXCLUDED_UNIVERSE_SYMBOLS
-        )
+        self.assertTrue({"AMUN", "RBIL", "SGVA", "SLTY", "UYLD", "VGUS", "ZMUN"} <= EXCLUDED_UNIVERSE_SYMBOLS)
 
     def test_common_words_that_are_tickers_do_not_win_generic_rsi_inference(self) -> None:
         cases = {
@@ -853,15 +873,11 @@ class UniverseTests(unittest.TestCase):
         ]:
             self.assertIn(source_name, source_names)
 
-        self.assertTrue(
-            all(source.source_type != "issuer" for source in AUDIT_UNIVERSE_SOURCES)
-        )
+        self.assertTrue(all(source.source_type != "issuer" for source in AUDIT_UNIVERSE_SOURCES))
 
     def test_dynamic_nyse_audit_directory_is_registered_only(self) -> None:
         nyse_source = next(
-            source
-            for source in AUDIT_UNIVERSE_SOURCES
-            if source.name == "NYSE exchange-traded products directory"
+            source for source in AUDIT_UNIVERSE_SOURCES if source.name == "NYSE exchange-traded products directory"
         )
 
         self.assertFalse(nyse_source.enabled)
@@ -960,12 +976,8 @@ class UniverseTests(unittest.TestCase):
             out["fund_type"].tolist(),
             ["ETN (UBS ETRACS)", "ETN (UBS ETRACS)", "ETN (UBS ETRACS)"],
         )
-        self.assertTrue(
-            out.loc[out["symbol"].eq("BDCY"), "name"].item().endswith("1.5X Leveraged")
-        )
-        self.assertTrue(
-            out.loc[out["symbol"].eq("BDCZ"), "name"].item().endswith("1.5X Inverse Leveraged")
-        )
+        self.assertTrue(out.loc[out["symbol"].eq("BDCY"), "name"].item().endswith("1.5X Leveraged"))
+        self.assertTrue(out.loc[out["symbol"].eq("BDCZ"), "name"].item().endswith("1.5X Inverse Leveraged"))
         self.assertFalse(is_long_leveraged_name(out.loc[out["symbol"].eq("BDCZ"), "name"].item()))
 
     def test_sec_company_tickers_parser_builds_audit_rows(self) -> None:
@@ -1422,9 +1434,7 @@ class UniverseTests(unittest.TestCase):
             ),
         )
 
-        workflow_assets = determine_workflow_assets(
-            UniverseConfig(sqlite_db_path="state.sqlite")
-        )
+        workflow_assets = determine_workflow_assets(UniverseConfig(sqlite_db_path="state.sqlite"))
 
         self.assertEqual(
             workflow_assets.attrs["universe_title"],
@@ -1498,9 +1508,7 @@ class UniverseTests(unittest.TestCase):
         self.assertEqual(len(workflow_assets.attrs["rsi_mapping_review"]), 1)
 
         review_call = next(
-            call
-            for call in mock_save_table.call_args_list
-            if call.args[2] == "universe_rsi_mapping_review"
+            call for call in mock_save_table.call_args_list if call.args[2] == "universe_rsi_mapping_review"
         )
         review_df = review_call.args[0]
         self.assertEqual(review_df["symbol"].tolist(), ["FOOU"])
@@ -1543,9 +1551,7 @@ class UniverseTests(unittest.TestCase):
             ),
             patch("leveraged_trader.universe.save_table_to_sqlite") as mock_save_table,
         ):
-            workflow_asset_groups = determine_workflow_asset_groups(
-                UniverseConfig(sqlite_db_path="state.sqlite")
-            )
+            workflow_asset_groups = determine_workflow_asset_groups(UniverseConfig(sqlite_db_path="state.sqlite"))
 
         self.assertEqual(workflow_asset_groups["long"]["symbol"].tolist(), ["TQQQ"])
         self.assertEqual(workflow_asset_groups["short"]["symbol"].tolist(), ["SQQQ"])
@@ -1560,9 +1566,7 @@ class UniverseTests(unittest.TestCase):
         )
 
         review_call = next(
-            call
-            for call in mock_save_table.call_args_list
-            if call.args[2] == "universe_rsi_mapping_review"
+            call for call in mock_save_table.call_args_list if call.args[2] == "universe_rsi_mapping_review"
         )
         review_df = review_call.args[0]
         self.assertEqual(review_df["workflow"].tolist(), ["Short"])
@@ -1612,9 +1616,7 @@ class UniverseTests(unittest.TestCase):
         self.assertEqual(begs["mapping_source"], "self_fallback_override")
 
         review_call = next(
-            call
-            for call in mock_save_table.call_args_list
-            if call.args[2] == "universe_rsi_mapping_review"
+            call for call in mock_save_table.call_args_list if call.args[2] == "universe_rsi_mapping_review"
         )
         review_df = review_call.args[0]
         self.assertTrue(review_df.empty)
@@ -1660,11 +1662,7 @@ class UniverseTests(unittest.TestCase):
         self.assertEqual(workflow_assets.attrs["universe_counts"]["RSI mappings needing review"], 0)
         self.assertEqual(workflow_assets.attrs["rsi_mapping_review"], [])
 
-        nasdaq_call = next(
-            call
-            for call in mock_save_table.call_args_list
-            if call.args[2] == "nasdaq_etf_universe"
-        )
+        nasdaq_call = next(call for call in mock_save_table.call_args_list if call.args[2] == "nasdaq_etf_universe")
         nasdaq_universe = nasdaq_call.args[0]
         self.assertNotIn("SPACEX", nasdaq_universe["rsi_symbol"].tolist())
         self.assertEqual(
@@ -1716,18 +1714,12 @@ class UniverseTests(unittest.TestCase):
         self.assertTrue(workflow_assets.attrs["universe_degraded"])
         self.assertEqual(workflow_assets.attrs["universe_counts"]["Active listing sources failed"], 1)
 
-        nasdaq_call = next(
-            call
-            for call in mock_save_table.call_args_list
-            if call.args[2] == "nasdaq_etf_universe"
-        )
+        nasdaq_call = next(call for call in mock_save_table.call_args_list if call.args[2] == "nasdaq_etf_universe")
         nasdaq_universe = nasdaq_call.args[0]
         self.assertNotIn("ENERGY", nasdaq_universe["rsi_symbol"].tolist())
 
     def test_inactive_issuer_only_product_is_excluded_from_workflow(self) -> None:
-        nasdaq_rows = pd.DataFrame(
-            [{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"}]
-        )
+        nasdaq_rows = pd.DataFrame([{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"}])
         issuer_rows = pd.DataFrame(
             [
                 {
@@ -1767,14 +1759,16 @@ class UniverseTests(unittest.TestCase):
         )
 
     def test_partial_active_listing_snapshot_does_not_filter_issuer_products(self) -> None:
-        nasdaq_rows = pd.DataFrame(
-            [{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"}]
-        )
+        nasdaq_rows = pd.DataFrame([{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"}])
         issuer_rows = pd.DataFrame(
-            [{
-                "symbol": "ISSUER", "name": "Example 2X Leveraged Broad Market ETF",
-                "fund_type": "ETF (Example)", "source": "Example issuer table",
-            }]
+            [
+                {
+                    "symbol": "ISSUER",
+                    "name": "Example 2X Leveraged Broad Market ETF",
+                    "fund_type": "ETF (Example)",
+                    "source": "Example issuer table",
+                }
+            ]
         )
         partial_listing = ActiveListedSymbols(
             {"TQQQ"},
@@ -1877,9 +1871,7 @@ class UniverseTests(unittest.TestCase):
         self.assertEqual(status[0]["row_count"], 0)
 
     def test_strict_workflow_source_mode_aborts_after_recording_source_health(self) -> None:
-        nasdaq_rows = pd.DataFrame(
-            [{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"}]
-        )
+        nasdaq_rows = pd.DataFrame([{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"}])
         issuer_rows = pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
         issuer_rows.attrs["workflow_source_status"] = [
             {
@@ -1945,9 +1937,7 @@ class UniverseTests(unittest.TestCase):
         )
 
     def test_parse_error_workflow_source_marks_the_universe_degraded(self) -> None:
-        nasdaq_rows = pd.DataFrame(
-            [{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"}]
-        )
+        nasdaq_rows = pd.DataFrame([{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"}])
         issuer_rows = pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
         issuer_rows.attrs["workflow_source_status"] = [
             {
@@ -1991,9 +1981,7 @@ class UniverseTests(unittest.TestCase):
             )
 
     def test_zero_match_workflow_source_is_healthy_in_strict_mode(self) -> None:
-        nasdaq_rows = pd.DataFrame(
-            [{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"}]
-        )
+        nasdaq_rows = pd.DataFrame([{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"}])
         issuer_rows = pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
         issuer_rows.attrs["workflow_source_status"] = [
             {

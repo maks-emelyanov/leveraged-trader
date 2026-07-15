@@ -46,6 +46,11 @@ htmlcov/
 # Generated strategy state and reports
 *.sqlite
 *.sqlite-*
+# Runtime workflow locks for conventional SQLite database names and output directories.
+*.sqlite.lock
+*.sqlite3.lock
+*.db.lock
+.leveraged-trader.lock
 best_equity_curves.csv
 buy_signals.csv
 sell_signals.csv

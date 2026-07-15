@@ -25,11 +25,11 @@ from leveraged_trader.config import AlpacaOrderConfig
 from leveraged_trader.storage import (
     active_alpaca_managed_symbols,
     attach_alpaca_managed_sell_order_if_current,
+    claim_alpaca_managed_buy_intent,
     claim_alpaca_managed_sell_renewal,
     claim_alpaca_managed_sell_replacement,
     claim_alpaca_managed_sell_submission_retry,
     close_alpaca_managed_position_if_current_and_complete,
-    claim_alpaca_managed_buy_intent,
     fail_alpaca_managed_buy_submission_if_pending,
     init_state_db,
     load_alpaca_managed_positions,
@@ -73,7 +73,9 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
     def test_ticker_rename_migrates_managed_position_and_renews_with_current_symbol(
-        self, mock_get: Mock, mock_post: Mock,
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
     ) -> None:
         asset_id = "asset-echo"
         with sqlite3.connect(":memory:") as conn:
@@ -159,7 +161,9 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
     def test_ticker_rename_recovers_unattached_open_sell_by_asset_id(
-        self, mock_get: Mock, mock_post: Mock,
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
     ) -> None:
         asset_id = "asset-echo"
         with sqlite3.connect(":memory:") as conn:
@@ -228,7 +232,8 @@ class AlpacaTests(unittest.TestCase):
 
     @patch("leveraged_trader.alpaca.requests.get")
     def test_ticker_migration_rejects_two_active_rows_resolving_to_same_asset(
-        self, mock_get: Mock,
+        self,
+        mock_get: Mock,
     ) -> None:
         asset_id = "asset-echo"
         with sqlite3.connect(":memory:") as conn:
@@ -251,8 +256,19 @@ class AlpacaTests(unittest.TestCase):
                 )
             mock_get.side_effect = [
                 response(200, [{"asset_id": asset_id, "symbol": "ECHX", "qty": "73"}]),
-                response(200, {"id": "buy-1", "client_order_id": "rsi-buy-SATG-20260618", "asset_id": asset_id, "symbol": "SATG"}),
-                response(200, {"id": "buy-2", "client_order_id": "rsi-buy-LEGACY-20260619", "asset_id": asset_id, "symbol": "LEGACY"}),
+                response(
+                    200,
+                    {"id": "buy-1", "client_order_id": "rsi-buy-SATG-20260618", "asset_id": asset_id, "symbol": "SATG"},
+                ),
+                response(
+                    200,
+                    {
+                        "id": "buy-2",
+                        "client_order_id": "rsi-buy-LEGACY-20260619",
+                        "asset_id": asset_id,
+                        "symbol": "LEGACY",
+                    },
+                ),
             ]
 
             with self.assertRaisesRegex(ValueError, "resolve to the same Alpaca asset"):
@@ -266,7 +282,8 @@ class AlpacaTests(unittest.TestCase):
 
     @patch("leveraged_trader.alpaca.requests.get")
     def test_ticker_migration_rolls_back_entire_batch_when_later_update_fails(
-        self, mock_get: Mock,
+        self,
+        mock_get: Mock,
     ) -> None:
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)
@@ -304,8 +321,24 @@ class AlpacaTests(unittest.TestCase):
                         {"asset_id": "asset-2", "symbol": "NEW2", "qty": "1"},
                     ],
                 ),
-                response(200, {"id": "buy-1", "client_order_id": "rsi-buy-OLD1-20260618", "asset_id": "asset-1", "symbol": "OLD1"}),
-                response(200, {"id": "buy-2", "client_order_id": "rsi-buy-OLD2-20260619", "asset_id": "asset-2", "symbol": "OLD2"}),
+                response(
+                    200,
+                    {
+                        "id": "buy-1",
+                        "client_order_id": "rsi-buy-OLD1-20260618",
+                        "asset_id": "asset-1",
+                        "symbol": "OLD1",
+                    },
+                ),
+                response(
+                    200,
+                    {
+                        "id": "buy-2",
+                        "client_order_id": "rsi-buy-OLD2-20260619",
+                        "asset_id": "asset-2",
+                        "symbol": "OLD2",
+                    },
+                ),
             ]
 
             with self.assertRaisesRegex(sqlite3.IntegrityError, "forced second migration failure"):
@@ -319,7 +352,8 @@ class AlpacaTests(unittest.TestCase):
 
     @patch("leveraged_trader.alpaca.requests.get")
     def test_ticker_migration_blocks_mismatched_order_identity_without_fallback(
-        self, mock_get: Mock,
+        self,
+        mock_get: Mock,
     ) -> None:
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)
@@ -368,7 +402,8 @@ class AlpacaTests(unittest.TestCase):
 
     @patch("leveraged_trader.alpaca.requests.get")
     def test_ticker_migration_revalidates_persisted_asset_id_against_attached_order(
-        self, mock_get: Mock,
+        self,
+        mock_get: Mock,
     ) -> None:
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)
@@ -408,7 +443,8 @@ class AlpacaTests(unittest.TestCase):
 
     @patch("leveraged_trader.alpaca.requests.get")
     def test_ticker_migration_blocks_mismatched_asset_lookup_response(
-        self, mock_get: Mock,
+        self,
+        mock_get: Mock,
     ) -> None:
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)
@@ -449,7 +485,8 @@ class AlpacaTests(unittest.TestCase):
 
     @patch("leveraged_trader.alpaca.requests.get")
     def test_ticker_migration_skips_order_lookup_for_unchanged_persisted_asset(
-        self, mock_get: Mock,
+        self,
+        mock_get: Mock,
     ) -> None:
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)
@@ -817,9 +854,7 @@ class AlpacaTests(unittest.TestCase):
                 sell_submitted_at="2026-01-02T14:32:00Z",
                 sell_status="canceled",
             )
-            conn.execute(
-                "UPDATE alpaca_managed_positions SET closed_at = CURRENT_TIMESTAMP WHERE id = 1"
-            )
+            conn.execute("UPDATE alpaca_managed_positions SET closed_at = CURRENT_TIMESTAMP WHERE id = 1")
 
             claimed_qty = claim_alpaca_managed_sell_replacement(
                 conn,
@@ -849,7 +884,8 @@ class AlpacaTests(unittest.TestCase):
                 notes="unsafe stopped replacement",
             )
             row = conn.execute(
-                "SELECT sell_client_order_id, sell_status, sell_renewal_count FROM alpaca_managed_positions WHERE id = 1"
+                "SELECT sell_client_order_id, sell_status, sell_renewal_count "
+                "FROM alpaca_managed_positions WHERE id = 1"
             ).fetchone()
 
         self.assertIsNone(claimed_qty)
@@ -859,7 +895,9 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
     def test_recovered_r2_managed_sell_advances_next_replacement_to_r3(
-        self, mock_get: Mock, mock_post: Mock,
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
     ) -> None:
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)
@@ -960,9 +998,7 @@ class AlpacaTests(unittest.TestCase):
                 filled_at="2026-01-02T14:31:00Z",
                 target_sell_price=150,
             )
-            conn.execute(
-                "UPDATE alpaca_managed_positions SET closed_at = CURRENT_TIMESTAMP WHERE id = 1"
-            )
+            conn.execute("UPDATE alpaca_managed_positions SET closed_at = CURRENT_TIMESTAMP WHERE id = 1")
             closed_attached = attach_alpaca_managed_sell_order_if_current(
                 conn,
                 1,
@@ -976,9 +1012,7 @@ class AlpacaTests(unittest.TestCase):
                 sell_status="accepted",
                 sell_expires_at="2026-06-23T20:15:00Z",
             )
-            conn.execute(
-                "UPDATE alpaca_managed_positions SET closed_at = NULL, remaining_qty = 0 WHERE id = 1"
-            )
+            conn.execute("UPDATE alpaca_managed_positions SET closed_at = NULL, remaining_qty = 0 WHERE id = 1")
             completed_attached = attach_alpaca_managed_sell_order_if_current(
                 conn,
                 1,
@@ -993,7 +1027,8 @@ class AlpacaTests(unittest.TestCase):
                 sell_expires_at="2026-06-23T20:15:00Z",
             )
             row = conn.execute(
-                "SELECT sell_client_order_id, sell_alpaca_order_id, sell_renewal_count FROM alpaca_managed_positions WHERE id = 1"
+                "SELECT sell_client_order_id, sell_alpaca_order_id, sell_renewal_count "
+                "FROM alpaca_managed_positions WHERE id = 1"
             ).fetchone()
 
         self.assertFalse(closed_attached)
@@ -1003,7 +1038,9 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
     def test_initial_recovery_rejects_multiple_managed_sell_generations(
-        self, mock_get: Mock, mock_post: Mock,
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
     ) -> None:
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)
@@ -1060,24 +1097,41 @@ class AlpacaTests(unittest.TestCase):
                 buy_status="filled",
             )
             mark_alpaca_managed_buy_filled(
-                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
-                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
             )
             record_alpaca_managed_sell_order(
-                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
-                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
                 sell_status="expired",
             )
             remaining, current = mark_alpaca_managed_sell_filled_if_current(
-                conn, 1, expected_sell_client_order_id="rsi-exit-TQQQ-1",
-                sell_status="filled", sell_filled_qty=2, sell_filled_avg_price=150,
-                sell_filled_at="2026-03-30T19:00:00Z", sell_alpaca_order_id="sell-1",
+                conn,
+                1,
+                expected_sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_status="filled",
+                sell_filled_qty=2,
+                sell_filled_avg_price=150,
+                sell_filled_at="2026-03-30T19:00:00Z",
+                sell_alpaca_order_id="sell-1",
             )
             stale_claim = claim_alpaca_managed_sell_replacement(
-                conn, 1, prior_sell_client_order_id="rsi-exit-TQQQ-1",
-                prior_sell_alpaca_order_id="sell-1", prior_renewal_count=0,
+                conn,
+                1,
+                prior_sell_client_order_id="rsi-exit-TQQQ-1",
+                prior_sell_alpaca_order_id="sell-1",
+                prior_renewal_count=0,
                 replacement_sell_client_order_id="rsi-exit-TQQQ-1-r1",
-                requested_remaining_qty=2, notes="stale replacement",
+                requested_remaining_qty=2,
+                notes="stale replacement",
             )
             stale_retry = claim_alpaca_managed_sell_submission_retry(
                 conn,
@@ -1088,8 +1142,11 @@ class AlpacaTests(unittest.TestCase):
                 notes="stale 404 retry",
             )
             closed = close_alpaca_managed_position_if_current_and_complete(
-                conn, 1, expected_sell_client_order_id="rsi-exit-TQQQ-1",
-                closed_at="2026-03-30T19:00:00Z", notes="filled",
+                conn,
+                1,
+                expected_sell_client_order_id="rsi-exit-TQQQ-1",
+                closed_at="2026-03-30T19:00:00Z",
+                notes="filled",
             )
 
         self.assertTrue(current)
@@ -1114,12 +1171,22 @@ class AlpacaTests(unittest.TestCase):
                 buy_status="partially_filled",
             )
             current = mark_alpaca_managed_buy_filled(
-                conn, 1, buy_status="partially_filled", filled_qty=3,
-                filled_avg_price=101, filled_at=None, target_sell_price=151.5,
+                conn,
+                1,
+                buy_status="partially_filled",
+                filled_qty=3,
+                filled_avg_price=101,
+                filled_at=None,
+                target_sell_price=151.5,
             )
             stale = mark_alpaca_managed_buy_filled(
-                conn, 1, buy_status="partially_filled", filled_qty=2,
-                filled_avg_price=100, filled_at=None, target_sell_price=150,
+                conn,
+                1,
+                buy_status="partially_filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at=None,
+                target_sell_price=150,
             )
             row = conn.execute(
                 "SELECT filled_qty, filled_avg_price, target_sell_price, remaining_qty "
@@ -1133,35 +1200,60 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
     def test_replacement_404_recovery_uses_persisted_remaining_quantity(
-        self, mock_get: Mock, mock_post: Mock,
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
     ) -> None:
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)
             save_alpaca_managed_buy_order(
-                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
-                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
-                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
-                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
             )
             mark_alpaca_managed_buy_filled(
-                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
-                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
             )
             record_alpaca_managed_sell_order(
-                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
-                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
-                sell_status="expired", sell_order_qty=2,
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="expired",
+                sell_order_qty=2,
             )
             mark_alpaca_managed_sell_filled(
-                conn, 1, sell_status="expired", sell_filled_qty=1,
-                sell_filled_avg_price=150, sell_filled_at="2026-03-30T19:00:00Z",
+                conn,
+                1,
+                sell_status="expired",
+                sell_filled_qty=1,
+                sell_filled_avg_price=150,
+                sell_filled_at="2026-03-30T19:00:00Z",
                 sell_alpaca_order_id="sell-1",
             )
             claimed_qty = claim_alpaca_managed_sell_replacement(
-                conn, 1, prior_sell_client_order_id="rsi-exit-TQQQ-1",
-                prior_sell_alpaca_order_id="sell-1", prior_renewal_count=0,
+                conn,
+                1,
+                prior_sell_client_order_id="rsi-exit-TQQQ-1",
+                prior_sell_alpaca_order_id="sell-1",
+                prior_renewal_count=0,
                 replacement_sell_client_order_id="rsi-exit-TQQQ-1-r1",
-                requested_remaining_qty=1, notes="replacement claimed",
+                requested_remaining_qty=1,
+                notes="replacement claimed",
             )
             conn.execute(
                 """
@@ -1172,7 +1264,9 @@ class AlpacaTests(unittest.TestCase):
                 """
             )
             malformed_retry_qty = claim_alpaca_managed_sell_submission_retry(
-                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1-r1",
                 claimed_at="2026-03-30T19:10:00Z",
                 reclaim_before="2026-03-30T19:05:00Z",
                 notes="reclaimed malformed retry timestamp",
@@ -1186,7 +1280,9 @@ class AlpacaTests(unittest.TestCase):
                 """
             )
             legacy_retry_qty = claim_alpaca_managed_sell_submission_retry(
-                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1-r1",
                 claimed_at="2026-03-30T19:11:00Z",
                 reclaim_before="2026-03-30T19:06:00Z",
                 notes="reclaimed legacy retry timestamp",
@@ -1199,8 +1295,13 @@ class AlpacaTests(unittest.TestCase):
                 """
             )
             parent_fill_increased = mark_alpaca_managed_buy_filled(
-                conn, 1, buy_status="filled", filled_qty=3, filled_avg_price=100,
-                filled_at="2026-01-02T14:31:30Z", target_sell_price=150,
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=3,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:30Z",
+                target_sell_price=150,
             )
             mock_get.return_value = error_response(404, {})
             competing_claims: list[float | None] = []
@@ -1208,7 +1309,9 @@ class AlpacaTests(unittest.TestCase):
             def submit_while_competing_claim_is_attempted(*args: object, **kwargs: object) -> Mock:
                 competing_claims.append(
                     claim_alpaca_managed_sell_submission_retry(
-                        conn, 1, sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                        conn,
+                        1,
+                        sell_client_order_id="rsi-exit-TQQQ-1-r1",
                         claimed_at="2099-01-01T00:00:00Z",
                         reclaim_before="2000-01-01T00:00:00Z",
                         notes="competing retry",
@@ -1494,10 +1597,12 @@ class AlpacaTests(unittest.TestCase):
         ]
 
         result = submit_alpaca_paper_buy_orders(
-            pd.DataFrame([
-                {"Asset": "AAA", "Date": "2026-01-02"},
-                {"Asset": "BBB", "Date": "2026-01-02"},
-            ]),
+            pd.DataFrame(
+                [
+                    {"Asset": "AAA", "Date": "2026-01-02"},
+                    {"Asset": "BBB", "Date": "2026-01-02"},
+                ]
+            ),
             self.cfg(buy=True),
         )
 
@@ -1530,10 +1635,12 @@ class AlpacaTests(unittest.TestCase):
         mock_post.return_value = response(200, {"id": "order-1", "status": "accepted"})
 
         result = submit_alpaca_paper_buy_orders(
-            pd.DataFrame([
-                {"Asset": "SKIP", "Date": "2026-01-02"},
-                {"Asset": "BUY", "Date": "2026-01-02"},
-            ]),
+            pd.DataFrame(
+                [
+                    {"Asset": "SKIP", "Date": "2026-01-02"},
+                    {"Asset": "BUY", "Date": "2026-01-02"},
+                ]
+            ),
             self.cfg(buy=True),
         )
 
@@ -1664,13 +1771,15 @@ class AlpacaTests(unittest.TestCase):
             init_state_db(conn)
             result = submit_alpaca_paper_buy_orders(
                 pd.DataFrame(
-                    [{
-                        "Asset": "TQQQ",
-                        "RSI Symbol": "QQQ",
-                        "Date": "2026-01-02",
-                        "Buy RSI": 30.0,
-                        "Sell Return Multiple": 1.5,
-                    }]
+                    [
+                        {
+                            "Asset": "TQQQ",
+                            "RSI Symbol": "QQQ",
+                            "Date": "2026-01-02",
+                            "Buy RSI": 30.0,
+                            "Sell Return Multiple": 1.5,
+                        }
+                    ]
                 ),
                 self.cfg(buy=True),
                 conn=conn,
@@ -1706,13 +1815,15 @@ class AlpacaTests(unittest.TestCase):
             init_state_db(conn)
             result = submit_alpaca_paper_buy_orders(
                 pd.DataFrame(
-                    [{
-                        "Asset": "TQQQ",
-                        "RSI Symbol": "QQQ",
-                        "Date": "2026-01-02",
-                        "Buy RSI": 30.0,
-                        "Sell Return Multiple": 1.5,
-                    }]
+                    [
+                        {
+                            "Asset": "TQQQ",
+                            "RSI Symbol": "QQQ",
+                            "Date": "2026-01-02",
+                            "Buy RSI": 30.0,
+                            "Sell Return Multiple": 1.5,
+                        }
+                    ]
                 ),
                 self.cfg(buy=True),
                 conn=conn,
@@ -1844,13 +1955,15 @@ class AlpacaTests(unittest.TestCase):
 
             result = submit_alpaca_paper_buy_orders(
                 pd.DataFrame(
-                    [{
-                        "Asset": "TQQQ",
-                        "RSI Symbol": "QQQ",
-                        "Date": "2026-01-02",
-                        "Buy RSI": 30.0,
-                        "Sell Return Multiple": 1.5,
-                    }]
+                    [
+                        {
+                            "Asset": "TQQQ",
+                            "RSI Symbol": "QQQ",
+                            "Date": "2026-01-02",
+                            "Buy RSI": 30.0,
+                            "Sell Return Multiple": 1.5,
+                        }
+                    ]
                 ),
                 self.cfg(buy=True),
                 conn=conn,
@@ -1991,13 +2104,15 @@ class AlpacaTests(unittest.TestCase):
 
             result = submit_alpaca_paper_buy_orders(
                 pd.DataFrame(
-                    [{
-                        "Asset": "TQQQ",
-                        "RSI Symbol": "QQQ",
-                        "Date": "2026-01-02",
-                        "Buy RSI": 30.0,
-                        "Sell Return Multiple": 1.5,
-                    }]
+                    [
+                        {
+                            "Asset": "TQQQ",
+                            "RSI Symbol": "QQQ",
+                            "Date": "2026-01-02",
+                            "Buy RSI": 30.0,
+                            "Sell Return Multiple": 1.5,
+                        }
+                    ]
                 ),
                 self.cfg(buy=True),
                 conn=conn,
@@ -2108,13 +2223,15 @@ class AlpacaTests(unittest.TestCase):
             init_state_db(conn)
             result = submit_alpaca_paper_buy_orders(
                 pd.DataFrame(
-                    [{
-                        "Asset": "TQQQ",
-                        "RSI Symbol": "QQQ",
-                        "Date": "2026-01-02",
-                        "Buy RSI": 30.0,
-                        "Sell Return Multiple": 1.5,
-                    }]
+                    [
+                        {
+                            "Asset": "TQQQ",
+                            "RSI Symbol": "QQQ",
+                            "Date": "2026-01-02",
+                            "Buy RSI": 30.0,
+                            "Sell Return Multiple": 1.5,
+                        }
+                    ]
                 ),
                 self.cfg(buy=True),
                 conn=conn,
@@ -2667,13 +2784,15 @@ class AlpacaTests(unittest.TestCase):
 
             result = submit_alpaca_paper_buy_orders(
                 pd.DataFrame(
-                    [{
-                        "Asset": "TQQQ",
-                        "RSI Symbol": "QQQ",
-                        "Date": "2026-01-02",
-                        "Buy RSI": 30.0,
-                        "Sell Return Multiple": 1.5,
-                    }]
+                    [
+                        {
+                            "Asset": "TQQQ",
+                            "RSI Symbol": "QQQ",
+                            "Date": "2026-01-02",
+                            "Buy RSI": 30.0,
+                            "Sell Return Multiple": 1.5,
+                        }
+                    ]
                 ),
                 self.cfg(buy=True),
                 conn=conn,
@@ -3418,27 +3537,45 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
     def test_open_sell_recovery_accounts_fill_before_intent_mismatch(
-        self, mock_get: Mock, mock_post: Mock,
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
     ) -> None:
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)
             save_alpaca_managed_buy_order(
-                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
-                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
-                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
-                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
             )
             mark_alpaca_managed_buy_filled(
-                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
-                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
             )
             mock_get.return_value = response(
                 200,
                 [
                     {
-                        "id": "sell-1", "symbol": "TQQQ", "side": "sell",
-                        "client_order_id": "rsi-exit-TQQQ-1", "status": "partially_filled",
-                        "qty": "3", "limit_price": "149", "filled_qty": "1",
+                        "id": "sell-1",
+                        "symbol": "TQQQ",
+                        "side": "sell",
+                        "client_order_id": "rsi-exit-TQQQ-1",
+                        "status": "partially_filled",
+                        "qty": "3",
+                        "limit_price": "149",
+                        "filled_qty": "1",
                         "filled_avg_price": "149",
                     }
                 ],
@@ -3514,7 +3651,9 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
     def test_invalid_numeric_sell_fill_metadata_is_blocked_without_accounting_update(
-        self, mock_get: Mock, mock_post: Mock,
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
     ) -> None:
         cases = [
             ("-1", "150"),
@@ -3523,9 +3662,10 @@ class AlpacaTests(unittest.TestCase):
             ("1", "Infinity"),
         ]
         for filled_qty, filled_avg_price in cases:
-            with self.subTest(filled_qty=filled_qty, filled_avg_price=filled_avg_price), sqlite3.connect(
-                ":memory:"
-            ) as conn:
+            with (
+                self.subTest(filled_qty=filled_qty, filled_avg_price=filled_avg_price),
+                sqlite3.connect(":memory:") as conn,
+            ):
                 init_state_db(conn)
                 save_alpaca_managed_buy_order(
                     conn,
@@ -3582,30 +3722,53 @@ class AlpacaTests(unittest.TestCase):
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)
             save_alpaca_managed_buy_order(
-                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
-                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
-                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
-                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
             )
             mark_alpaca_managed_buy_filled(
-                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
-                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
             )
             record_alpaca_managed_sell_order(
-                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
-                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
-                sell_status="partially_filled", sell_order_qty=2,
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="partially_filled",
+                sell_order_qty=2,
             )
             mark_alpaca_managed_sell_filled(
-                conn, 1, sell_status="partially_filled", sell_filled_qty=1,
-                sell_filled_avg_price=150, sell_filled_at="2026-01-02T14:33:00Z",
+                conn,
+                1,
+                sell_status="partially_filled",
+                sell_filled_qty=1,
+                sell_filled_avg_price=150,
+                sell_filled_at="2026-01-02T14:33:00Z",
                 sell_alpaca_order_id="sell-1",
             )
             mock_get.return_value = response(
                 200,
                 {
-                    "id": "sell-1", "status": "partially_filled", "qty": "2",
-                    "limit_price": "150", "filled_qty": "0.5", "filled_avg_price": "150",
+                    "id": "sell-1",
+                    "status": "partially_filled",
+                    "qty": "2",
+                    "limit_price": "150",
+                    "filled_qty": "0.5",
+                    "filled_avg_price": "150",
                 },
             )
 
@@ -3858,24 +4021,41 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
     def test_replacement_expiring_inside_renewal_window_is_blocked_for_review(
-        self, mock_get: Mock, mock_post: Mock, mock_utc_now: Mock,
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+        mock_utc_now: Mock,
     ) -> None:
         mock_utc_now.return_value = datetime(2026, 4, 1, tzinfo=UTC)
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)
             save_alpaca_managed_buy_order(
-                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
-                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
-                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
-                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
             )
             mark_alpaca_managed_buy_filled(
-                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
-                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
             )
             record_alpaca_managed_sell_order(
-                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
-                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
                 sell_status="expired",
             )
             mock_get.side_effect = [
@@ -3885,8 +4065,10 @@ class AlpacaTests(unittest.TestCase):
             mock_post.return_value = response(
                 200,
                 {
-                    "id": "sell-2", "client_order_id": "rsi-exit-TQQQ-1-r1",
-                    "status": "accepted", "expires_at": "2026-04-05T20:15:00Z",
+                    "id": "sell-2",
+                    "client_order_id": "rsi-exit-TQQQ-1-r1",
+                    "status": "accepted",
+                    "expires_at": "2026-04-05T20:15:00Z",
                 },
             )
 
@@ -3902,23 +4084,39 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
     def test_rejected_replacement_is_not_reported_as_renewed(
-        self, mock_get: Mock, mock_post: Mock,
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
     ) -> None:
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)
             save_alpaca_managed_buy_order(
-                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
-                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
-                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
-                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
             )
             mark_alpaca_managed_buy_filled(
-                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
-                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
             )
             record_alpaca_managed_sell_order(
-                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
-                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
                 sell_status="expired",
             )
             mock_get.side_effect = [
@@ -3946,23 +4144,39 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
     def test_partially_filled_replacement_is_accounted_immediately(
-        self, mock_get: Mock, mock_post: Mock,
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
     ) -> None:
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)
             save_alpaca_managed_buy_order(
-                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
-                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
-                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
-                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
             )
             mark_alpaca_managed_buy_filled(
-                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
-                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
             )
             record_alpaca_managed_sell_order(
-                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
-                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
                 sell_status="expired",
             )
             mock_get.side_effect = [
@@ -3994,23 +4208,39 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
     def test_active_partial_replacement_covering_position_does_not_close(
-        self, mock_get: Mock, mock_post: Mock,
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
     ) -> None:
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)
             save_alpaca_managed_buy_order(
-                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
-                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
-                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
-                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
             )
             mark_alpaca_managed_buy_filled(
-                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
-                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
             )
             record_alpaca_managed_sell_order(
-                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
-                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
                 sell_status="expired",
             )
             mock_get.side_effect = [
@@ -4041,23 +4271,39 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
     def test_oversized_replacement_response_is_blocked_before_accounting(
-        self, mock_get: Mock, mock_post: Mock,
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
     ) -> None:
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)
             save_alpaca_managed_buy_order(
-                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
-                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
-                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
-                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
             )
             mark_alpaca_managed_buy_filled(
-                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
-                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
             )
             record_alpaca_managed_sell_order(
-                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
-                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
                 sell_status="expired",
             )
             mock_get.side_effect = [
@@ -4067,9 +4313,13 @@ class AlpacaTests(unittest.TestCase):
             mock_post.return_value = response(
                 200,
                 {
-                    "id": "sell-2", "client_order_id": "rsi-exit-TQQQ-1-r1",
-                    "status": "partially_filled", "qty": "3", "limit_price": "149",
-                    "filled_qty": "1", "filled_avg_price": "149",
+                    "id": "sell-2",
+                    "client_order_id": "rsi-exit-TQQQ-1-r1",
+                    "status": "partially_filled",
+                    "qty": "3",
+                    "limit_price": "149",
+                    "filled_qty": "1",
+                    "filled_avg_price": "149",
                 },
             )
 
@@ -4177,44 +4427,73 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
     def test_cancellation_refresh_fill_regression_blocks_replacement(
-        self, mock_get: Mock, mock_post: Mock, mock_delete: Mock, mock_utc_now: Mock,
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+        mock_delete: Mock,
+        mock_utc_now: Mock,
     ) -> None:
         mock_utc_now.return_value = datetime(2026, 3, 25, tzinfo=UTC)
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)
             save_alpaca_managed_buy_order(
-                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
-                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
-                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
-                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
             )
             mark_alpaca_managed_buy_filled(
-                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
-                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
             )
             record_alpaca_managed_sell_order(
-                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
-                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
-                sell_status="partially_filled", sell_order_qty=2,
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="partially_filled",
+                sell_order_qty=2,
             )
             mark_alpaca_managed_sell_filled(
-                conn, 1, sell_status="partially_filled", sell_filled_qty=1,
-                sell_filled_avg_price=150, sell_filled_at="2026-01-02T14:33:00Z",
+                conn,
+                1,
+                sell_status="partially_filled",
+                sell_filled_qty=1,
+                sell_filled_avg_price=150,
+                sell_filled_at="2026-01-02T14:33:00Z",
                 sell_alpaca_order_id="sell-1",
             )
             mock_get.side_effect = [
                 response(
                     200,
                     {
-                        "id": "sell-1", "status": "partially_filled", "qty": "2",
-                        "limit_price": "150", "filled_qty": "1", "filled_avg_price": "150",
+                        "id": "sell-1",
+                        "status": "partially_filled",
+                        "qty": "2",
+                        "limit_price": "150",
+                        "filled_qty": "1",
+                        "filled_avg_price": "150",
                         "expires_at": "2026-03-30T20:15:00Z",
                     },
                 ),
                 response(
                     200,
                     {
-                        "id": "sell-1", "status": "canceled", "filled_qty": "0.5",
+                        "id": "sell-1",
+                        "status": "canceled",
+                        "filled_qty": "0.5",
                         "filled_avg_price": "150",
                     },
                 ),
@@ -4279,9 +4558,7 @@ class AlpacaTests(unittest.TestCase):
                     sell_status="accepted",
                     sell_expires_at="2026-03-30T20:15:00Z",
                 )
-                broker_order = {
-                    "id": "sell-1", "status": "accepted", "qty": "2", "limit_price": "150"
-                }
+                broker_order = {"id": "sell-1", "status": "accepted", "qty": "2", "limit_price": "150"}
                 if broker_expires_at is not None:
                     broker_order["expires_at"] = broker_expires_at
                 mock_get.side_effect = [
@@ -4304,30 +4581,51 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
     def test_active_sell_without_any_valid_expiration_is_blocked_for_review(
-        self, mock_get: Mock, mock_post: Mock, mock_delete: Mock,
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+        mock_delete: Mock,
     ) -> None:
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)
             save_alpaca_managed_buy_order(
-                conn, symbol="TQQQ", signal_symbol="QQQ", buy_rsi=30,
-                profit_target_multiple=1.5, buy_signal_date="2026-01-02",
-                buy_client_order_id="rsi-buy-TQQQ-20260102", buy_alpaca_order_id="buy-1",
-                buy_submitted_at="2026-01-02T14:30:00Z", buy_status="filled",
+                conn,
+                symbol="TQQQ",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
             )
             mark_alpaca_managed_buy_filled(
-                conn, 1, buy_status="filled", filled_qty=2, filled_avg_price=100,
-                filled_at="2026-01-02T14:31:00Z", target_sell_price=150,
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=2,
+                filled_avg_price=100,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=150,
             )
             record_alpaca_managed_sell_order(
-                conn, 1, sell_client_order_id="rsi-exit-TQQQ-1",
-                sell_alpaca_order_id="sell-1", sell_submitted_at="2026-01-02T14:32:00Z",
-                sell_status="accepted", sell_expires_at=None,
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="accepted",
+                sell_expires_at=None,
             )
             mock_get.return_value = response(
                 200,
                 {
-                    "id": "sell-1", "status": "accepted", "qty": "2",
-                    "limit_price": "150", "expires_at": "not-a-timestamp",
+                    "id": "sell-1",
+                    "status": "accepted",
+                    "qty": "2",
+                    "limit_price": "150",
+                    "expires_at": "not-a-timestamp",
                 },
             )
 
@@ -4343,7 +4641,10 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
     def test_active_managed_sell_with_invalid_order_metadata_is_blocked_for_review(
-        self, mock_get: Mock, mock_post: Mock, mock_delete: Mock,
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+        mock_delete: Mock,
     ) -> None:
         cases = [
             (None, "150"),
@@ -4408,7 +4709,10 @@ class AlpacaTests(unittest.TestCase):
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
     def test_partial_fill_is_recorded_before_invalid_order_metadata_blocks_renewal(
-        self, mock_get: Mock, mock_post: Mock, mock_delete: Mock,
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+        mock_delete: Mock,
     ) -> None:
         with sqlite3.connect(":memory:") as conn:
             init_state_db(conn)

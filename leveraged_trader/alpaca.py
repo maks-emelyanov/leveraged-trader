@@ -12,25 +12,24 @@ import requests
 import yfinance as yf
 from requests import HTTPError
 
-from .config import AlpacaOrderConfig
+from .config import AlpacaOrderConfig, validate_alpaca_paper_endpoint
 from .storage import (
+    SellFillQuantityRegressionError,
     active_alpaca_managed_symbols,
     attach_alpaca_managed_sell_order_if_current,
+    claim_alpaca_managed_buy_intent,
     claim_alpaca_managed_sell_renewal,
     claim_alpaca_managed_sell_replacement,
     claim_alpaca_managed_sell_submission_retry,
-    claim_alpaca_managed_buy_intent,
     close_alpaca_managed_position,
     close_alpaca_managed_position_if_current_and_complete,
     fail_alpaca_managed_buy_submission_if_pending,
     load_alpaca_managed_positions,
     mark_alpaca_managed_buy_filled,
-    mark_alpaca_managed_sell_filled,
     mark_alpaca_managed_sell_filled_if_current,
     migrate_alpaca_managed_position_symbol,
     record_alpaca_managed_sell_order,
     save_alpaca_managed_buy_order,
-    SellFillQuantityRegressionError,
     update_alpaca_managed_buy_status,
     update_alpaca_managed_sell_status_if_current,
 )
@@ -58,6 +57,8 @@ class SellFillMetadataError(ValueError):
 
 class SellOrderIdentityError(ValueError):
     pass
+
+
 _BUY_BATCH_CASH_FRACTION_MAX = 0.50
 
 
@@ -67,10 +68,7 @@ def _alpaca_headers(cfg: AlpacaOrderConfig) -> dict[str, str]:
             "Alpaca paper order submission requires ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY, "
             "or matching CLI arguments."
         )
-    if (
-        cfg.api_key_id == "your_alpaca_paper_api_key_id"
-        or cfg.api_secret_key == "your_alpaca_paper_api_secret_key"
-    ):
+    if cfg.api_key_id == "your_alpaca_paper_api_key_id" or cfg.api_secret_key == "your_alpaca_paper_api_secret_key":
         raise ValueError("Replace the placeholder Alpaca credentials in .env before submitting orders.")
     return {
         "APCA-API-KEY-ID": cfg.api_key_id,
@@ -290,14 +288,14 @@ def _matching_managed_open_sell_orders(
             continue
         client_order_id = _optional_str(order.get("client_order_id"))
         alpaca_order_id = _optional_str(order.get("id"))
-        if (
-            client_order_id == excluded_client_order_id
-            or (excluded_alpaca_order_id is not None and alpaca_order_id == excluded_alpaca_order_id)
+        if client_order_id == excluded_client_order_id or (
+            excluded_alpaca_order_id is not None and alpaca_order_id == excluded_alpaca_order_id
         ):
             continue
-        if client_order_id is not None and _alpaca_exit_client_order_generation(
-            symbol, position_id, client_order_id
-        ) is not None:
+        if (
+            client_order_id is not None
+            and _alpaca_exit_client_order_generation(symbol, position_id, client_order_id) is not None
+        ):
             matches.append(order)
     return matches
 
@@ -393,8 +391,7 @@ def _sell_order_matches_submission_intent(
     if raw_limit_price is not None and raw_limit_price != "":
         observed_limit_price = _optional_positive_float(raw_limit_price)
         if observed_limit_price is None or (
-            abs(observed_limit_price - target_sell_price)
-            > _alpaca_limit_price_tolerance(target_sell_price)
+            abs(observed_limit_price - target_sell_price) > _alpaca_limit_price_tolerance(target_sell_price)
         ):
             return False
     return True
@@ -501,9 +498,7 @@ def _append_incomplete_sell_order_identity_result(
         conn,
         position_id,
         expected_sell_client_order_id=(
-            None
-            if match_missing_sell_client_order_id
-            else expected_sell_client_order_id or sell_client_order_id
+            None if match_missing_sell_client_order_id else expected_sell_client_order_id or sell_client_order_id
         ),
         sell_status="incomplete_order_metadata",
         notes=(
@@ -547,10 +542,7 @@ def _append_incomplete_sell_expiration_metadata_result(
         position_id,
         expected_sell_client_order_id=sell_client_order_id,
         sell_status="incomplete_order_metadata",
-        notes=(
-            f"{expiration_issue}; "
-            "automatic renewal is blocked pending review"
-        ),
+        notes=(f"{expiration_issue}; automatic renewal is blocked pending review"),
     )
     _append_reconciliation_result(
         rows,
@@ -860,6 +852,7 @@ def _sell_renewal_claim_lease_active(position: dict) -> bool:
 
 class AlpacaClient:
     def __init__(self, cfg: AlpacaOrderConfig):
+        validate_alpaca_paper_endpoint(cfg, unconditional=True)
         self.cfg = cfg
         self.base_url = cfg.base_url.rstrip("/")
         self.headers = _alpaca_headers(cfg)
@@ -1101,9 +1094,7 @@ def _ambiguous_submission_http_error(exc: HTTPError) -> bool:
     mentions_client_order_id = any(
         marker in detail for marker in {"client_order_id", "client order id", "client order"}
     )
-    return mentions_client_order_id and any(
-        marker in detail for marker in {"exist", "duplicate", "already"}
-    )
+    return mentions_client_order_id and any(marker in detail for marker in {"exist", "duplicate", "already"})
 
 
 def _fetch_order_payload(client: AlpacaClient, order_id: str | None, client_order_id: str) -> dict:
@@ -1481,9 +1472,16 @@ def _submit_managed_gtc_sell(
             )
             if not state_updated:
                 _append_reconciliation_result(
-                    rows, position_id=position_id, symbol=symbol, action="sell", status="superseded",
-                    buy_client_order_id=buy_client_order_id, sell_client_order_id=sell_client_order_id,
-                    qty=filled_qty, limit_price=target_sell_price, alpaca_order_id=None,
+                    rows,
+                    position_id=position_id,
+                    symbol=symbol,
+                    action="sell",
+                    status="superseded",
+                    buy_client_order_id=buy_client_order_id,
+                    sell_client_order_id=sell_client_order_id,
+                    qty=filled_qty,
+                    limit_price=target_sell_price,
+                    alpaca_order_id=None,
                     message="submission result belongs to a superseded managed GTC sell generation",
                 )
                 return
@@ -1510,9 +1508,16 @@ def _submit_managed_gtc_sell(
         )
         if not state_updated:
             _append_reconciliation_result(
-                rows, position_id=position_id, symbol=symbol, action="sell", status="superseded",
-                buy_client_order_id=buy_client_order_id, sell_client_order_id=sell_client_order_id,
-                qty=filled_qty, limit_price=target_sell_price, alpaca_order_id=None,
+                rows,
+                position_id=position_id,
+                symbol=symbol,
+                action="sell",
+                status="superseded",
+                buy_client_order_id=buy_client_order_id,
+                sell_client_order_id=sell_client_order_id,
+                qty=filled_qty,
+                limit_price=target_sell_price,
+                alpaca_order_id=None,
                 message="submission result belongs to a superseded managed GTC sell generation",
             )
             return
@@ -1554,9 +1559,16 @@ def _submit_managed_gtc_sell(
         )
         if not state_updated:
             _append_reconciliation_result(
-                rows, position_id=position_id, symbol=symbol, action="sell", status="superseded",
-                buy_client_order_id=buy_client_order_id, sell_client_order_id=sell_client_order_id,
-                qty=filled_qty, limit_price=target_sell_price, alpaca_order_id=None,
+                rows,
+                position_id=position_id,
+                symbol=symbol,
+                action="sell",
+                status="superseded",
+                buy_client_order_id=buy_client_order_id,
+                sell_client_order_id=sell_client_order_id,
+                qty=filled_qty,
+                limit_price=target_sell_price,
+                alpaca_order_id=None,
                 message="submission result belongs to a superseded managed GTC sell generation",
             )
             return
@@ -1598,9 +1610,16 @@ def _submit_managed_gtc_sell(
         )
         if not state_updated:
             _append_reconciliation_result(
-                rows, position_id=position_id, symbol=symbol, action="sell", status="superseded",
-                buy_client_order_id=buy_client_order_id, sell_client_order_id=sell_client_order_id,
-                qty=filled_qty, limit_price=target_sell_price, alpaca_order_id=None,
+                rows,
+                position_id=position_id,
+                symbol=symbol,
+                action="sell",
+                status="superseded",
+                buy_client_order_id=buy_client_order_id,
+                sell_client_order_id=sell_client_order_id,
+                qty=filled_qty,
+                limit_price=target_sell_price,
+                alpaca_order_id=None,
                 message="submission result belongs to a superseded managed GTC sell generation",
             )
             return
@@ -1649,9 +1668,16 @@ def _submit_managed_gtc_sell(
     )
     if not generation_is_current:
         _append_reconciliation_result(
-            rows, position_id=position_id, symbol=symbol, action="sell", status="superseded",
-            buy_client_order_id=buy_client_order_id, sell_client_order_id=sell_client_order_id,
-            qty=filled_qty, limit_price=target_sell_price, alpaca_order_id=sell_alpaca_order_id,
+            rows,
+            position_id=position_id,
+            symbol=symbol,
+            action="sell",
+            status="superseded",
+            buy_client_order_id=buy_client_order_id,
+            sell_client_order_id=sell_client_order_id,
+            qty=filled_qty,
+            limit_price=target_sell_price,
+            alpaca_order_id=sell_alpaca_order_id,
             message="submission response belongs to a superseded managed GTC sell generation",
         )
         return
@@ -1782,11 +1808,7 @@ def _submit_managed_gtc_sell(
         position_id=position_id,
         symbol=symbol,
         action="sell",
-        status=(
-            "renewed"
-            if renewal_submission and renewal_is_active
-            else sell_status
-        ),
+        status=("renewed" if renewal_submission and renewal_is_active else sell_status),
         buy_client_order_id=buy_client_order_id,
         sell_client_order_id=sell_client_order_id,
         qty=filled_qty,
@@ -1957,9 +1979,7 @@ def _append_recovered_open_sell_result(
         return
 
     observed_sell_qty, _, fill_metadata_is_valid = _sell_fill_metadata(sell_order)
-    if not fill_metadata_is_valid or (
-        sell_status == "filled" and observed_sell_qty <= _MANAGED_QTY_TOLERANCE
-    ):
+    if not fill_metadata_is_valid or (sell_status == "filled" and observed_sell_qty <= _MANAGED_QTY_TOLERANCE):
         _append_incomplete_sell_fill_result(
             conn=conn,
             rows=rows,
@@ -2151,14 +2171,14 @@ def _submit_replacement_gtc_sell(
     authoritative_remaining_qty = None
     if prior_sell_client_order_id and prior_sell_alpaca_order_id:
         authoritative_remaining_qty = claim_alpaca_managed_sell_replacement(
-        conn,
-        position_id,
-        prior_sell_client_order_id=prior_sell_client_order_id or "",
-        prior_sell_alpaca_order_id=prior_sell_alpaca_order_id or "",
-        prior_renewal_count=next_renewal_count - 1,
-        replacement_sell_client_order_id=sell_client_order_id,
-        requested_remaining_qty=filled_qty,
-        notes="managed GTC sell replacement submission claimed before broker request",
+            conn,
+            position_id,
+            prior_sell_client_order_id=prior_sell_client_order_id or "",
+            prior_sell_alpaca_order_id=prior_sell_alpaca_order_id or "",
+            prior_renewal_count=next_renewal_count - 1,
+            replacement_sell_client_order_id=sell_client_order_id,
+            requested_remaining_qty=filled_qty,
+            notes="managed GTC sell replacement submission claimed before broker request",
         )
     if authoritative_remaining_qty is None:
         _append_reconciliation_result(
@@ -2254,9 +2274,9 @@ def _request_gtc_sell_renewal(
     try:
         refreshed_resp = client.get_order(sell_alpaca_order_id)
         refreshed_resp.raise_for_status()
-    except requests.RequestException:
+    except requests.RequestException as exc:
         if cancel_error is not None:
-            raise cancel_error
+            raise cancel_error from exc
         raise
     refreshed_order = _response_json(refreshed_resp)
     refreshed_status = str(refreshed_order.get("status", "pending_cancel")).lower()
@@ -2306,9 +2326,7 @@ def _request_gtc_sell_renewal(
         return
     remaining_qty = _managed_remaining_qty(position, filled_qty)
     observed_sell_qty, observed_sell_avg_price, fill_metadata_is_valid = _sell_fill_metadata(refreshed_order)
-    if not fill_metadata_is_valid or (
-        refreshed_status == "filled" and observed_sell_qty <= _MANAGED_QTY_TOLERANCE
-    ):
+    if not fill_metadata_is_valid or (refreshed_status == "filled" and observed_sell_qty <= _MANAGED_QTY_TOLERANCE):
         _append_incomplete_sell_fill_result(
             conn=conn,
             rows=rows,
@@ -2529,8 +2547,7 @@ def reconcile_alpaca_managed_positions(
     if positions.empty:
         return pd.DataFrame(columns=columns)
     workflow_by_position_id = {
-        int(position["id"]): _optional_str(position.get("workflow"))
-        for position in positions.to_dict("records")
+        int(position["id"]): _optional_str(position.get("workflow")) for position in positions.to_dict("records")
     }
 
     client = AlpacaClient(cfg)
@@ -2619,8 +2636,7 @@ def reconcile_alpaca_managed_positions(
                     if order_filled_qty <= 0 or order_filled_avg_price is None or order_filled_avg_price <= 0:
                         raise ValueError("filled Alpaca buy order is missing filled_qty or filled_avg_price")
                     parent_buy_fill_increased = (
-                        prior_filled_qty is not None
-                        and order_filled_qty > prior_filled_qty + _MANAGED_QTY_TOLERANCE
+                        prior_filled_qty is not None and order_filled_qty > prior_filled_qty + _MANAGED_QTY_TOLERANCE
                     )
                     filled_qty = order_filled_qty
                     filled_avg_price = order_filled_avg_price
@@ -2751,9 +2767,8 @@ def reconcile_alpaca_managed_positions(
                     )
                 except HTTPError as exc:
                     if (
-                        current_sell_status in {
-                            "submission_pending", "submission_unknown", "submission_not_found", "submission_retrying"
-                        }
+                        current_sell_status
+                        in {"submission_pending", "submission_unknown", "submission_not_found", "submission_retrying"}
                         and exc.response is not None
                         and exc.response.status_code == 404
                     ):
@@ -2763,9 +2778,9 @@ def reconcile_alpaca_managed_positions(
                             position_id,
                             sell_client_order_id=sell_client_order_id,
                             claimed_at=retry_now.isoformat().replace("+00:00", "Z"),
-                            reclaim_before=(
-                                retry_now - _SELL_SUBMISSION_RETRY_CLAIM_LEASE
-                            ).isoformat().replace("+00:00", "Z"),
+                            reclaim_before=(retry_now - _SELL_SUBMISSION_RETRY_CLAIM_LEASE)
+                            .isoformat()
+                            .replace("+00:00", "Z"),
                             notes="managed sell submission was not found by client order ID after recovery",
                         )
                         if recovery_qty is None:
@@ -2822,10 +2837,7 @@ def reconcile_alpaca_managed_positions(
                         identity_issue="broker response does not match the persisted managed sell order",
                     )
                     continue
-                sell_alpaca_order_id = (
-                    _optional_str(sell_order.get("id"))
-                    or persisted_sell_alpaca_order_id
-                )
+                sell_alpaca_order_id = _optional_str(sell_order.get("id")) or persisted_sell_alpaca_order_id
                 sell_expires_at = _optional_alpaca_datetime_str(sell_order.get("expires_at"))
                 sell_order_qty = _optional_positive_float(sell_order.get("qty"))
                 sell_order_limit_price = _optional_positive_float(sell_order.get("limit_price"))
@@ -3065,20 +3077,15 @@ def reconcile_alpaca_managed_positions(
                     )
                     continue
                 open_sell_remaining_qty = (
-                    None
-                    if sell_order_qty is None
-                    else max(sell_order_qty - observed_sell_qty, 0.0)
+                    None if sell_order_qty is None else max(sell_order_qty - observed_sell_qty, 0.0)
                 )
                 needs_sell_replacement = (
-                    (
-                        open_sell_remaining_qty is not None
-                        and abs(open_sell_remaining_qty - remaining_qty) > _MANAGED_QTY_TOLERANCE
-                    )
-                    or (
-                        sell_order_limit_price is not None
-                        and abs(sell_order_limit_price - float(target_sell_price))
-                        > _alpaca_limit_price_tolerance(float(target_sell_price))
-                    )
+                    open_sell_remaining_qty is not None
+                    and abs(open_sell_remaining_qty - remaining_qty) > _MANAGED_QTY_TOLERANCE
+                ) or (
+                    sell_order_limit_price is not None
+                    and abs(sell_order_limit_price - float(target_sell_price))
+                    > _alpaca_limit_price_tolerance(float(target_sell_price))
                 )
                 if sell_status in SELL_RENEWABLE_STATUSES and sell_alpaca_order_id and needs_sell_replacement:
                     _request_gtc_sell_renewal(
@@ -3104,11 +3111,8 @@ def reconcile_alpaca_managed_positions(
                 renewal_was_requested = _optional_str(position.get("sell_renewal_requested_at")) is not None
                 if sell_status in SELL_INACTIVE_STATUSES:
                     should_resubmit = (
-                        sell_status == "expired"
-                        and (cfg.gtc_sell_renewal_enabled or renewal_was_requested)
-                    ) or (
-                        sell_status == "canceled" and renewal_was_requested
-                    )
+                        sell_status == "expired" and (cfg.gtc_sell_renewal_enabled or renewal_was_requested)
+                    ) or (sell_status == "canceled" and renewal_was_requested)
                     if should_resubmit:
                         _submit_replacement_gtc_sell(
                             conn=conn,
@@ -3798,8 +3802,8 @@ def submit_alpaca_paper_buy_orders(
                 # ambiguous or fails after Alpaca accepted it, retrying cannot
                 # accidentally over-allocate the configured batch budget.
                 remaining_batch_notional = max(remaining_batch_notional - order_notional, 0.0)
-                is_managed_signal = (
-                    conn is not None and {"RSI Symbol", "Buy RSI", "Sell Return Multiple"}.issubset(signal)
+                is_managed_signal = conn is not None and {"RSI Symbol", "Buy RSI", "Sell Return Multiple"}.issubset(
+                    signal
                 )
                 managed_position_id: int | None = None
                 submission_claimed = False
@@ -3833,10 +3837,7 @@ def submit_alpaca_paper_buy_orders(
                             qty=order_qty,
                             limit_price=limit_price,
                             status="submission_pending",
-                            message=(
-                                "another workflow owns this managed buy intent; "
-                                f"broker lookup is pending: {exc}"
-                            ),
+                            message=(f"another workflow owns this managed buy intent; broker lookup is pending: {exc}"),
                         )
                         continue
                     if existing_resp.status_code == 200:
@@ -3977,8 +3978,8 @@ def submit_alpaca_paper_buy_orders(
                         qty=order_qty,
                         limit_price=limit_price,
                         status="error",
-                            message=_http_error_message(exc),
-                        )
+                        message=_http_error_message(exc),
+                    )
                 except requests.RequestException as exc:
                     if managed_position_id is not None and _recover_managed_buy_submission(
                         conn=conn,
@@ -4094,10 +4095,7 @@ def submit_alpaca_paper_sell_orders(
             amount=None,
             status="managed_only",
             alpaca_order_id=None,
-            message=(
-                "direct sell-signal submissions are disabled; "
-                "managed reconciliation handles GTC limit sells"
-            ),
+            message=("direct sell-signal submissions are disabled; managed reconciliation handles GTC limit sells"),
         )
 
     return pd.DataFrame(rows, columns=columns)

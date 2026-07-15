@@ -387,9 +387,7 @@ class OutputTests(unittest.TestCase):
     def test_universe_assets_renders_audit_source_failure_details(self) -> None:
         console = Console(file=io.StringIO(), record=True, width=120, color_system=None, no_color=True)
         reporter = WorkflowReporter(console=console)
-        universe = pd.DataFrame(
-            [{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "rsi_symbol": "QQQ"}]
-        )
+        universe = pd.DataFrame([{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "rsi_symbol": "QQQ"}])
         universe.attrs["universe_degraded"] = True
         universe.attrs["universe_counts"] = {"Audit sources failed": 1}
         universe.attrs["audit_source_failures"] = [

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import math
+import os
 import sqlite3
+import stat
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -27,6 +31,7 @@ from .config import (
     BacktestConfig,
     TradierMarketDataConfig,
     UniverseConfig,
+    validate_alpaca_paper_endpoint,
 )
 from .market_data import (
     TRADIER_RECOVERED_SYMBOLS_ATTR,
@@ -80,6 +85,66 @@ def _validate_optimization_grids(
 ) -> None:
     _validate_grid_values("buy_rsi_values", buy_rsi_values)
     _validate_grid_values("profit_target_values", profit_target_values)
+    if any(not 0.0 <= float(value) <= 100.0 for value in buy_rsi_values):
+        raise ValueError("buy_rsi_values must be between 0 and 100 inclusive.")
+    if any(float(value) <= 1.0 for value in profit_target_values):
+        raise ValueError("profit_target_values must be greater than 1.0.")
+
+
+def _validate_workflow_mode(mode: str) -> None:
+    if mode not in {"update", "rebuild"}:
+        raise ValueError(f"mode must be 'update' or 'rebuild'; got {mode!r}.")
+
+
+def _validate_database_path(db_path: str) -> None:
+    if not db_path:
+        raise ValueError("db_path must be a nonempty filesystem path.")
+    if db_path == ":memory:":
+        raise ValueError("db_path must be a persistent filesystem path; ':memory:' is not supported.")
+
+
+@contextmanager
+def _workflow_run_lock(db_path: str, output_dir: str):
+    canonical_db_path = Path(db_path).resolve()
+    try:
+        db_stat = canonical_db_path.stat()
+    except FileNotFoundError:
+        db_stat = None
+    if db_stat is not None and stat.S_ISREG(db_stat.st_mode) and db_stat.st_nlink > 1:
+        raise WorkflowRunError(
+            f"Database {db_path} has multiple hard links; use one canonical path for the SQLite database."
+        )
+    lock_paths = sorted(
+        {
+            Path(f"{db_path}.lock").resolve(),
+            Path(f"{canonical_db_path}.lock"),
+            Path(output_dir).resolve() / ".leveraged-trader.lock",
+        },
+        key=str,
+    )
+    lock_files = []
+    try:
+        for lock_path in lock_paths:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_file = lock_path.open("a+", encoding="utf-8")
+            lock_files.append(lock_file)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException as exc:
+        for lock_file in reversed(lock_files):
+            lock_file.close()
+        if isinstance(exc, BlockingIOError):
+            raise WorkflowRunError(
+                f"Another workflow is already using database {db_path} or output directory {output_dir}."
+            ) from exc
+        raise
+    try:
+        yield
+    finally:
+        for lock_file in reversed(lock_files):
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            finally:
+                lock_file.close()
 
 
 class WorkflowRunError(RuntimeError):
@@ -320,9 +385,7 @@ def _reconcile_alpaca_managed_positions_for_db(
         active_positions = load_alpaca_managed_positions(conn, active_only=True)
         migration_rows = []
         for prior_symbol, current_symbol in migrations.items():
-            matches = active_positions[
-                active_positions["symbol"].astype(str).str.upper().eq(current_symbol.upper())
-            ]
+            matches = active_positions[active_positions["symbol"].astype(str).str.upper().eq(current_symbol.upper())]
             if matches.empty:
                 continue
             position = matches.iloc[0]
@@ -903,7 +966,23 @@ def _concat_report_frames(frames: list[pd.DataFrame], *, axis: int = 0) -> pd.Da
     return pd.concat(frames, ignore_index=True, sort=False)
 
 
-async def run_resumable_optimizations_async(
+def _atomic_to_csv(frame: pd.DataFrame, destination: Path, *, index: bool = True) -> None:
+    """Write a CSV completely before atomically publishing it at its destination."""
+    fd, temporary_name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+    )
+    os.close(fd)
+    temporary_path = Path(temporary_name)
+    try:
+        frame.to_csv(temporary_path, index=index)
+        os.replace(temporary_path, destination)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+async def _run_resumable_optimizations_unlocked(
     mode: str,
     db_path: str,
     base_cfg: BacktestConfig,
@@ -918,6 +997,7 @@ async def run_resumable_optimizations_async(
     tradier_cfg: TradierMarketDataConfig | None = None,
     short_buy_rsi_values: list[float] | None = None,
 ) -> None:
+    validate_alpaca_paper_endpoint(alpaca_cfg)
     _validate_optimization_grids(buy_rsi_values, profit_target_values)
     short_buy_rsi_values = list(DEFAULT_SHORT_BUY_RSI_VALUES) if short_buy_rsi_values is None else short_buy_rsi_values
     _validate_optimization_grids(short_buy_rsi_values, profit_target_values)
@@ -1122,6 +1202,47 @@ async def run_resumable_optimizations_async(
     )
 
 
+async def run_resumable_optimizations_async(
+    mode: str,
+    db_path: str,
+    base_cfg: BacktestConfig,
+    universe_cfg: UniverseConfig,
+    buy_rsi_values: list[float],
+    profit_target_values: list[float],
+    alpaca_cfg: AlpacaOrderConfig,
+    output_dir: str,
+    workflow_concurrency: int = DEFAULT_WORKFLOW_CONCURRENCY,
+    no_color: bool = False,
+    reporter: WorkflowReporter | None = None,
+    tradier_cfg: TradierMarketDataConfig | None = None,
+    short_buy_rsi_values: list[float] | None = None,
+) -> None:
+    _validate_workflow_mode(mode)
+    _validate_database_path(db_path)
+    validate_alpaca_paper_endpoint(alpaca_cfg)
+    _validate_optimization_grids(buy_rsi_values, profit_target_values)
+    validated_short_buy_rsi_values = (
+        DEFAULT_SHORT_BUY_RSI_VALUES if short_buy_rsi_values is None else short_buy_rsi_values
+    )
+    _validate_optimization_grids(validated_short_buy_rsi_values, profit_target_values)
+    with _workflow_run_lock(db_path, output_dir):
+        await _run_resumable_optimizations_unlocked(
+            mode=mode,
+            db_path=db_path,
+            base_cfg=base_cfg,
+            universe_cfg=universe_cfg,
+            buy_rsi_values=buy_rsi_values,
+            profit_target_values=profit_target_values,
+            alpaca_cfg=alpaca_cfg,
+            output_dir=output_dir,
+            workflow_concurrency=workflow_concurrency,
+            no_color=no_color,
+            reporter=reporter,
+            tradier_cfg=tradier_cfg,
+            short_buy_rsi_values=short_buy_rsi_values,
+        )
+
+
 def run_resumable_optimizations(
     mode: str,
     db_path: str,
@@ -1220,14 +1341,14 @@ def _write_workflow_outputs(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    curves.to_csv(output_path / "best_equity_curves.csv")
-    optimization_summary.to_csv(output_path / "optimization_summary.csv", index=False)
-    buy_signals.to_csv(output_path / "buy_signals.csv", index=False)
-    eligible_buy_signals.to_csv(output_path / "eligible_buy_signals.csv", index=False)
-    sell_signals.to_csv(output_path / "sell_signals.csv", index=False)
-    realized_pnl_summary.to_csv(output_path / "alpaca_realized_pnl.csv", index=False)
-    managed_positions.to_csv(output_path / "managed_positions.csv", index=False)
-    reconciliation_results.to_csv(output_path / "alpaca_reconciliation_results.csv", index=False)
+    _atomic_to_csv(curves, output_path / "best_equity_curves.csv")
+    _atomic_to_csv(optimization_summary, output_path / "optimization_summary.csv", index=False)
+    _atomic_to_csv(buy_signals, output_path / "buy_signals.csv", index=False)
+    _atomic_to_csv(eligible_buy_signals, output_path / "eligible_buy_signals.csv", index=False)
+    _atomic_to_csv(sell_signals, output_path / "sell_signals.csv", index=False)
+    _atomic_to_csv(realized_pnl_summary, output_path / "alpaca_realized_pnl.csv", index=False)
+    _atomic_to_csv(managed_positions, output_path / "managed_positions.csv", index=False)
+    _atomic_to_csv(reconciliation_results, output_path / "alpaca_reconciliation_results.csv", index=False)
     if alpaca_cfg.enabled:
         reporter.order_results(terminal_order_results)
     reporter.buy_signal_eligibility_summary(
@@ -1235,12 +1356,12 @@ def _write_workflow_outputs(
         eligible_buy_signals=eligible_buy_signals,
         order_results=order_results,
     )
-    order_results.to_csv(output_path / "alpaca_order_results.csv", index=False)
+    _atomic_to_csv(order_results, output_path / "alpaca_order_results.csv", index=False)
 
     if alpaca_cfg.sell_enabled:
         reporter.reconciliation(terminal_reconciliation_results)
     reporter.realized_pnl_summary(realized_pnl_summary)
-    sell_reconciliation_results.to_csv(output_path / "alpaca_sell_order_results.csv", index=False)
+    _atomic_to_csv(sell_reconciliation_results, output_path / "alpaca_sell_order_results.csv", index=False)
     if phase_timings is not None:
         phase_timings.add("report_generation", time.perf_counter() - report_output_started)
     reporter.workflow_footer(workflow_timer.elapsed_seconds())

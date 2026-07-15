@@ -63,7 +63,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--db",
         default=SQLITE_DB_PATH,
-        help="SQLite file used for market data, RSI values, equity history, and strategy state.",
+        help=(
+            "Persistent SQLite file used for market data, RSI values, equity history, and strategy state; "
+            "in-memory and hard-linked databases are not supported."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -104,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--alpaca-base-url",
         default=os.environ.get("ALPACA_BASE_URL", ALPACA_PAPER_BASE_URL),
-        help="Alpaca Trading API base URL. Defaults to the paper trading endpoint.",
+        help=("Alpaca Trading API base URL. Access is restricted to https://paper-api.alpaca.markets (default)."),
     )
     parser.add_argument(
         "--alpaca-timeout-seconds",

@@ -25,8 +25,7 @@ def sample_strategy_data(periods: int = 40) -> pd.DataFrame:
     dates = pd.date_range("2026-01-02", periods=periods, freq="B")
     asset_close = np.linspace(100.0, 140.0, periods)
     signal_close = pd.Series(
-        [100.0 - i for i in range(periods // 2)]
-        + [80.0 + i for i in range(periods - periods // 2)],
+        [100.0 - i for i in range(periods // 2)] + [80.0 + i for i in range(periods - periods // 2)],
         index=dates,
     )
     return pd.DataFrame(
@@ -84,11 +83,7 @@ class StorageOptimizationTests(unittest.TestCase):
         finally:
             self.conn.set_trace_callback(None)
 
-        market_statements = [
-            statement.upper()
-            for statement in statements
-            if "MARKET_DATA" in statement.upper()
-        ]
+        market_statements = [statement.upper() for statement in statements if "MARKET_DATA" in statement.upper()]
         self.assertFalse(revised)
         self.assertEqual(self.conn.total_changes, changes_before)
         self.assertEqual(
@@ -96,10 +91,7 @@ class StorageOptimizationTests(unittest.TestCase):
             1,
         )
         self.assertFalse(
-            any(
-                statement.lstrip().startswith(("INSERT", "UPDATE", "DELETE"))
-                for statement in market_statements
-            )
+            any(statement.lstrip().startswith(("INSERT", "UPDATE", "DELETE")) for statement in market_statements)
         )
 
     def test_authoritative_history_tail_append_writes_only_new_session(self) -> None:
@@ -171,9 +163,7 @@ class StorageOptimizationTests(unittest.TestCase):
         self.assertEqual(self.conn.total_changes, changes_before)
 
     def test_authoritative_history_missing_columns_fails_before_writing(self) -> None:
-        history = self.canonical_histories(sample_strategy_data())["TQQQ"].drop(
-            columns="TQQQ_Volume"
-        )
+        history = self.canonical_histories(sample_strategy_data())["TQQQ"].drop(columns="TQQQ_Volume")
         changes_before = self.conn.total_changes
 
         with self.assertRaisesRegex(ValueError, "TQQQ_Volume"):
@@ -359,9 +349,7 @@ class StorageOptimizationTests(unittest.TestCase):
             rebuild=False,
         )
 
-        trading_days = self.conn.execute(
-            "SELECT trading_days FROM strategy_summary"
-        ).fetchone()[0]
+        trading_days = self.conn.execute("SELECT trading_days FROM strategy_summary").fetchone()[0]
         equity_rows = self.conn.execute("SELECT COUNT(*) FROM strategy_equity").fetchone()[0]
 
         self.assertEqual(trading_days, len(data))
@@ -412,9 +400,7 @@ class StorageOptimizationTests(unittest.TestCase):
             "SELECT close FROM market_data WHERE symbol = 'TQQQ' AND date = ?",
             (revision.index[10].date().isoformat(),),
         ).fetchone()[0]
-        summary_end_date = self.conn.execute(
-            "SELECT DISTINCT end_date FROM strategy_summary"
-        ).fetchone()[0]
+        summary_end_date = self.conn.execute("SELECT DISTINCT end_date FROM strategy_summary").fetchone()[0]
         self.assertEqual(stored_close, 20.0)
         self.assertEqual(summary_end_date, revision.index[-1].date().isoformat())
 
@@ -610,13 +596,8 @@ class StorageOptimizationTests(unittest.TestCase):
             authoritative_histories=histories,
         )
 
-        equity_dates = {
-            row[0]
-            for row in self.conn.execute("SELECT date FROM strategy_equity").fetchall()
-        }
-        summary_trading_days = self.conn.execute(
-            "SELECT trading_days FROM strategy_summary"
-        ).fetchone()[0]
+        equity_dates = {row[0] for row in self.conn.execute("SELECT date FROM strategy_equity").fetchall()}
+        summary_trading_days = self.conn.execute("SELECT trading_days FROM strategy_summary").fetchone()[0]
 
         self.assertIn(missing_benchmark_date.date().isoformat(), equity_dates)
         self.assertEqual(len(equity_dates), len(data))
