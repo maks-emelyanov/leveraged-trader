@@ -349,7 +349,7 @@ class OutputTests(unittest.TestCase):
         reporter.universe_assets(universe)
         output = console.export_text(styles=False)
 
-        self.assertIn("Workflow universe is degraded", output)
+        self.assertIn("Universe is degraded", output)
         self.assertIn("Failed Workflow Universe Sources", output)
         self.assertIn("Direxion", output)
         self.assertIn("source_error", output)
@@ -379,10 +379,35 @@ class OutputTests(unittest.TestCase):
         reporter.universe_assets(universe)
         output = console.export_text(styles=False)
 
-        self.assertIn("Workflow universe is degraded", output)
+        self.assertIn("Universe is degraded", output)
         self.assertIn("Failed Active Listing Sources", output)
         self.assertIn("other_listed", output)
         self.assertIn("Offline", output)
+
+    def test_universe_assets_renders_audit_source_failure_details(self) -> None:
+        console = Console(file=io.StringIO(), record=True, width=120, color_system=None, no_color=True)
+        reporter = WorkflowReporter(console=console)
+        universe = pd.DataFrame(
+            [{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "rsi_symbol": "QQQ"}]
+        )
+        universe.attrs["universe_degraded"] = True
+        universe.attrs["universe_counts"] = {"Audit sources failed": 1}
+        universe.attrs["audit_source_failures"] = [
+            {
+                "source": "NYSE exchange-traded products directory",
+                "source_type": "exchange_directory",
+                "status": "error",
+                "error": "Parser returned no rows from an enabled audit source.",
+            }
+        ]
+
+        reporter.universe_assets(universe)
+        output = console.export_text(styles=False)
+
+        self.assertIn("Audit sources failed", output)
+        self.assertIn("Failed Audit Universe Sources", output)
+        self.assertIn("NYSE exchange-traded products directory", output)
+        self.assertIn("Parser returned no rows", output)
 
     def test_universe_assets_renders_rsi_mapping_review_details(self) -> None:
         console = Console(file=io.StringIO(), record=True, width=120, color_system=None, no_color=True)

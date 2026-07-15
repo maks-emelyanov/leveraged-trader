@@ -28,6 +28,7 @@ UNIVERSE_SUMMARY_NONZERO_COUNT_LABELS = (
     "RSI mappings excluded pending review",
     "Workflow universe sources failed",
     "Active listing sources failed",
+    "Audit sources failed",
     "Audit leveraged candidates missing from merged universe",
 )
 
@@ -313,6 +314,7 @@ class WorkflowReporter:
         universe_degraded = bool(df.attrs.get("universe_degraded", False))
         source_failures = pd.DataFrame(df.attrs.get("workflow_source_failures", []))
         active_listing_failures = pd.DataFrame(df.attrs.get("active_listing_source_failures", []))
+        audit_source_failures = pd.DataFrame(df.attrs.get("audit_source_failures", []))
         mapping_review = pd.DataFrame(df.attrs.get("rsi_mapping_review", []))
 
         self.section(title)
@@ -327,8 +329,8 @@ class WorkflowReporter:
         if universe_degraded:
             self.console.print(
                 Text(
-                    "Workflow universe is degraded: one or more universe source checks failed. "
-                    "See universe_workflow_source_status and universe_active_listing_source_status in SQLite.",
+                    "Universe is degraded: one or more source checks failed. See the universe source-status "
+                    "tables in SQLite.",
                     style="yellow",
                 )
             )
@@ -358,6 +360,20 @@ class WorkflowReporter:
                     empty_message="No failed active listing sources.",
                     max_rows=12,
                     truncated_detail="full active listing health saved in SQLite",
+                )
+            if not audit_source_failures.empty:
+                self.dataframe(
+                    "Failed Audit Universe Sources",
+                    audit_source_failures,
+                    [
+                        TableColumn("source", "Source", no_wrap=True),
+                        TableColumn("source_type", "Type", no_wrap=True),
+                        TableColumn("status", "Status", status=True, no_wrap=True),
+                        TableColumn("error", "Error", ratio=1, min_width=28, formatter=format_compact_message),
+                    ],
+                    empty_message="No failed audit universe sources.",
+                    max_rows=12,
+                    truncated_detail="full audit source health saved in SQLite",
                 )
         if not mapping_review.empty:
             self.console.print(

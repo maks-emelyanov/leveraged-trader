@@ -38,6 +38,7 @@ from leveraged_trader.universe import (
     is_short_leveraged_name,
     leveraged_name_filter,
     load_active_listed_symbols,
+    load_audit_universe_sources,
     load_current_etf_universe,
     load_etn_universe,
     load_issuer_etf_universe,
@@ -243,6 +244,35 @@ class UniverseTests(unittest.TestCase):
             infer_rsi_symbol("FIVP", "500% Long QQQ Daily ETF", known_symbols={"FIVP", "QQQ"}),
             "QQQ",
         )
+
+    def test_sk_hynix_products_do_not_use_sk_telecom_rsi(self) -> None:
+        for asset_symbol, direction in [
+            ("SKHU", "Long"),
+            ("SKHX", "Long"),
+            ("SKUU", "Long"),
+            ("SKDD", "Short"),
+        ]:
+            with self.subTest(asset_symbol=asset_symbol):
+                mapping = infer_rsi_mapping(
+                    asset_symbol,
+                    f"Example 2X {direction} SK Hynix Daily ETF",
+                    known_symbols={asset_symbol, "SK"},
+                )
+
+                self.assertEqual(mapping.rsi_symbol, asset_symbol)
+                self.assertEqual(mapping.confidence, "needs_review")
+                self.assertIn("SK Telecom", mapping.mapping_reason)
+
+    def test_new_sk_hynix_product_is_quarantined_by_name(self) -> None:
+        mapping = infer_rsi_mapping(
+            "NEWSK",
+            "Example 2X Long SK Hynix Daily ETF",
+            known_symbols={"NEWSK", "SK"},
+        )
+
+        self.assertEqual(mapping.rsi_symbol, "NEWSK")
+        self.assertEqual(mapping.confidence, "needs_review")
+        self.assertIn("SK Telecom", mapping.mapping_reason)
 
     def test_normalizes_brkb_to_yahoo_symbol(self) -> None:
         self.assertEqual(infer_rsi_symbol("BRKU", "2X Long BRKB Daily ETF"), "BRK-B")
@@ -826,6 +856,26 @@ class UniverseTests(unittest.TestCase):
         self.assertTrue(
             all(source.source_type != "issuer" for source in AUDIT_UNIVERSE_SOURCES)
         )
+
+    @patch("leveraged_trader.universe.AUDIT_UNIVERSE_SOURCES")
+    @patch("leveraged_trader.universe.requests.get")
+    def test_enabled_audit_source_with_no_parsed_rows_is_an_error(
+        self,
+        mock_get: Mock,
+        mock_sources: Mock,
+    ) -> None:
+        mock_sources.__iter__.return_value = iter(
+            [UniverseSource("Empty directory", "https://example.test", "exchange_directory")]
+        )
+        response = Mock()
+        response.text = "<html><body>No parseable product table</body></html>"
+        mock_get.return_value = response
+
+        rows, status = load_audit_universe_sources()
+
+        self.assertTrue(rows.empty)
+        self.assertEqual(status.loc[0, "status"], "error")
+        self.assertIn("Parser returned no rows", status.loc[0, "error"])
 
     def test_microsectors_parser_builds_etn_rows(self) -> None:
         source = UniverseSource(

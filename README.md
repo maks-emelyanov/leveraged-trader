@@ -309,11 +309,13 @@ Curated inverse mappings use an unlevered ETF or spot-market proxy for the produ
 than the inverse product's own RSI. Products are excluded when leveraged-looking wording is not actual
 inverse exposure (for example, "ultra-short" bond-duration funds), or when a changing basket means no
 stable single RSI proxy exists.
-A universe discovery or active listing source
-failure, or a successful response that cannot be parsed, leaves the run marked as degraded in terminal
-output. A successfully parsed source with zero leveraged matches remains healthy; use
-`--require-workflow-source-success` when a partial universe caused by a fetch or parser failure is not
-acceptable.
+A workflow discovery, active listing, or enabled audit-source failure leaves the run marked as
+degraded in terminal output. A workflow source that parses successfully but contains zero leveraged
+matches remains healthy; an enabled audit directory that produces no parseable product rows is treated
+as a parser failure because an empty exchange or registry directory is not a credible successful
+snapshot. Audit sources remain coverage checks and do not contribute executable rows. Use
+`--require-workflow-source-success` when a partial executable universe caused by a workflow discovery or
+active-listing failure is not acceptable; the option does not make audit-only source failures fatal.
 
 Terminal output is intentionally compact: concurrent asset work is shown as aggregate progress, with
 long and short ETF/ETN workflow results reported separately before combined buy and Alpaca sections.

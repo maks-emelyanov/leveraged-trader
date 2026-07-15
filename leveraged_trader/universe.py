@@ -481,7 +481,20 @@ RSI_SELF_FALLBACK_SYMBOL_OVERRIDES = {
     "BEGS": ("BEGS", "Rareview 2X Bull Cryptocurrency & Precious Metals ETF self-RSI fallback"),
 }
 
-RSI_SYMBOLS_REQUIRING_REVIEW: dict[str, str] = {}
+RSI_SYMBOLS_REQUIRING_REVIEW: dict[str, str] = {
+    # SK is SK Telecom's U.S. ticker, not an investable SK hynix underlying.
+    # Until a stable market-data proxy is selected, using it would drive both
+    # long and inverse SK hynix products from an unrelated company's RSI.
+    symbol: "SK hynix has no validated U.S. underlying ticker or RSI proxy; SK is SK Telecom"
+    for symbol in ("SKHU", "SKHX", "SKUU", "SKDD")
+}
+
+RSI_NAME_PATTERNS_REQUIRING_REVIEW = [
+    (
+        r"\bSK\s+HYNIX\b",
+        "SK hynix has no validated U.S. underlying ticker or RSI proxy; SK is SK Telecom",
+    ),
+]
 
 RSI_NAME_PROXY_PATTERNS = [
     (r"\bSPACE\s*X\b|\bSPACEX\b", "SPCX", "Space Exploration Technologies Corp. Class A"),
@@ -716,6 +729,19 @@ def _mapping_from_review_symbol(asset_symbol: str) -> RsiSymbolMapping | None:
     )
 
 
+def _mapping_from_review_name(asset_symbol: str, normalized_name: str) -> RsiSymbolMapping | None:
+    for pattern, review_reason in RSI_NAME_PATTERNS_REQUIRING_REVIEW:
+        if re.search(pattern, normalized_name):
+            return RsiSymbolMapping(
+                rsi_symbol=asset_symbol,
+                underlying_name=asset_symbol,
+                mapping_source="unresolved_single_stock",
+                confidence="needs_review",
+                mapping_reason=review_reason,
+            )
+    return None
+
+
 def _looks_like_single_stock_product(fund_name: object, fund_type: object | None = None) -> bool:
     normalized_name = _normalized_fund_name(fund_name)
     normalized_type = _normalized_fund_name(fund_type or "")
@@ -754,6 +780,7 @@ def infer_rsi_mapping(
         _mapping_from_self_fallback_symbol(asset_symbol),
         _mapping_from_curated_name(normalized_name),
         _mapping_from_review_symbol(asset_symbol),
+        _mapping_from_review_name(asset_symbol, normalized_name),
     ]:
         if curated_mapping is not None:
             return curated_mapping
@@ -1854,16 +1881,19 @@ def load_audit_universe_sources(timeout: int = 30) -> tuple[pd.DataFrame, pd.Dat
             )
             continue
 
-        if not source_rows.empty:
-            source_rows = _with_audit_metadata(source_rows, source)
-            rows.append(source_rows)
-        status_rows.append(
-            _audit_source_status_row(
-                source,
-                status="loaded" if not source_rows.empty else "loaded_no_rows",
-                row_count=len(source_rows),
+        if source_rows.empty:
+            status_rows.append(
+                _audit_source_status_row(
+                    source,
+                    status="error",
+                    error="Parser returned no rows from an enabled audit source.",
+                )
             )
-        )
+            continue
+
+        source_rows = _with_audit_metadata(source_rows, source)
+        rows.append(source_rows)
+        status_rows.append(_audit_source_status_row(source, status="loaded", row_count=len(source_rows)))
 
     if rows:
         audit_rows = (
@@ -2077,6 +2107,11 @@ def determine_workflow_asset_groups(cfg: UniverseConfig) -> dict[str, pd.DataFra
         sort=False,
     ).drop_duplicates("symbol")
     audit_report = build_universe_audit_report(audit_rows, etf_df, all_workflow_leveraged)
+    audit_source_failures = (
+        audit_status.loc[audit_status["status"].eq("error")].copy()
+        if "status" in audit_status.columns
+        else pd.DataFrame(columns=audit_status.columns)
+    )
     save_table_to_sqlite(audit_rows, cfg.sqlite_db_path, "universe_audit_rows")
     save_table_to_sqlite(audit_report, cfg.sqlite_db_path, "universe_audit_missing_candidates")
     save_table_to_sqlite(audit_status, cfg.sqlite_db_path, "universe_audit_source_status")
@@ -2131,15 +2166,19 @@ def determine_workflow_asset_groups(cfg: UniverseConfig) -> dict[str, pd.DataFra
         "RSI mappings needing review": len(rsi_mapping_review),
         "RSI mappings excluded pending review": len(rsi_mapping_review),
         "Audit sources registered": len(AUDIT_UNIVERSE_SOURCES),
+        "Audit sources failed": len(audit_source_failures),
         "Audit rows parsed": len(audit_rows),
         "Audit leveraged candidates missing from merged universe": len(audit_report),
     }
     common_attrs = {
         "universe_degraded": (
-            not workflow_source_failures.empty or not active_listing_failures.empty
+            not workflow_source_failures.empty
+            or not active_listing_failures.empty
+            or not audit_source_failures.empty
         ),
         "workflow_source_failures": workflow_source_failures.to_dict("records"),
         "active_listing_source_failures": active_listing_failures.to_dict("records"),
+        "audit_source_failures": audit_source_failures.to_dict("records"),
         "rsi_mapping_review": rsi_mapping_review.to_dict("records"),
         "universe_db_path": cfg.sqlite_db_path,
     }
