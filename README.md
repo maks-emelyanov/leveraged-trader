@@ -389,8 +389,9 @@ Managed sell orders:
 - Persist the deterministic sell client order ID before broker submission. Ambiguous sell POST outcomes are recovered by client order ID on later reconciliation, and matching open `rsi-exit-...` orders can be reattached to the managed row.
 - Reconcile immediately after each submitted buy batch, so fills can receive their managed sell in the same workflow run.
 - Renew active GTC sells before Alpaca's aged-order expiration, using the remaining managed quantity and frozen target price. The renewal-cancel intent is persisted before requesting cancellation, so a timeout can still be completed after Alpaca later reports the order canceled.
-- Track managed holdings by Alpaca asset ID across ticker changes. Before changing a managed ticker, the workflow validates attached broker/client-order identity and Alpaca's asset response, rejects asset or ticker collisions, and applies the complete migration batch transactionally. Existing broker order IDs remain attached to their original lineage, old-ticker open sells can be recovered by asset ID, every observed ticker alias blocks duplicate buys, and replacement exits use Alpaca's current ticker. Unchanged positions avoid historical-order lookups. A `symbol_migrated` row appears in reconciliation output only on the run that applies the change.
+- Track managed holdings by Alpaca asset ID across ticker changes. Before changing a managed ticker, the workflow validates attached broker/client-order identity and Alpaca's asset response, rejects asset or ticker collisions, and applies the complete migration batch transactionally. Existing broker order IDs remain attached to their original lineage, old-ticker open sells can be recovered by asset ID, every observed ticker alias blocks duplicate buys, and replacement exits use Alpaca's current ticker. Alpaca can continue displaying an existing protective order under its pre-rename ticker even though the current position uses the new ticker; matching asset IDs establish that the order protects the renamed position. Unchanged positions avoid historical-order lookups. A `symbol_migrated` row appears in reconciliation output only on the run that applies the change.
 - Resubmit expired GTC sells when renewal is enabled and the managed position is still open.
+- Require recurring runs with managed sell submission enabled for renewal and resubmission to occur; persisted state alone does not schedule broker requests.
 - Are not resubmitted automatically after a sell order is rejected or manually canceled.
 - Skip GTC sell submission for legacy fractional managed quantities and keep the managed position active for review.
 - Keep the managed position active, blocking new buys, until cumulative managed sell fills close the full buy quantity.
@@ -407,6 +408,7 @@ Managed position lifecycle:
 - Closed rows missing actual sell fill data are counted as incomplete and excluded from realized P/L totals.
 - Existing Alpaca positions that predate this table are not managed automatically unless imported into `alpaca_managed_positions`.
 - Existing unmanaged Alpaca sell orders still protect against repeat buys while they remain open. Deterministic managed exit orders can be linked back to `managed_positions.csv`; unrelated sell orders are not linked automatically.
+- To audit live coverage, compare each open Alpaca position with an active managed row and an open sell order by `alpaca_asset_id`, then verify that the order's unfilled quantity covers the held quantity. Symbol-only checks are insufficient across ticker changes.
 
 ## Consistency and Concurrency
 

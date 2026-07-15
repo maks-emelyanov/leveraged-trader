@@ -199,7 +199,12 @@ AUDIT_UNIVERSE_SOURCES = [
         "NYSE exchange-traded products directory",
         "https://www.nyse.com/listings_directory/etf",
         source_type="exchange_directory",
-        notes="Audit-only exchange directory; does not override issuer or Nasdaq rows.",
+        parser="registered_only",
+        enabled=False,
+        notes=(
+            "Registered as an audit backstop; listings are populated client-side and the public page "
+            "does not expose product rows to the static HTML parser."
+        ),
     ),
     UniverseSource(
         "Nasdaq funds/ETFs directory",
@@ -473,6 +478,10 @@ RSI_SYMBOL_OVERRIDES = {
     "SOLT": ("SOL-USD", "Solana spot price proxy"),
     "STLU": ("XLM-USD", "Stellar spot price proxy"),
     "SUIL": ("SUI20947-USD", "Sui spot price proxy"),
+    "SKDD": ("SKHY", "SK hynix Inc. American depositary shares"),
+    "SKHU": ("SKHY", "SK hynix Inc. American depositary shares"),
+    "SKHX": ("SKHY", "SK hynix Inc. American depositary shares"),
+    "SKUU": ("SKHY", "SK hynix Inc. American depositary shares"),
     "TXXD": ("DOGE-USD", "Dogecoin spot price proxy"),
     "TXXH": ("HYPE32196-USD", "Hyperliquid spot price proxy"),
 }
@@ -481,22 +490,12 @@ RSI_SELF_FALLBACK_SYMBOL_OVERRIDES = {
     "BEGS": ("BEGS", "Rareview 2X Bull Cryptocurrency & Precious Metals ETF self-RSI fallback"),
 }
 
-RSI_SYMBOLS_REQUIRING_REVIEW: dict[str, str] = {
-    # SK is SK Telecom's U.S. ticker, not an investable SK hynix underlying.
-    # Until a stable market-data proxy is selected, using it would drive both
-    # long and inverse SK hynix products from an unrelated company's RSI.
-    symbol: "SK hynix has no validated U.S. underlying ticker or RSI proxy; SK is SK Telecom"
-    for symbol in ("SKHU", "SKHX", "SKUU", "SKDD")
-}
+RSI_SYMBOLS_REQUIRING_REVIEW: dict[str, str] = {}
 
-RSI_NAME_PATTERNS_REQUIRING_REVIEW = [
-    (
-        r"\bSK\s+HYNIX\b",
-        "SK hynix has no validated U.S. underlying ticker or RSI proxy; SK is SK Telecom",
-    ),
-]
+RSI_NAME_PATTERNS_REQUIRING_REVIEW: list[tuple[str, str]] = []
 
 RSI_NAME_PROXY_PATTERNS = [
+    (r"\bSK\s+HYNIX\b", "SKHY", "SK hynix Inc. American depositary shares"),
     (r"\bSPACE\s*X\b|\bSPACEX\b", "SPCX", "Space Exploration Technologies Corp. Class A"),
     (r"\bS\s*&\s*P\s*500\s+EQUAL\s+WEIGHT\b", "RSP", "Invesco S&P 500 Equal Weight ETF proxy"),
     (r"\bS\s*&\s*P\s*500\b|\bS&P500\b", "SPY", "SPDR S&P 500 ETF Trust proxy"),

@@ -245,7 +245,7 @@ class UniverseTests(unittest.TestCase):
             "QQQ",
         )
 
-    def test_sk_hynix_products_do_not_use_sk_telecom_rsi(self) -> None:
+    def test_sk_hynix_products_use_us_listed_underlying_rsi(self) -> None:
         for asset_symbol, direction in [
             ("SKHU", "Long"),
             ("SKHX", "Long"),
@@ -259,20 +259,20 @@ class UniverseTests(unittest.TestCase):
                     known_symbols={asset_symbol, "SK"},
                 )
 
-                self.assertEqual(mapping.rsi_symbol, asset_symbol)
-                self.assertEqual(mapping.confidence, "needs_review")
-                self.assertIn("SK Telecom", mapping.mapping_reason)
+                self.assertEqual(mapping.rsi_symbol, "SKHY")
+                self.assertEqual(mapping.confidence, "curated")
+                self.assertEqual(mapping.mapping_source, "symbol_override")
 
-    def test_new_sk_hynix_product_is_quarantined_by_name(self) -> None:
+    def test_new_sk_hynix_product_uses_us_listed_underlying_by_name(self) -> None:
         mapping = infer_rsi_mapping(
             "NEWSK",
             "Example 2X Long SK Hynix Daily ETF",
             known_symbols={"NEWSK", "SK"},
         )
 
-        self.assertEqual(mapping.rsi_symbol, "NEWSK")
-        self.assertEqual(mapping.confidence, "needs_review")
-        self.assertIn("SK Telecom", mapping.mapping_reason)
+        self.assertEqual(mapping.rsi_symbol, "SKHY")
+        self.assertEqual(mapping.confidence, "curated")
+        self.assertEqual(mapping.mapping_source, "name_proxy")
 
     def test_normalizes_brkb_to_yahoo_symbol(self) -> None:
         self.assertEqual(infer_rsi_symbol("BRKU", "2X Long BRKB Daily ETF"), "BRK-B")
@@ -856,6 +856,17 @@ class UniverseTests(unittest.TestCase):
         self.assertTrue(
             all(source.source_type != "issuer" for source in AUDIT_UNIVERSE_SOURCES)
         )
+
+    def test_dynamic_nyse_audit_directory_is_registered_only(self) -> None:
+        nyse_source = next(
+            source
+            for source in AUDIT_UNIVERSE_SOURCES
+            if source.name == "NYSE exchange-traded products directory"
+        )
+
+        self.assertFalse(nyse_source.enabled)
+        self.assertEqual(nyse_source.parser, "registered_only")
+        self.assertIn("client-side", nyse_source.notes)
 
     @patch("leveraged_trader.universe.AUDIT_UNIVERSE_SOURCES")
     @patch("leveraged_trader.universe.requests.get")
