@@ -2312,6 +2312,14 @@ class MarketDataTests(unittest.TestCase):
 
         legacy_dumps.assert_not_called()
 
+    def test_worker_serializer_accepts_protocol_five_pickle_buffers(self) -> None:
+        payload = pd.DataFrame({"close": np.array([1.0, 2.0])})
+
+        encoded = http_deadline_worker._serialize_envelope(payload, max_bytes=16_384)
+
+        decoded = http_deadline_worker._deserialize_envelope(encoded, max_bytes=16_384)
+        pd.testing.assert_frame_equal(decoded, payload)
+
     def test_deadline_worker_interrupts_partial_result_output_and_reaps_process(self) -> None:
         processes: list[subprocess.Popen[bytes]] = []
         real_popen = subprocess.Popen

@@ -183,7 +183,9 @@ def _open_existing_regular_file(path: str | os.PathLike[str]) -> int:
         raise OSError(f"Runtime path {path_value} must not be a symbolic link.")
     if not stat.S_ISREG(path_before_open.st_mode):
         raise OSError(f"Runtime path {path_value} must be a regular file.")
-    if path_before_open.st_nlink != 1:
+    if path_before_open.st_nlink == 0:
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path_value)
+    if path_before_open.st_nlink > 1:
         raise OSError(f"Runtime path {path_value} must not have multiple hard links.")
 
     flags = os.O_RDONLY
@@ -201,7 +203,12 @@ def _open_existing_regular_file(path: str | os.PathLike[str]) -> int:
             raise OSError(f"Runtime path {path_value} must be a regular file.")
         if opened_file.st_uid != os.geteuid():
             raise OSError(f"Runtime path {path_value} must be owned by the current user.")
-        if opened_file.st_nlink != 1:
+        if opened_file.st_nlink == 0:
+            # SQLite may unlink a WAL/SHM sidecar after the pathname snapshot
+            # but before this descriptor is inspected. Treat that open-but-
+            # unlinked inode exactly like the adjacent FileNotFoundError race.
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path_value)
+        if opened_file.st_nlink > 1:
             raise OSError(f"Runtime path {path_value} must not have multiple hard links.")
         if (path_before_open.st_dev, path_before_open.st_ino) != (opened_file.st_dev, opened_file.st_ino):
             raise OSError(f"Runtime path {path_value} changed while it was being secured.")

@@ -2094,8 +2094,12 @@ def _migrate_state_db(conn: sqlite3.Connection) -> None:
     _ensure_strategy_state_columns(conn)
     _ensure_strategy_summary_rollup_columns(conn)
     _ensure_strategy_equity_columns(conn)
+    # Preserve the exact predecessor close/fill timestamp relationship before
+    # closed-marker normalization repairs legacy timestamp formatting.
+    _repair_legacy_managed_sell_parent_only_accounting(conn)
     _ensure_alpaca_managed_position_columns(conn)
     _ensure_alpaca_managed_sell_fill_columns(conn)
+    _repair_legacy_managed_sell_parent_only_accounting(conn)
     _ensure_market_history_removal_candidate_columns(conn)
     _repair_storage_table_contracts(conn)
     _ensure_strategy_identity_uniqueness(conn)
@@ -2500,12 +2504,12 @@ def _canonical_storage_schema_object_contracts() -> dict[str, tuple[str, str, st
     return contracts
 
 
-def _existing_identity_guard_sql(
+def _existing_identity_guard_sqls(
     conn: sqlite3.Connection,
     trigger_name: str,
     table_name: str,
-) -> str | None:
-    """Build the one legacy guard form valid for the table's present columns."""
+) -> set[str]:
+    """Build the exact recognized legacy guard forms for the present table."""
     for operation in ("insert", "update"):
         expected_name = f"leveraged_trader_{table_name}_identity_{operation}_guard"
         if trigger_name.lower() != expected_name.lower():
@@ -2515,15 +2519,35 @@ def _existing_identity_guard_sql(
             contract for contract in _STORAGE_IDENTITY_TYPE_CONTRACTS[table_name] if contract[0] in existing_columns
         )
         if not present_contracts:
-            return None
-        return _normalized_schema_sql(
-            _storage_identity_type_guard_sql(
-                table_name,
-                present_contracts,
-                operation,
+            return set()
+        acceptable = {
+            _normalized_schema_sql(
+                _storage_identity_type_guard_sql(
+                    table_name,
+                    present_contracts,
+                    operation,
+                )
             )
-        )
-    return None
+        }
+        if table_name == "alpaca_managed_positions":
+            # The immediately preceding managed-position guards relied on the
+            # rowid-backed INTEGER PRIMARY KEY and revision fence for ``id``.
+            # Recognize only that exact prior generated body; migration drops
+            # it and installs the stronger canonical guard in the same
+            # transaction. Existing identity preflight has already rejected a
+            # null, non-integer, non-positive, or ambiguous imported id.
+            prior_contracts = tuple(contract for contract in present_contracts if contract[0] != "id")
+            acceptable.add(
+                _normalized_schema_sql(
+                    _storage_identity_type_guard_sql(
+                        table_name,
+                        prior_contracts,
+                        operation,
+                    )
+                )
+            )
+        return acceptable
+    return set()
 
 
 def _preflight_existing_storage_schema_objects(conn: sqlite3.Connection) -> None:
@@ -2591,13 +2615,13 @@ def _preflight_existing_storage_schema_objects(conn: sqlite3.Connection) -> None
                     ),
                 }
             )
-            legacy_guard_sql = _existing_identity_guard_sql(
-                conn,
-                str(name),
-                expected_table,
+            acceptable_sql.update(
+                _existing_identity_guard_sqls(
+                    conn,
+                    str(name),
+                    expected_table,
+                )
             )
-            if legacy_guard_sql is not None:
-                acceptable_sql.add(legacy_guard_sql)
         active_index_is_compatible = bool(
             expected_type == "index"
             and normalized_name in _ALPACA_ACTIVE_IDENTITY_INDEX_SQL
@@ -3198,6 +3222,168 @@ def _validate_managed_position_economics(conn: sqlite3.Connection) -> None:
                 ) from exc
 
 
+@dataclass(frozen=True)
+class _LegacyManagedSellAccountingRepair:
+    position_id: int
+    alpaca_order_id: str
+    filled_qty: float
+    filled_value: float
+    remaining_qty: float
+
+
+def _legacy_managed_sell_parent_only_accounting_repairs(
+    conn: sqlite3.Connection,
+) -> dict[int, _LegacyManagedSellAccountingRepair]:
+    """Return narrowly provable fills written before the durable sell ledger."""
+    if not (
+        _storage_table_exists(conn, "alpaca_managed_positions")
+        and _storage_table_exists(conn, "alpaca_managed_sell_fills")
+    ):
+        return {}
+    position_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(alpaca_managed_positions)")}
+    fill_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(alpaca_managed_sell_fills)")}
+    required_position_columns = {
+        "id",
+        "buy_status",
+        "filled_qty",
+        "filled_avg_price",
+        "sell_client_order_id",
+        "sell_alpaca_order_id",
+        "sell_submitted_at",
+        "sell_status",
+        "sell_order_qty",
+        "sell_order_limit_price",
+        "sell_filled_qty",
+        "sell_filled_avg_price",
+        "sell_filled_at",
+        "realized_pl",
+        "realized_pl_pct",
+        "sold_qty",
+        "sold_value",
+        "remaining_qty",
+        "closed_at",
+    }
+    if not required_position_columns.issubset(position_columns) or not {
+        "managed_position_id",
+        "alpaca_order_id",
+    }.issubset(fill_columns):
+        return {}
+
+    rows = conn.execute(
+        """
+        SELECT positions.id, positions.sell_alpaca_order_id,
+               positions.filled_qty, positions.filled_avg_price,
+               positions.sell_filled_qty, positions.sell_filled_avg_price
+        FROM alpaca_managed_positions AS positions
+        WHERE positions.buy_status = 'filled'
+          AND positions.sell_status = 'filled'
+          AND positions.sell_client_order_id IS NOT NULL
+          AND positions.sell_alpaca_order_id IS NOT NULL
+          AND positions.sell_submitted_at IS NOT NULL
+          AND positions.sell_order_qty IS NULL
+          AND positions.sell_order_limit_price IS NULL
+          AND positions.sell_filled_qty IS NOT NULL
+          AND positions.sell_filled_avg_price IS NOT NULL
+          AND positions.sell_filled_at IS NOT NULL
+          AND positions.closed_at = positions.sell_filled_at
+          AND positions.realized_pl IS NOT NULL
+          AND positions.realized_pl_pct IS NOT NULL
+          AND positions.sold_qty = 0
+          AND positions.sold_value = 0
+          AND positions.remaining_qty IS NULL
+          AND NOT EXISTS (
+                SELECT 1
+                FROM alpaca_managed_sell_fills AS owned_fills
+                WHERE owned_fills.managed_position_id = positions.id
+          )
+          AND NOT EXISTS (
+                SELECT 1
+                FROM alpaca_managed_sell_fills AS claimed_fills
+                WHERE claimed_fills.alpaca_order_id = positions.sell_alpaca_order_id
+          )
+        """
+    ).fetchall()
+    repairs: dict[int, _LegacyManagedSellAccountingRepair] = {}
+    for position_id, order_id, buy_qty, buy_avg_price, sell_qty, sell_avg_price in rows:
+        try:
+            normalized_order_id = _canonical_alpaca_order_id(
+                order_id,
+                field_name="A legacy managed Alpaca sell order ID",
+            )
+            normalized_buy_qty, normalized_buy_avg_price = _normalize_optional_managed_buy_fill_economics(
+                buy_qty,
+                buy_avg_price,
+            )
+            normalized_sell_qty = float(sell_qty)
+            normalized_sell_avg_price = float(sell_avg_price)
+            normalized_sell_qty, normalized_sell_value = _normalize_managed_sell_fill_economics(
+                normalized_sell_qty,
+                normalized_sell_qty * normalized_sell_avg_price,
+            )
+            if normalized_buy_qty is None or normalized_buy_avg_price is None:
+                continue
+            if not _managed_accounting_quantities_match(
+                normalized_sell_qty,
+                normalized_buy_qty,
+                mark_prices=(normalized_buy_avg_price, normalized_sell_avg_price),
+                value_scale=normalized_sell_value,
+            ):
+                continue
+        except (TypeError, ValueError, OverflowError):
+            continue
+        normalized_position_id = int(position_id)
+        repairs[normalized_position_id] = _LegacyManagedSellAccountingRepair(
+            position_id=normalized_position_id,
+            alpaca_order_id=normalized_order_id,
+            filled_qty=normalized_sell_qty,
+            filled_value=normalized_sell_value,
+            remaining_qty=normalized_buy_qty - normalized_sell_qty,
+        )
+    return repairs
+
+
+def _repair_legacy_managed_sell_parent_only_accounting(conn: sqlite3.Connection) -> None:
+    """Promote complete predecessor-era parent fills into durable accounting."""
+    for repair in _legacy_managed_sell_parent_only_accounting_repairs(conn).values():
+        updated = conn.execute(
+            """
+            UPDATE alpaca_managed_positions
+            SET sold_qty = ?, sold_value = ?, remaining_qty = ?
+            WHERE id = ?
+              AND sold_qty = 0
+              AND sold_value = 0
+              AND remaining_qty IS NULL
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM alpaca_managed_sell_fills
+                    WHERE managed_position_id = ?
+              )
+            """,
+            (
+                repair.filled_qty,
+                repair.filled_value,
+                repair.remaining_qty,
+                repair.position_id,
+                repair.position_id,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("Legacy managed sell accounting changed during atomic migration.")
+        conn.execute(
+            """
+            INSERT INTO alpaca_managed_sell_fills
+            (managed_position_id, alpaca_order_id, filled_qty, filled_value)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                repair.position_id,
+                repair.alpaca_order_id,
+                repair.filled_qty,
+                repair.filled_value,
+            ),
+        )
+
+
 def _validate_managed_sell_fill_economics(conn: sqlite3.Connection) -> None:
     """Reject imported sell-ledger values that runtime reconciliation cannot use."""
     if not _storage_table_exists(conn, "alpaca_managed_sell_fills"):
@@ -3277,13 +3463,22 @@ def _validate_managed_sell_fill_economics(conn: sqlite3.Connection) -> None:
             )
         totals[position_id] = total_qty, total_value
 
-    _validate_managed_sell_parent_ledger_accounting(conn, totals)
+    legacy_repairs = _legacy_managed_sell_parent_only_accounting_repairs(conn)
+    for repair in legacy_repairs.values():
+        totals[repair.position_id] = (repair.filled_qty, repair.filled_value)
+    _validate_managed_sell_parent_ledger_accounting(
+        conn,
+        totals,
+        legacy_parent_only_position_ids=frozenset(legacy_repairs),
+    )
     _validate_current_managed_sell_intent_ledger_consistency(conn)
 
 
 def _validate_managed_sell_parent_ledger_accounting(
     conn: sqlite3.Connection,
     ledger_totals: Mapping[object, tuple[float, float]],
+    *,
+    legacy_parent_only_position_ids: frozenset[int] = frozenset(),
 ) -> None:
     """Reject materialized parent accounting that disagrees with its ledger."""
     if not _storage_table_exists(conn, "alpaca_managed_positions"):
@@ -3393,6 +3588,10 @@ def _validate_managed_sell_parent_ledger_accounting(
                 continue
 
             ledger_qty, ledger_value = ledger_totals.get(position_id, (0.0, 0.0))
+            if position_id in legacy_parent_only_position_ids:
+                sold_qty = ledger_qty
+                sold_value = ledger_value
+                remaining_qty = None if filled_qty is None else filled_qty - ledger_qty
             cumulative_sell_avg_price = ledger_value / ledger_qty if ledger_qty > 0.0 else None
             mark_prices = tuple(
                 None if value is None else float(value)

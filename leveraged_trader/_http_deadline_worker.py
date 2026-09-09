@@ -364,10 +364,14 @@ class _BoundedPickleBuffer(io.BytesIO):
         super().__init__()
         self._max_bytes = max_bytes
 
-    def write(self, value: bytes | bytearray) -> int:
-        if len(value) > self._max_bytes - self.tell():
+    def write(self, value: object) -> int:
+        try:
+            byte_count = memoryview(value).nbytes
+        except TypeError:
+            raise TypeError("HTTP request worker protocol received a non-buffer value.") from None
+        if byte_count > self._max_bytes - self.tell():
             raise ValueError(f"HTTP request worker protocol exceeded its {self._max_bytes}-byte limit.")
-        return super().write(value)
+        return super().write(value)  # type: ignore[arg-type]
 
 
 def _is_public_network_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:

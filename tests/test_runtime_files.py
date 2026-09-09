@@ -1002,6 +1002,33 @@ class RuntimeFilePermissionTests(unittest.TestCase):
                     self.assertEqual(stat.S_IMODE(sidecar.stat().st_mode), 0o600)
                     self.assertIsNotNone(refreshed_sidecars[os.fspath(sidecar)])
 
+    def test_active_preparation_accepts_sidecar_unlinked_after_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.sqlite"
+            path.write_bytes(b"database")
+            sidecar = Path(f"{path}-shm")
+            sidecar.write_bytes(b"sidecar")
+            guard = prepare_private_runtime_file(path)
+            assert guard is not None
+
+            real_open = os.open
+            unlinked = False
+
+            def open_then_unlink(runtime_path: str | os.PathLike[str], flags: int) -> int:
+                nonlocal unlinked
+                descriptor = real_open(runtime_path, flags)
+                if os.fspath(runtime_path).endswith("-shm") and not unlinked:
+                    sidecar.unlink()
+                    unlinked = True
+                return descriptor
+
+            with patch("leveraged_trader.runtime_files.os.open", side_effect=open_then_unlink):
+                refreshed = prepare_private_runtime_file(path, expected_guard=guard)
+
+            assert refreshed is not None
+            self.assertTrue(unlinked)
+            self.assertIsNone(dict(refreshed.sidecars)[os.fspath(sidecar)])
+
     def test_active_sidecar_lstat_open_replacement_is_rejected_before_chmod(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.sqlite"

@@ -16294,6 +16294,168 @@ class AlpacaManagedStorageTests(unittest.TestCase):
         self.assertIn("submitted_limit_price", columns)
         self.assertEqual(ledger, (1, 150, None, None, None))
 
+    def test_init_migrates_provable_parent_only_sell_fill_and_prior_identity_guards(self) -> None:
+        position_id = self.save_position(
+            symbol="TQQQ",
+            client_order_id="rsi-buy-TQQQ-parent-only-legacy-fill",
+        )
+        sell_client_order_id = "rsi-exit-TQQQ-parent-only-legacy-fill"
+        sell_order_id = "sell-parent-only-legacy-fill"
+        record_alpaca_managed_sell_order(
+            self.conn,
+            position_id,
+            sell_client_order_id=sell_client_order_id,
+            sell_alpaca_order_id=sell_order_id,
+            sell_submitted_at="2026-01-02T14:32:00Z",
+            sell_status="accepted",
+            sell_order_qty=2,
+            sell_order_limit_price=150,
+        )
+        mark_alpaca_managed_sell_filled_if_current(
+            self.conn,
+            position_id,
+            expected_sell_client_order_id=sell_client_order_id,
+            sell_status="filled",
+            sell_filled_qty=2,
+            sell_filled_avg_price=150,
+            sell_filled_at="2026-01-02T14:33:00Z",
+            sell_alpaca_order_id=sell_order_id,
+        )
+        self.conn.execute(
+            "DELETE FROM alpaca_managed_sell_fills WHERE managed_position_id = ?",
+            (position_id,),
+        )
+        self.conn.execute(
+            """
+            UPDATE alpaca_managed_positions
+            SET sell_order_qty = NULL,
+                sell_order_limit_price = NULL,
+                sold_qty = 0,
+                sold_value = 0,
+                remaining_qty = NULL,
+                closed_at = sell_filled_at
+            WHERE id = ?
+            """,
+            (position_id,),
+        )
+        for operation in ("insert", "update"):
+            trigger_name = f"leveraged_trader_alpaca_managed_positions_identity_{operation}_guard"
+            self.conn.execute(f"DROP TRIGGER {trigger_name}")
+            prior_contracts = tuple(
+                contract
+                for contract in storage_module._STORAGE_IDENTITY_TYPE_CONTRACTS["alpaca_managed_positions"]
+                if contract[0] != "id"
+            )
+            self.conn.execute(
+                storage_module._storage_identity_type_guard_sql(
+                    "alpaca_managed_positions",
+                    prior_contracts,
+                    operation,
+                )
+            )
+        self.conn.commit()
+
+        init_state_db(self.conn)
+
+        self.assertEqual(
+            self.conn.execute(
+                """
+                SELECT alpaca_order_id, filled_qty, filled_value,
+                       broker_updated_at, submitted_qty, submitted_limit_price
+                FROM alpaca_managed_sell_fills
+                WHERE managed_position_id = ?
+                """,
+                (position_id,),
+            ).fetchone(),
+            (sell_order_id, 2, 300, None, None, None),
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT sold_qty, sold_value, remaining_qty FROM alpaca_managed_positions WHERE id = ?",
+                (position_id,),
+            ).fetchone(),
+            (2, 300, 0),
+        )
+        canonical_contracts = storage_module._canonical_storage_schema_object_contracts()
+        for operation in ("insert", "update"):
+            trigger_name = f"leveraged_trader_alpaca_managed_positions_identity_{operation}_guard"
+            installed_sql = self.conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+                (trigger_name,),
+            ).fetchone()[0]
+            self.assertEqual(
+                storage_module._normalized_schema_sql(installed_sql),
+                canonical_contracts[trigger_name][2],
+            )
+
+    def test_init_rejects_incomplete_parent_only_sell_fill_as_legacy_accounting(self) -> None:
+        position_id = self.save_position(
+            symbol="TQQQ",
+            client_order_id="rsi-buy-TQQQ-incomplete-parent-only-fill",
+        )
+        sell_client_order_id = "rsi-exit-TQQQ-incomplete-parent-only-fill"
+        sell_order_id = "sell-incomplete-parent-only-fill"
+        record_alpaca_managed_sell_order(
+            self.conn,
+            position_id,
+            sell_client_order_id=sell_client_order_id,
+            sell_alpaca_order_id=sell_order_id,
+            sell_submitted_at="2026-01-02T14:32:00Z",
+            sell_status="accepted",
+            sell_order_qty=2,
+            sell_order_limit_price=150,
+        )
+        mark_alpaca_managed_sell_filled_if_current(
+            self.conn,
+            position_id,
+            expected_sell_client_order_id=sell_client_order_id,
+            sell_status="filled",
+            sell_filled_qty=1,
+            sell_filled_avg_price=150,
+            sell_filled_at="2026-01-02T14:33:00Z",
+            sell_alpaca_order_id=sell_order_id,
+        )
+        self.conn.execute(
+            "DELETE FROM alpaca_managed_sell_fills WHERE managed_position_id = ?",
+            (position_id,),
+        )
+        self.conn.execute(
+            """
+            UPDATE alpaca_managed_positions
+            SET sell_order_qty = NULL,
+                sell_order_limit_price = NULL,
+                sold_qty = 0,
+                sold_value = 0,
+                remaining_qty = NULL,
+                closed_at = sell_filled_at
+            WHERE id = ?
+            """,
+            (position_id,),
+        )
+        self.conn.commit()
+        parent_before = self.conn.execute(
+            "SELECT * FROM alpaca_managed_positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+
+        with self.assertRaisesRegex(ValueError, "sell accounting that conflicts with its"):
+            init_state_db(self.conn)
+
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT * FROM alpaca_managed_positions WHERE id = ?",
+                (position_id,),
+            ).fetchone(),
+            parent_before,
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT * FROM alpaca_managed_sell_fills WHERE managed_position_id = ?",
+                (position_id,),
+            ).fetchall(),
+            [],
+        )
+
     def test_init_rejects_parent_sell_accounting_that_conflicts_with_ledger(self) -> None:
         position_id = self.save_position(
             symbol="TQQQ",
