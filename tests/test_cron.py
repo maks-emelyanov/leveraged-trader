@@ -175,6 +175,14 @@ def _cron_shell_command(schedule_line: str) -> str:
     return "".join(parsed)
 
 
+def _cron_assignment_value(value: str) -> str:
+    """Apply cron's outer-quote handling to an environment value."""
+
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
 def _install_test_schedule(
     tmp_path: Path,
     *,
@@ -231,7 +239,7 @@ def _run_installed_schedule(
         if "=" not in line or line.startswith("#"):
             continue
         name, value = line.split("=", 1)
-        cron_env[name] = value
+        cron_env[name] = _cron_assignment_value(value)
     return subprocess.run(
         ["/bin/sh", "-c", _cron_shell_command(schedule_line)],
         cwd=repo_dir,
@@ -1268,10 +1276,10 @@ fi
     )[0]
     managed_lines = [line for line in managed_block.splitlines() if line]
     assert managed_lines[0] == "SHELL=/bin/sh"
-    assert managed_lines[1:3] == ["SHELLOPTS=", "BASHOPTS="]
+    assert managed_lines[1:3] == ['SHELLOPTS=""', 'BASHOPTS=""']
     schedule_index = managed_lines.index(schedule_lines[0])
-    assert managed_lines[3:schedule_index] == ["BASH_ENV=", "ENV="] + [
-        f"{name}=" for name in CRON_BOUNDARY_ENVIRONMENT_NAMES
+    assert managed_lines[3:schedule_index] == ['BASH_ENV=""', 'ENV=""'] + [
+        f'{name}=""' for name in CRON_BOUNDARY_ENVIRONMENT_NAMES
     ]
     restored_lines = managed_lines[schedule_index + 1 : -3]
     assert "LD_PRELOAD=/trusted/libcron-preload.so" in restored_lines
@@ -1601,7 +1609,7 @@ fi
     for assignment in installed_lines[: installed_lines.index(schedule_line)]:
         if "=" in assignment and not assignment.startswith("#"):
             name, value = assignment.split("=", 1)
-            cron_env[name] = value
+            cron_env[name] = _cron_assignment_value(value)
     subprocess.run(["/bin/sh", "-c", cron_command], cwd=repo_dir, env=cron_env, check=True)
 
     environment_value, security_level = probe_output.read_text(encoding="utf-8").splitlines()
@@ -2653,12 +2661,12 @@ fi
     )
     managed_lines = [line for line in managed_block.splitlines() if line]
     assert "SHELL=/bin/sh\n" in managed_block
-    assert "SHELLOPTS=\n" in managed_block
-    assert "BASHOPTS=\n" in managed_block
+    assert 'SHELLOPTS=""\n' in managed_block
+    assert 'BASHOPTS=""\n' in managed_block
     assert not any(line.startswith("PATH=") for line in managed_block.splitlines())
     schedule_index = managed_lines.index(schedule_line)
-    assert managed_lines[3:schedule_index] == ["BASH_ENV=", "ENV="] + [
-        f"{name}=" for name in CRON_BOUNDARY_ENVIRONMENT_NAMES
+    assert managed_lines[3:schedule_index] == ['BASH_ENV=""', 'ENV=""'] + [
+        f'{name}=""' for name in CRON_BOUNDARY_ENVIRONMENT_NAMES
     ]
 
     # Emulate cron's backslash-parity scan before handing the command to
@@ -2698,7 +2706,7 @@ fi
     cron_env = env.copy()
     for assignment in managed_lines[: managed_lines.index(schedule_line)]:
         name, value = assignment.split("=", 1)
-        cron_env[name] = value
+        cron_env[name] = _cron_assignment_value(value)
     subprocess.run([str(bash_as_sh), "-c", cron_command], cwd=repo_dir, env=cron_env, check=True)
     assert not startup_marker.exists()
 

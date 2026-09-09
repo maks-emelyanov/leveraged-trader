@@ -1631,14 +1631,14 @@ restored_shellopts_assignment="$(printf '%s\n' "$filtered_crontab" | awk '
     END { if (assignment != "") print assignment }
 ')"
 if [[ -z "$restored_shellopts_assignment" ]]; then
-    restored_shellopts_assignment='SHELLOPTS='
+    restored_shellopts_assignment='SHELLOPTS=""'
 fi
 restored_bashopts_assignment="$(printf '%s\n' "$filtered_crontab" | awk '
     /^[[:space:]]*BASHOPTS[[:space:]]*=/ { assignment = $0 }
     END { if (assignment != "") print assignment }
 ')"
 if [[ -z "$restored_bashopts_assignment" ]]; then
-    restored_bashopts_assignment='BASHOPTS='
+    restored_bashopts_assignment='BASHOPTS=""'
 fi
 
 # These variables can redirect shell startup, executable loading, or
@@ -1686,7 +1686,7 @@ for environment_name in "${boundary_environment_names[@]}"; do
         END { if (assignment != "") print assignment }
     ')"
     if [[ -z "$restored_assignment" ]]; then
-        restored_assignment="$environment_name="
+        restored_assignment="$environment_name=\"\""
     fi
     restored_boundary_assignments+=("$restored_assignment")
 done
@@ -1910,10 +1910,12 @@ new_crontab="$(
     # shell-option environment is restored immediately after the job for future
     # appended entries.
     printf '%s\n' 'SHELL=/bin/sh'
-    printf '%s\n' 'SHELLOPTS='
-    printf '%s\n' 'BASHOPTS='
+    # Cronie rejects an unquoted empty value as a malformed schedule line.
+    # Quotes are removed by cron, so these remain empty in the job environment.
+    printf '%s\n' 'SHELLOPTS=""'
+    printf '%s\n' 'BASHOPTS=""'
     for environment_name in "${boundary_environment_names[@]}"; do
-        printf '%s=\n' "$environment_name"
+        printf '%s=""\n' "$environment_name"
     done
     printf '%s\n' "$cron_schedule_line"
     for restored_assignment in "${restored_boundary_assignments[@]}"; do
