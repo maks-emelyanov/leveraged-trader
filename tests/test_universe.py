@@ -1983,6 +1983,7 @@ class UniverseTests(unittest.TestCase):
             "BERZ": "FNGS",
             "BIS": "IBB",
             "BNKD": "KBWB",
+            "BRZD": "EWZ",
             "BZQ": "EWZ",
             "DUG": "XLE",
             "EEV": "EEM",
@@ -1993,7 +1994,10 @@ class UniverseTests(unittest.TestCase):
             "FLYD": "PEJ",
             "FNGD": "FNGS",
             "FXP": "FXI",
+            "HYGD": "HYG",
+            "JPND": "EWJ",
             "KOLD": "UNG",
+            "LQDD": "LQD",
             "MZZ": "MDY",
             "NRGD": "XLE",
             "OILD": "XOP",
@@ -2008,11 +2012,13 @@ class UniverseTests(unittest.TestCase):
             "SIJ": "XLI",
             "SKF": "XLF",
             "SKRE": "KRE",
+            "SMHD": "SMH",
             "SMDD": "MDY",
             "SMN": "XLB",
             "SRS": "IYR",
             "SSG": "SOXX",
             "SZK": "XLP",
+            "TPEI": "EWT",
             "WTID": "XLE",
             "YCS": "FXY",
         }
@@ -2022,6 +2028,23 @@ class UniverseTests(unittest.TestCase):
                 mapping = infer_rsi_mapping(asset_symbol, "Inverse leveraged product")
                 self.assertEqual(mapping.rsi_symbol, rsi_symbol)
                 self.assertEqual(mapping.confidence, "curated")
+
+    def test_new_microsectors_long_products_share_reference_asset_mappings(self) -> None:
+        expected = {
+            "BRZL": "EWZ",
+            "HYGU": "HYG",
+            "JPNU": "EWJ",
+            "LQDU": "LQD",
+            "SMHU": "SMH",
+            "TAWN": "EWT",
+        }
+
+        for asset_symbol, rsi_symbol in expected.items():
+            with self.subTest(asset_symbol=asset_symbol):
+                mapping = infer_rsi_mapping(asset_symbol, "Leveraged product")
+                self.assertEqual(mapping.rsi_symbol, rsi_symbol)
+                self.assertEqual(mapping.confidence, "curated")
+                self.assertEqual(mapping.mapping_source, "symbol_override")
 
     def test_ultrashort_duration_and_unstable_basket_products_are_excluded(self) -> None:
         self.assertTrue({"AMUN", "RBIL", "SGVA", "SLTY", "UYLD", "VGUS", "ZMUN"} <= EXCLUDED_UNIVERSE_SYMBOLS)
@@ -2065,6 +2088,12 @@ class UniverseTests(unittest.TestCase):
             "FLYU": (
                 "MicroSectors Travel 3X Leveraged Exposure ETN",
                 "PEJ",
+                "curated",
+                "symbol_override",
+            ),
+            "RAML": (
+                "Leverage Shares 2X Long Memory Daily ETF",
+                "DRAM",
                 "curated",
                 "symbol_override",
             ),
