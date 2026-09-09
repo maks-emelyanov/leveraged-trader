@@ -1,0 +1,995 @@
+# Shared scheduler runtime checks. This file is sourced only by the Bash
+# entrypoints in this directory; keep it compatible with the macOS system Bash.
+
+runtime_security_contains_ascii_control() {
+    local LC_ALL=C
+    [[ "$1" =~ [[:cntrl:]] ]]
+}
+
+runtime_security_absolute_lexical_path() {
+    local input="$1"
+    local component normalized=""
+    local component_count=0
+    local -a input_components=()
+    local -a normalized_components=()
+
+    if runtime_security_contains_ascii_control "$input"; then
+        echo "Scheduler executable paths must not contain ASCII control characters." >&2
+        return 2
+    fi
+    if [[ "$input" != /* ]]; then
+        input="$PWD/$input"
+    fi
+    IFS='/' read -r -a input_components <<< "$input"
+    for component in "${input_components[@]}"; do
+        case "$component" in
+            ""|.)
+                ;;
+            ..)
+                echo "Scheduler executable paths must not contain '..' components: $input" >&2
+                return 2
+                ;;
+            *)
+                normalized_components[component_count]="$component"
+                component_count=$((component_count + 1))
+                ;;
+        esac
+    done
+    if (( component_count == 0 )); then
+        printf '/\n'
+        return 0
+    fi
+    for component in "${normalized_components[@]}"; do
+        normalized="$normalized/$component"
+    done
+    printf '%s\n' "$normalized"
+}
+
+runtime_security_readlink_losslessly() {
+    local path="$1"
+    local encoded_target readlink_status=0
+
+    # Command substitution normally removes every trailing newline, including
+    # bytes that belong to the symlink target. Append a non-newline sentinel,
+    # retain readlink's status, then remove exactly its output delimiter.
+    encoded_target="$(
+        "$runtime_security_readlink_bin" "$path"
+        readlink_status=$?
+        printf 'x'
+        exit "$readlink_status"
+    )" || readlink_status=$?
+    if (( readlink_status != 0 )); then
+        return "$readlink_status"
+    fi
+    if [[ "$encoded_target" != *$'\n'x ]]; then
+        return 2
+    fi
+    encoded_target="${encoded_target%x}"
+    runtime_security_readlink_target="${encoded_target%$'\n'}"
+}
+
+runtime_security_physical_executable_path() {
+    local requested_path="$1"
+    local description="${2:-executable}"
+    local path component parent_path child_path child_owner_uid link_target resolved_component
+    local symlink_count=0
+    local -a pending_components=()
+    local -a resolved_components=()
+    local -a link_components=()
+
+    path="$(runtime_security_absolute_lexical_path "$requested_path")" || return $?
+    if ! runtime_security_root_owner_uid="$(runtime_security_path_owner_uid_lstat /)"; then
+        echo "Cannot verify scheduler executable filesystem-root ownership." >&2
+        return 2
+    fi
+    IFS='/' read -r -a pending_components <<< "${path#/}"
+
+    while (( ${#pending_components[@]} > 0 )); do
+        component="${pending_components[0]}"
+        pending_components=("${pending_components[@]:1}")
+        case "$component" in
+            ""|.)
+                continue
+                ;;
+            ..)
+                if (( ${#resolved_components[@]} > 0 )); then
+                    unset "resolved_components[$((${#resolved_components[@]} - 1))]"
+                fi
+                continue
+                ;;
+        esac
+
+        parent_path=""
+        for resolved_component in "${resolved_components[@]}"; do
+            parent_path="$parent_path/$resolved_component"
+        done
+        if [[ -z "$parent_path" ]]; then
+            parent_path="/"
+        fi
+        if [[ "$parent_path" == "/" ]]; then
+            child_path="/$component"
+        else
+            child_path="$parent_path/$component"
+        fi
+        if [[ ! -e "$child_path" && ! -L "$child_path" ]]; then
+            echo "Scheduler executable path entry does not exist: $child_path" >&2
+            return 2
+        fi
+        if ! child_owner_uid="$(runtime_security_path_owner_uid_lstat "$child_path")"; then
+            echo "Cannot verify scheduler executable path-entry ownership: $child_path" >&2
+            return 2
+        fi
+        runtime_security_require_safe_parent \
+            "$child_path" \
+            "$child_owner_uid" \
+            "$parent_path" \
+            "$description" || return $?
+
+        if [[ -L "$child_path" ]]; then
+            if (( symlink_count >= 40 )); then
+                echo "Scheduler executable symbolic-link chain is too deep: $requested_path" >&2
+                return 2
+            fi
+            runtime_security_readlink_losslessly "$child_path" || {
+                echo "Cannot resolve scheduler executable symbolic link: $child_path" >&2
+                return 2
+            }
+            link_target="$runtime_security_readlink_target"
+            unset runtime_security_readlink_target
+            if runtime_security_contains_ascii_control "$link_target"; then
+                echo "Scheduler executable symbolic-link targets must not contain ASCII control characters." >&2
+                return 2
+            fi
+            link_components=()
+            IFS='/' read -r -a link_components <<< "$link_target"
+            if [[ "$link_target" == /* ]]; then
+                resolved_components=()
+            fi
+            pending_components=("${link_components[@]}" "${pending_components[@]}")
+            symlink_count=$((symlink_count + 1))
+            continue
+        fi
+
+        if (( ${#pending_components[@]} > 0 )); then
+            if [[ ! -d "$child_path" ]]; then
+                echo "Scheduler executable ancestor must be a directory: $child_path" >&2
+                return 2
+            fi
+            resolved_components[${#resolved_components[@]}]="$component"
+            continue
+        fi
+        printf '%s\n' "$child_path"
+        return 0
+    done
+
+    echo "Scheduler executable path must name a file: $requested_path" >&2
+    return 2
+}
+
+runtime_security_path_owner_uid_lstat() {
+    local path="$1"
+    local owner_uid
+    if owner_uid="$("$runtime_security_stat_bin" -c '%u' -- "$path" 2>/dev/null)"; then
+        :
+    elif owner_uid="$("$runtime_security_stat_bin" -f '%u' "$path" 2>/dev/null)"; then
+        :
+    else
+        return 1
+    fi
+    [[ "$owner_uid" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$owner_uid"
+}
+
+runtime_security_owner_mode_follow() {
+    local path="$1"
+    local status owner_uid mode extra
+    if status="$("$runtime_security_stat_bin" -Lc '%u %a' -- "$path" 2>/dev/null)"; then
+        :
+    elif status="$("$runtime_security_stat_bin" -Lf '%u %p' "$path" 2>/dev/null)"; then
+        :
+    else
+        return 1
+    fi
+    read -r owner_uid mode extra <<< "$status"
+    [[ "$owner_uid" =~ ^[0-9]+$ && "$mode" =~ ^[0-7]+$ && -z "$extra" ]] || return 1
+    printf '%s %s\n' "$owner_uid" "$mode"
+}
+
+runtime_security_regular_file_link_count() {
+    local path="$1"
+    local link_count
+    if link_count="$("$runtime_security_stat_bin" -Lc '%h' -- "$path" 2>/dev/null)"; then
+        :
+    elif link_count="$("$runtime_security_stat_bin" -Lf '%l' "$path" 2>/dev/null)"; then
+        :
+    else
+        return 1
+    fi
+    [[ "$link_count" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s\n' "$link_count"
+}
+
+runtime_security_owner_is_trusted() {
+    local owner_uid="$1"
+    [[ "$owner_uid" == "$runtime_security_current_uid" \
+        || "$owner_uid" == "0" \
+        || "$owner_uid" == "$runtime_security_root_owner_uid" ]]
+}
+
+runtime_security_require_safe_parent() {
+    local child_path="$1"
+    local child_owner_uid="$2"
+    local parent_path="$3"
+    local description="$4"
+    local parent_status parent_owner_uid parent_mode parent_mode_value
+
+    if [[ -L "$parent_path" || ! -d "$parent_path" ]]; then
+        echo "Scheduler $description ancestor must be a regular directory: $parent_path" >&2
+        return 2
+    fi
+    if ! parent_status="$(runtime_security_owner_mode_follow "$parent_path")"; then
+        echo "Cannot verify scheduler $description ancestor metadata: $parent_path" >&2
+        return 2
+    fi
+    read -r parent_owner_uid parent_mode <<< "$parent_status"
+    if ! runtime_security_owner_is_trusted "$parent_owner_uid"; then
+        echo "Scheduler $description path is controlled by an untrusted owner at $parent_path." >&2
+        return 2
+    fi
+
+    # GNU %a contains permissions only; BSD %p also contains file-type bits.
+    parent_mode_value=$(((8#$parent_mode) & 07777))
+    if (( parent_mode_value & 0022 )); then
+        # A trusted sticky directory (for example /tmp) prevents other users
+        # from replacing a trusted child's directory entry.
+        if (( ! (parent_mode_value & 01000) )) || ! runtime_security_owner_is_trusted "$child_owner_uid"; then
+            echo "Scheduler $description path is replaceable through writable ancestor $parent_path." >&2
+            return 2
+        fi
+    fi
+}
+
+runtime_security_validate_trusted_executable() {
+    local requested_path="$1"
+    local description="$2"
+    local path relative_path component parent_path child_path child_owner_uid
+    local file_status file_owner_uid file_mode file_mode_value file_link_count
+    local -a path_components=()
+
+    path="$(runtime_security_physical_executable_path "$requested_path" "$description")" || return $?
+    if ! runtime_security_root_owner_uid="$(runtime_security_path_owner_uid_lstat /)"; then
+        echo "Cannot verify scheduler $description filesystem-root ownership." >&2
+        return 2
+    fi
+
+    parent_path="/"
+    relative_path="${path#/}"
+    IFS='/' read -r -a path_components <<< "$relative_path"
+    for component in "${path_components[@]:0:${#path_components[@]}-1}"; do
+        if [[ "$parent_path" == "/" ]]; then
+            child_path="/$component"
+        else
+            child_path="$parent_path/$component"
+        fi
+        if [[ -L "$child_path" || ! -d "$child_path" ]]; then
+            echo "Scheduler $description ancestor must be a non-symlink directory: $child_path" >&2
+            return 2
+        fi
+        if ! child_owner_uid="$(runtime_security_path_owner_uid_lstat "$child_path")"; then
+            echo "Cannot verify scheduler $description ancestor ownership: $child_path" >&2
+            return 2
+        fi
+        runtime_security_require_safe_parent \
+            "$child_path" \
+            "$child_owner_uid" \
+            "$parent_path" \
+            "$description" || return $?
+        parent_path="$child_path"
+    done
+
+    if [[ ! -f "$path" || ! -x "$path" ]]; then
+        echo "Scheduler $description must be an executable regular file: $path" >&2
+        return 2
+    fi
+    if ! file_status="$(runtime_security_owner_mode_follow "$path")"; then
+        echo "Cannot verify scheduler $description metadata: $path" >&2
+        return 2
+    fi
+    read -r file_owner_uid file_mode <<< "$file_status"
+    if ! runtime_security_owner_is_trusted "$file_owner_uid"; then
+        echo "Scheduler $description is controlled by an untrusted owner: $path" >&2
+        return 2
+    fi
+    file_mode_value=$(((8#$file_mode) & 07777))
+    if (( file_mode_value & 0022 )); then
+        echo "Scheduler $description must not be group- or world-writable: $path" >&2
+        return 2
+    fi
+    if ! file_link_count="$(runtime_security_regular_file_link_count "$path")"; then
+        echo "Cannot verify scheduler $description link count: $path" >&2
+        return 2
+    fi
+    if (( file_link_count != 1 )); then
+        echo "Scheduler $description must not have multiple hard links: $path" >&2
+        return 2
+    fi
+    runtime_security_require_safe_parent \
+        "$path" \
+        "$file_owner_uid" \
+        "$parent_path" \
+        "$description" || return $?
+    printf '%s\n' "$path"
+}
+
+# Validate both the invocation entry and its resolved executable target, but
+# return the original absolute entry path. Virtual-environment Python must be
+# invoked through `.venv/bin/python` so CPython discovers pyvenv.cfg; executing
+# its resolved system target would silently leave the virtual environment.
+runtime_security_validate_trusted_executable_entry() {
+    local requested_path="$1"
+    local description="$2"
+    local path
+
+    path="$(runtime_security_absolute_lexical_path "$requested_path")" || return $?
+    # The component resolver used below validates every directory entry and
+    # symbolic-link hop before returning the final physical executable.
+    runtime_security_validate_trusted_executable "$path" "$description" >/dev/null || return $?
+    printf '%s\n' "$path"
+}
+
+runtime_security_validate_trusted_directory() {
+    local requested_path="$1"
+    local description="$2"
+    local path relative_path component parent_path child_path child_owner_uid
+    local directory_status directory_owner_uid directory_mode directory_mode_value
+    local -a path_components=()
+
+    path="$(runtime_security_absolute_lexical_path "$requested_path")" || return $?
+    if ! runtime_security_root_owner_uid="$(runtime_security_path_owner_uid_lstat /)"; then
+        echo "Cannot verify scheduler $description filesystem-root ownership." >&2
+        return 2
+    fi
+
+    parent_path="/"
+    relative_path="${path#/}"
+    IFS='/' read -r -a path_components <<< "$relative_path"
+    for component in "${path_components[@]}"; do
+        if [[ "$parent_path" == "/" ]]; then
+            child_path="/$component"
+        else
+            child_path="$parent_path/$component"
+        fi
+        if [[ -L "$child_path" || ! -d "$child_path" ]]; then
+            echo "Scheduler $description must be a non-symlink directory: $child_path" >&2
+            return 2
+        fi
+        if ! child_owner_uid="$(runtime_security_path_owner_uid_lstat "$child_path")"; then
+            echo "Cannot verify scheduler $description directory ownership: $child_path" >&2
+            return 2
+        fi
+        runtime_security_require_safe_parent \
+            "$child_path" \
+            "$child_owner_uid" \
+            "$parent_path" \
+            "$description" || return $?
+        if ! runtime_security_owner_is_trusted "$child_owner_uid"; then
+            echo "Scheduler $description is controlled by an untrusted owner: $child_path" >&2
+            return 2
+        fi
+        parent_path="$child_path"
+    done
+
+    if ! directory_status="$(runtime_security_owner_mode_follow "$path")"; then
+        echo "Cannot verify scheduler $description directory metadata: $path" >&2
+        return 2
+    fi
+    read -r directory_owner_uid directory_mode <<< "$directory_status"
+    if ! runtime_security_owner_is_trusted "$directory_owner_uid"; then
+        echo "Scheduler $description is controlled by an untrusted owner: $path" >&2
+        return 2
+    fi
+    directory_mode_value=$(((8#$directory_mode) & 07777))
+    if (( directory_mode_value & 0022 )); then
+        echo "Scheduler $description must not be group- or world-writable: $path" >&2
+        return 2
+    fi
+    printf '%s\n' "$path"
+}
+
+runtime_security_validate_trusted_regular_file() {
+    local requested_path="$1"
+    local description="$2"
+    local path parent_path file_status file_owner_uid file_mode file_mode_value
+
+    path="$(runtime_security_absolute_lexical_path "$requested_path")" || return $?
+    parent_path="${path%/*}"
+    [[ -n "$parent_path" ]] || parent_path="/"
+    runtime_security_validate_trusted_directory "$parent_path" "$description parent directory" \
+        >/dev/null || return $?
+
+    if [[ -L "$path" || ! -f "$path" ]]; then
+        echo "Scheduler $description must be a non-symlink regular file: $path" >&2
+        return 2
+    fi
+    if ! file_status="$(runtime_security_owner_mode_follow "$path")"; then
+        echo "Cannot verify scheduler $description metadata: $path" >&2
+        return 2
+    fi
+    read -r file_owner_uid file_mode <<< "$file_status"
+    if ! runtime_security_owner_is_trusted "$file_owner_uid"; then
+        echo "Scheduler $description is controlled by an untrusted owner: $path" >&2
+        return 2
+    fi
+    file_mode_value=$(((8#$file_mode) & 07777))
+    if (( file_mode_value & 0022 )); then
+        echo "Scheduler $description must not be group- or world-writable: $path" >&2
+        return 2
+    fi
+    printf '%s\n' "$path"
+}
+
+runtime_security_validate_trusted_import_tree() {
+    local requested_path="$1"
+    local description="$2"
+    local path validated_find unsafe_entries
+
+    path="$(runtime_security_validate_trusted_directory "$requested_path" "$description")" || return $?
+    if ! runtime_security_root_owner_uid="$(runtime_security_path_owner_uid_lstat /)"; then
+        echo "Cannot verify scheduler $description filesystem-root ownership." >&2
+        return 2
+    fi
+    validated_find="$(
+        runtime_security_validate_trusted_executable "$runtime_security_find_bin" "find executable"
+    )" || return $?
+
+    # GNU and BSD find both support these predicates. Keep traversal and
+    # classification inside one trusted process so whitespace and control
+    # characters in entry names cannot be reinterpreted by the shell.
+    if unsafe_entries="$(
+        "$validated_find" "$path" \
+            \( \
+                ! \( -type f -o -type d \) \
+                -o ! \( \
+                    -user "$runtime_security_current_uid" \
+                    -o -user 0 \
+                    -o -user "$runtime_security_root_owner_uid" \
+                \) \
+                -o -perm -0020 \
+                -o -perm -0002 \
+            \) \
+            -print 2>&1
+    )"; then
+        :
+    else
+        echo "Unable to complete scheduler $description security scan." >&2
+        return 2
+    fi
+    if [[ -n "$unsafe_entries" ]]; then
+        echo "Scheduler $description must contain only trusted non-symlink regular files and directories; entries must not be group- or world-writable." >&2
+        return 2
+    fi
+
+    # Recheck the root after traversal. Safe ownership and modes on every
+    # directory exclude replacement by another OS user after it was visited.
+    runtime_security_validate_trusted_directory "$path" "$description" >/dev/null || return $?
+    printf '%s\n' "$path"
+}
+
+runtime_security_validate_trusted_source_tree() {
+    local requested_path="$1"
+    local description="$2"
+    local cache_only="${3:-0}"
+    local path entry entry_name child_cache_only
+    local restore_nullglob=0
+    local restore_dotglob=0
+    local -a entries=()
+
+    path="$(runtime_security_validate_trusted_directory "$requested_path" "$description")" || return $?
+    if ! shopt -q nullglob; then
+        shopt -s nullglob
+        restore_nullglob=1
+    fi
+    if ! shopt -q dotglob; then
+        shopt -s dotglob
+        restore_dotglob=1
+    fi
+    entries=("$path"/*)
+    (( restore_dotglob == 0 )) || shopt -u dotglob
+    (( restore_nullglob == 0 )) || shopt -u nullglob
+
+    for entry in "${entries[@]}"; do
+        entry_name="${entry##*/}"
+        if runtime_security_contains_ascii_control "$entry_name"; then
+            echo "Scheduler $description contains a path with ASCII control characters." >&2
+            return 2
+        fi
+        if [[ -L "$entry" ]]; then
+            echo "Scheduler $description must not contain symbolic links: $entry" >&2
+            return 2
+        fi
+        if [[ -d "$entry" ]]; then
+            child_cache_only="$cache_only"
+            [[ "$entry_name" != "__pycache__" ]] || child_cache_only=1
+            runtime_security_validate_trusted_source_tree \
+                "$entry" \
+                "$description" \
+                "$child_cache_only" >/dev/null || return $?
+        elif [[ -f "$entry" ]]; then
+            if (( cache_only != 0 )) && [[ "$entry_name" != *.pyc ]]; then
+                continue
+            fi
+            runtime_security_validate_trusted_regular_file "$entry" "$description file" \
+                >/dev/null || return $?
+        else
+            echo "Scheduler $description must contain only directories and regular files: $entry" >&2
+            return 2
+        fi
+    done
+    printf '%s\n' "$path"
+}
+
+runtime_security_validate_isolated_pyvenv_configuration() {
+    local configuration_path="$1"
+    local literal_python="$2"
+
+    "$literal_python" -I -S - "$configuration_path" <<'PYVENV_CONFIGURATION'
+import sys
+
+configuration_path = sys.argv[1]
+include_system_value = None
+try:
+    with open(configuration_path, encoding="utf-8", newline=None) as configuration:
+        for line in configuration:
+            key, separator, value = line.partition("=")
+            if separator and key.strip().lower() == "include-system-site-packages":
+                include_system_value = value.strip().lower()
+except (OSError, UnicodeError):
+    print("Project pyvenv.cfg could not be parsed safely.", file=sys.stderr)
+    raise SystemExit(2)
+
+if include_system_value is None:
+    print(
+        "Project pyvenv.cfg must explicitly set include-system-site-packages to false.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+if include_system_value == "true":
+    print(
+        "Project environment must not enable system site-packages for scheduled execution.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+if include_system_value != "false":
+    print(
+        "Project pyvenv.cfg contains an unsupported include-system-site-packages value.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+PYVENV_CONFIGURATION
+}
+
+runtime_security_validate_editable_finder() {
+    local repo_dir="$1"
+    local site_packages="$2"
+    local module_name="$3"
+    local require_install="$4"
+    local literal_python="$5"
+    local finder_path finder_line
+    local mapping_found=0
+    local namespaces_found=0
+    local mapping_path mapping_literal
+    local expected_mapping expected_typed_mapping
+
+    finder_path="$site_packages/$module_name.py"
+    runtime_security_validate_trusted_regular_file \
+        "$finder_path" \
+        "editable import finder" >/dev/null || return $?
+
+    # Setuptools serializes editable mappings with Python ``repr``. Ask the
+    # already-validated project interpreter to render that one inert argv value
+    # under -I -S, so quotes, backslashes, and non-printable Unicode receive the
+    # exact escaping setuptools uses without importing or executing the finder.
+    mapping_path="$repo_dir/leveraged_trader"
+    if runtime_security_contains_ascii_control "$mapping_path"; then
+        echo "Editable import finder project paths must not contain ASCII control characters." >&2
+        return 2
+    fi
+    mapping_literal="$(
+        "$literal_python" -I -S -c \
+            'import sys; sys.stdout.write(repr(sys.argv[1]))' \
+            "$mapping_path"
+    )" || {
+        echo "Unable to encode the validated editable project package path." >&2
+        return 2
+    }
+    if [[ -z "$mapping_literal" ]] || runtime_security_contains_ascii_control "$mapping_literal"; then
+        echo "Project Python returned an invalid editable package path literal." >&2
+        return 2
+    fi
+    expected_mapping="MAPPING = {'leveraged_trader': $mapping_literal}"
+    expected_typed_mapping="MAPPING: dict[str, str] = {'leveraged_trader': $mapping_literal}"
+    while IFS= read -r finder_line || [[ -n "$finder_line" ]]; do
+        [[ "$finder_line" != *$'\r' ]] || finder_line="${finder_line%$'\r'}"
+        case "$finder_line" in
+            MAPPING*)
+                if [[ "$finder_line" != "$expected_mapping" \
+                    && "$finder_line" != "$expected_typed_mapping" ]]; then
+                    echo "Editable import finder maps leveraged_trader outside the validated project package." >&2
+                    return 2
+                fi
+                mapping_found=1
+                ;;
+            NAMESPACES*)
+                if [[ "$finder_line" != "NAMESPACES = {}" \
+                    && "$finder_line" != "NAMESPACES: dict[str, list[str]] = {}" ]]; then
+                    echo "Editable import finder contains unsupported namespace search paths." >&2
+                    return 2
+                fi
+                namespaces_found=1
+                ;;
+        esac
+    done < "$finder_path"
+
+    if (( mapping_found == 0 )); then
+        echo "Editable import finder does not declare the validated leveraged_trader package path." >&2
+        return 2
+    fi
+    if (( require_install != 0 && namespaces_found == 0 )); then
+        echo "Editable import finder does not declare its namespace search paths." >&2
+        return 2
+    fi
+}
+
+runtime_security_collect_project_site_package_candidates() {
+    local project_environment="$1"
+    local lib64_path lib64_target lib64_owner lib64_parent lib64_status
+    local restore_nullglob=0
+
+    runtime_security_collected_site_package_candidates=()
+    if ! runtime_security_root_owner_uid="$(runtime_security_path_owner_uid_lstat /)"; then
+        echo "Cannot verify scheduler project package-layout filesystem-root ownership." >&2
+        return 2
+    fi
+    if ! shopt -q nullglob; then
+        shopt -s nullglob
+        restore_nullglob=1
+    fi
+    runtime_security_collected_site_package_candidates=(
+        "$project_environment"/lib/python*/site-packages
+        "$project_environment"/lib/python*/dist-packages
+        "$project_environment"/lib/site-packages
+        "$project_environment"/lib/dist-packages
+        "$project_environment"/local/lib/python*/site-packages
+        "$project_environment"/local/lib/python*/dist-packages
+        "$project_environment"/local/lib/site-packages
+        "$project_environment"/local/lib/dist-packages
+        "$project_environment"/Lib/site-packages
+        "$project_environment"/Lib/dist-packages
+    )
+
+    for lib64_path in \
+        "$project_environment/lib64" \
+        "$project_environment/local/lib64"; do
+        if [[ -L "$lib64_path" ]]; then
+            if ! lib64_owner="$(runtime_security_path_owner_uid_lstat "$lib64_path")"; then
+                (( restore_nullglob == 0 )) || shopt -u nullglob
+                echo "Cannot verify scheduler project package-layout alias ownership: $lib64_path" >&2
+                return 2
+            fi
+            lib64_parent="${lib64_path%/*}"
+            runtime_security_require_safe_parent \
+                "$lib64_path" \
+                "$lib64_owner" \
+                "$lib64_parent" \
+                "project package-layout alias" || {
+                    lib64_status=$?
+                    (( restore_nullglob == 0 )) || shopt -u nullglob
+                    return "$lib64_status"
+                }
+            if ! runtime_security_owner_is_trusted "$lib64_owner"; then
+                (( restore_nullglob == 0 )) || shopt -u nullglob
+                echo "Scheduler project package-layout alias is controlled by an untrusted owner: $lib64_path" >&2
+                return 2
+            fi
+            runtime_security_readlink_losslessly "$lib64_path" || {
+                (( restore_nullglob == 0 )) || shopt -u nullglob
+                echo "Cannot resolve scheduler project package-layout alias: $lib64_path" >&2
+                return 2
+            }
+            lib64_target="$runtime_security_readlink_target"
+            unset runtime_security_readlink_target
+            if runtime_security_contains_ascii_control "$lib64_target"; then
+                (( restore_nullglob == 0 )) || shopt -u nullglob
+                echo "Scheduler project package-layout aliases must not contain ASCII control characters." >&2
+                return 2
+            fi
+            # Python's venv module commonly creates lib64 -> lib. That alias
+            # exposes exactly the package tree collected above, so scanning it
+            # again through a symlink would reject an otherwise safe standard
+            # environment. No other symlink target is accepted.
+            if [[ "$lib64_target" != "lib" ]]; then
+                (( restore_nullglob == 0 )) || shopt -u nullglob
+                echo "Scheduler project lib64 aliases must point directly to lib: $lib64_path" >&2
+                return 2
+            fi
+            continue
+        fi
+        runtime_security_collected_site_package_candidates+=(
+            "$lib64_path"/python*/site-packages
+            "$lib64_path"/python*/dist-packages
+            "$lib64_path"/site-packages
+            "$lib64_path"/dist-packages
+        )
+    done
+    (( restore_nullglob == 0 )) || shopt -u nullglob
+}
+
+runtime_security_validate_pth_effects() {
+    local repo_dir="$1"
+    local site_packages="$2"
+    local literal_python="$3"
+    local pth_file pth_name line normalized_path_line control_check payload module_name target_path
+    local install_call
+    local restore_dotglob=0
+    local restore_nullglob=0
+    local -a pth_files=()
+
+    if ! shopt -q nullglob; then
+        shopt -s nullglob
+        restore_nullglob=1
+    fi
+    if ! shopt -q dotglob; then
+        shopt -s dotglob
+        restore_dotglob=1
+    fi
+    pth_files=("$site_packages"/*.pth)
+    (( restore_dotglob == 0 )) || shopt -u dotglob
+    (( restore_nullglob == 0 )) || shopt -u nullglob
+
+    for pth_file in "${pth_files[@]}"; do
+        pth_name="${pth_file##*/}"
+        if runtime_security_contains_ascii_control "$pth_name"; then
+            echo "Scheduler project .pth filenames must not contain ASCII control characters." >&2
+            return 2
+        fi
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ "$line" != *$'\r' ]] || line="${line%$'\r'}"
+            [[ -n "$line" && "$line" != \#* ]] || continue
+
+            # Ask the exact validated interpreter that will process this file
+            # to apply its own ``str.rstrip`` whitespace table. CPython ignores
+            # whitespace-only lines and strips all trailing Unicode whitespace
+            # from path entries; Bash character classes and byte-oriented shell
+            # substitutions cannot reproduce those version-specific semantics.
+            # -I -S prevents this inert argv transformation from processing the
+            # very site files that are still being validated.
+            normalized_path_line="$(
+                "$literal_python" -I -S -c \
+                    'import sys; sys.stdout.write(sys.argv[1].rstrip())' \
+                    "$line"
+            )" || {
+                echo "Unable to normalize a scheduler project .pth entry with the validated project Python." >&2
+                return 2
+            }
+            [[ -n "$normalized_path_line" ]] || continue
+
+            payload=""
+            if [[ "$line" == import\ * ]]; then
+                payload="${line#import }"
+            elif [[ "$line" == import$'\t'* ]]; then
+                payload="${line#import$'\t'}"
+            fi
+            if [[ -n "$payload" ]]; then
+                # Tabs are valid immediately after the import keyword, but no
+                # other control characters can safely participate in a startup
+                # directive. Executable directives deliberately retain their
+                # original text, matching CPython's pre-rstrip classification.
+                control_check="${line//$'\t'/}"
+                if runtime_security_contains_ascii_control "$control_check"; then
+                    echo "Scheduler project .pth entries must not contain ASCII control characters." >&2
+                    return 2
+                fi
+                module_name="${payload%%;*}"
+                install_call=0
+                if [[ "$payload" == "$module_name" ]]; then
+                    :
+                elif [[ "$module_name" =~ ^__editable___leveraged_trader_[A-Za-z0-9_]+_finder$ \
+                    && "$payload" == "$module_name; $module_name.install()" ]]; then
+                    install_call=1
+                else
+                    echo "Scheduler project .pth file contains an unsupported executable directive: $pth_file" >&2
+                    return 2
+                fi
+                if [[ ! "$module_name" =~ ^[A-Za-z_][A-Za-z0-9_.]*$ ]]; then
+                    echo "Scheduler project .pth file contains an unsupported import target: $pth_file" >&2
+                    return 2
+                fi
+                if [[ "$module_name" =~ ^__editable___leveraged_trader_[A-Za-z0-9_]+_finder$ ]]; then
+                    runtime_security_validate_editable_finder \
+                        "$repo_dir" \
+                        "$site_packages" \
+                        "$module_name" \
+                        "$install_call" \
+                        "$literal_python" || return $?
+                elif [[ "$module_name" != "_virtualenv" ]]; then
+                    echo "Scheduler project .pth file contains an unreviewed import hook: $pth_file" >&2
+                    return 2
+                fi
+                continue
+            fi
+            if [[ "$line" == import || "$line" == import$'\t' ]]; then
+                echo "Scheduler project .pth file contains an invalid executable directive: $pth_file" >&2
+                return 2
+            fi
+
+            target_path="$normalized_path_line"
+            if runtime_security_contains_ascii_control "$target_path"; then
+                echo "Scheduler project .pth entries must not contain ASCII control characters." >&2
+                return 2
+            fi
+            if [[ "$target_path" != /* ]]; then
+                target_path="$site_packages/$target_path"
+            fi
+            # CPython ignores a nonexistent target, but an untrusted process
+            # could create it after this check when its parent is writable.
+            # Reject it instead of leaving a creation race before site startup.
+            if [[ ! -e "$target_path" && ! -L "$target_path" ]]; then
+                echo "Scheduler project .pth targets must exist before validation: $target_path" >&2
+                return 2
+            fi
+            if [[ -d "$target_path" && ! -L "$target_path" ]]; then
+                runtime_security_validate_trusted_import_tree \
+                    "$target_path" \
+                    ".pth import target" >/dev/null || return $?
+            elif [[ -f "$target_path" && ! -L "$target_path" ]]; then
+                runtime_security_validate_trusted_regular_file \
+                    "$target_path" \
+                    ".pth import target" >/dev/null || return $?
+            else
+                echo "Scheduler project .pth targets must be trusted regular files or directories: $target_path" >&2
+                return 2
+            fi
+        done < "$pth_file"
+    done
+}
+
+runtime_security_validate_leveraged_trader_import_paths() {
+    local repo_dir="$1"
+    local project_environment="$2"
+    local literal_python_entry="${3:-$project_environment/bin/python}"
+    local literal_python site_packages installed_import_path
+    local editable_found=0
+    local project_install_found=0
+    local site_packages_found=0
+    local restore_dotglob=0
+    local restore_nullglob=0
+    local -a site_package_candidates=()
+    local -a editable_paths=()
+    local -a installed_import_paths=()
+
+    literal_python="$(
+        runtime_security_validate_trusted_executable_entry \
+            "$literal_python_entry" \
+            "project Python executable"
+    )" || return $?
+    runtime_security_collect_project_site_package_candidates "$project_environment" || return $?
+    site_package_candidates=("${runtime_security_collected_site_package_candidates[@]}")
+    unset runtime_security_collected_site_package_candidates
+
+    for site_packages in "${site_package_candidates[@]}"; do
+        [[ -d "$site_packages" ]] || continue
+        site_packages_found=1
+        runtime_security_validate_trusted_import_tree \
+            "$site_packages" \
+            "project site-packages tree" >/dev/null || return $?
+    done
+
+    if (( site_packages_found != 0 )); then
+        # CPython checks beside the invoked executable before checking the
+        # environment root. Standard venv and uv environments keep pyvenv.cfg
+        # at the root; reject a shadow configuration rather than validating a
+        # different file from the one uv uses for the project environment.
+        if [[ -e "$project_environment/bin/pyvenv.cfg" \
+            || -L "$project_environment/bin/pyvenv.cfg" ]]; then
+            echo "Project environment must not contain a bin/pyvenv.cfg override." >&2
+            return 2
+        fi
+        if [[ ! -e "$project_environment/pyvenv.cfg" && ! -L "$project_environment/pyvenv.cfg" ]]; then
+            echo "Project environment is missing its validated pyvenv.cfg file." >&2
+            return 2
+        fi
+        runtime_security_validate_trusted_regular_file \
+            "$project_environment/pyvenv.cfg" \
+            "project pyvenv.cfg" >/dev/null || return $?
+        runtime_security_validate_isolated_pyvenv_configuration \
+            "$project_environment/pyvenv.cfg" \
+            "$literal_python" || return $?
+    fi
+
+    for site_packages in "${site_package_candidates[@]}"; do
+        [[ -d "$site_packages" ]] || continue
+        runtime_security_validate_pth_effects \
+            "$repo_dir" \
+            "$site_packages" \
+            "$literal_python" || return $?
+        restore_nullglob=0
+        restore_dotglob=0
+        if ! shopt -q nullglob; then
+            shopt -s nullglob
+            restore_nullglob=1
+        fi
+        if ! shopt -q dotglob; then
+            shopt -s dotglob
+            restore_dotglob=1
+        fi
+        editable_paths=("$site_packages"/__editable__.*leveraged_trader*.pth)
+        installed_import_paths=(
+            "$site_packages"/leveraged_trader
+            "$site_packages"/leveraged_trader.py
+            "$site_packages"/leveraged_trader.pyc
+            "$site_packages"/leveraged_trader*.so
+            "$site_packages"/leveraged_trader*.pyd
+        )
+        (( restore_dotglob == 0 )) || shopt -u dotglob
+        (( restore_nullglob == 0 )) || shopt -u nullglob
+
+        if (( ${#editable_paths[@]} > 0 )); then
+            editable_found=1
+            project_install_found=1
+        fi
+        for installed_import_path in "${installed_import_paths[@]}"; do
+            if [[ -e "$installed_import_path" || -L "$installed_import_path" ]]; then
+                project_install_found=1
+            fi
+        done
+    done
+
+    if (( site_packages_found != 0 && project_install_found == 0 )); then
+        echo "Cannot locate a validated leveraged_trader install in the project environment." >&2
+        return 2
+    fi
+
+    if (( editable_found != 0 )); then
+        runtime_security_validate_trusted_source_tree \
+            "$repo_dir/leveraged_trader" \
+            "leveraged_trader project package" >/dev/null || return $?
+    fi
+}
+
+runtime_security_clear_uv_environment() {
+    local environment_name
+    while IFS= read -r environment_name; do
+        case "$environment_name" in
+            UV_*)
+                unset "$environment_name"
+                ;;
+        esac
+    done < <(compgen -e)
+}
+
+runtime_security_current_uid="${EUID}"
+runtime_security_root_owner_uid=""
+if [[ -x /usr/bin/stat ]]; then
+    runtime_security_stat_bin=/usr/bin/stat
+elif [[ -x /bin/stat ]]; then
+    runtime_security_stat_bin=/bin/stat
+else
+    echo "Unable to find the system stat executable required for scheduler security checks." >&2
+    return 2
+fi
+if [[ -x /usr/bin/readlink ]]; then
+    runtime_security_readlink_bin=/usr/bin/readlink
+elif [[ -x /bin/readlink ]]; then
+    runtime_security_readlink_bin=/bin/readlink
+else
+    echo "Unable to find the system readlink executable required for scheduler security checks." >&2
+    return 2
+fi
+if [[ -x /usr/bin/find ]]; then
+    runtime_security_find_bin=/usr/bin/find
+elif [[ -x /bin/find ]]; then
+    runtime_security_find_bin=/bin/find
+else
+    echo "Unable to find the system find executable required for scheduler security checks." >&2
+    return 2
+fi

@@ -1,18 +1,265 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
+# The installed scheduler clears shell startup hooks before this Bash starts;
+# also keep direct invocations from forwarding them to uv or other subprocesses.
+unset BASH_ENV ENV
 
-repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+runner_script_path="${BASH_SOURCE[0]}"
+runner_initial_directory="$(builtin pwd -P)" || exit $?
+runner_path_parent="${runner_script_path%/*}"
+if [[ "$runner_path_parent" == "$runner_script_path" ]]; then
+    runner_path_parent="."
+fi
+if [[ "$runner_path_parent" != /* ]]; then
+    runner_path_parent="$runner_initial_directory/$runner_path_parent"
+fi
+runner_marker=$'\001'
+runner_captured_directory="$(
+    cd -P -- "$runner_path_parent" \
+        && printf '%s%s' "$PWD" "$runner_marker"
+)" || exit $?
+case "$runner_captured_directory" in
+    *"$runner_marker")
+        script_dir="${runner_captured_directory%"$runner_marker"}"
+        ;;
+    *)
+        echo "Cannot safely resolve the scheduler runner directory." >&2
+        exit 2
+        ;;
+esac
+runner_control_value="$runner_script_path$runner_initial_directory$script_dir"
+runner_control_lc="${LC_ALL-}"
+runner_control_lc_was_set="${LC_ALL+x}"
+LC_ALL=C
+if [[ "$runner_control_value" =~ [[:cntrl:]] ]]; then
+    echo "Scheduler runner paths must not contain ASCII control characters." >&2
+    exit 2
+fi
+if [[ "$runner_control_lc_was_set" == "x" ]]; then
+    LC_ALL="$runner_control_lc"
+else
+    unset LC_ALL
+fi
+unset runner_control_value runner_control_lc runner_control_lc_was_set runner_marker
+unset runner_captured_directory runner_path_parent runner_initial_directory
+runtime_security_file="$script_dir/runtime-security"
+
+# Bootstrap this trust boundary without executing code from the helper first.
+# Source a stable, verified descriptor after checking its complete ancestry and
+# opened-file metadata.
+bootstrap_source_runtime_security() {
+    local path="$1"
+    local stat_bin root_owner current_uid parent_path relative_parent component child_path child_owner
+    local parent_status parent_owner parent_mode parent_mode_value
+    local file_status file_owner file_mode file_links file_mode_value extra source_status
+    local descriptor_path="/dev/fd/7"
+    local -a path_components=()
+
+    local LC_ALL=C
+    if [[ "$path" =~ [[:cntrl:]] || "$path" != /* ]]; then
+        echo "Scheduler runtime security path must be an absolute control-free path." >&2
+        return 2
+    fi
+    if [[ -x /usr/bin/stat ]]; then
+        stat_bin=/usr/bin/stat
+    elif [[ -x /bin/stat ]]; then
+        stat_bin=/bin/stat
+    else
+        echo "Unable to find the system stat executable required to verify scheduler runtime security." >&2
+        return 2
+    fi
+    if ! root_owner="$($stat_bin -c '%u' -- / 2>/dev/null)"; then
+        root_owner="$($stat_bin -f '%u' / 2>/dev/null)" || return 2
+    fi
+    [[ "$root_owner" =~ ^[0-9]+$ ]] || return 2
+    current_uid="$EUID"
+
+    parent_path="${path%/*}"
+    [[ -n "$parent_path" ]] || parent_path="/"
+    relative_parent="${parent_path#/}"
+    if [[ -n "$relative_parent" ]]; then
+        IFS='/' read -r -a path_components <<< "$relative_parent"
+    fi
+    parent_path="/"
+    for component in "${path_components[@]}"; do
+        if [[ -z "$component" || "$component" == "." || "$component" == ".." ]]; then
+            echo "Scheduler runtime security path contains an unsafe component." >&2
+            return 2
+        fi
+        if [[ "$parent_path" == "/" ]]; then
+            child_path="/$component"
+        else
+            child_path="$parent_path/$component"
+        fi
+        if [[ -L "$child_path" || ! -d "$child_path" ]]; then
+            echo "Scheduler runtime security ancestor must not be a symbolic link: $child_path" >&2
+            return 2
+        fi
+        if ! child_owner="$($stat_bin -c '%u' -- "$child_path" 2>/dev/null)"; then
+            child_owner="$($stat_bin -f '%u' "$child_path" 2>/dev/null)" || return 2
+        fi
+        if ! parent_status="$($stat_bin -Lc '%u %a' -- "$parent_path" 2>/dev/null)"; then
+            parent_status="$($stat_bin -Lf '%u %p' "$parent_path" 2>/dev/null)" || return 2
+        fi
+        read -r parent_owner parent_mode extra <<< "$parent_status"
+        if [[ ! "$child_owner" =~ ^[0-9]+$ || ! "$parent_owner" =~ ^[0-9]+$ \
+            || ! "$parent_mode" =~ ^[0-7]+$ || -n "$extra" ]]; then
+            return 2
+        fi
+        if [[ "$parent_owner" != "$current_uid" && "$parent_owner" != "0" \
+            && "$parent_owner" != "$root_owner" ]]; then
+            echo "Scheduler runtime security path is controlled by an untrusted owner at $parent_path." >&2
+            return 2
+        fi
+        parent_mode_value=$(((8#$parent_mode) & 07777))
+        if (( parent_mode_value & 0022 )) \
+            && { (( ! (parent_mode_value & 01000) )) \
+                || [[ "$child_owner" != "$current_uid" && "$child_owner" != "0" \
+                    && "$child_owner" != "$root_owner" ]]; }; then
+            echo "Scheduler runtime security path is replaceable through writable ancestor $parent_path." >&2
+            return 2
+        fi
+        parent_path="$child_path"
+    done
+
+    if [[ -L "$path" || ! -f "$path" ]]; then
+        echo "Unable to load scheduler runtime security checks: $path" >&2
+        return 2
+    fi
+    exec 7< "$path" || return 2
+    if [[ ! -f "$descriptor_path" || ! "$path" -ef "$descriptor_path" || -L "$path" ]]; then
+        exec 7<&-
+        echo "Scheduler runtime security file changed while it was being opened: $path" >&2
+        return 2
+    fi
+    if ! file_status="$($stat_bin -Lc '%u %a %h' -- "$descriptor_path" 2>/dev/null)"; then
+        file_status="$($stat_bin -Lf '%u %p %l' "$descriptor_path" 2>/dev/null)" || {
+            exec 7<&-
+            return 2
+        }
+    fi
+    read -r file_owner file_mode file_links extra <<< "$file_status"
+    if [[ ! "$file_owner" =~ ^[0-9]+$ || ! "$file_mode" =~ ^[0-7]+$ \
+        || ! "$file_links" =~ ^[1-9][0-9]*$ || -n "$extra" ]]; then
+        exec 7<&-
+        return 2
+    fi
+    if ! parent_status="$($stat_bin -Lc '%u %a' -- "$parent_path" 2>/dev/null)"; then
+        parent_status="$($stat_bin -Lf '%u %p' "$parent_path" 2>/dev/null)" || {
+            exec 7<&-
+            return 2
+        }
+    fi
+    read -r parent_owner parent_mode extra <<< "$parent_status"
+    if [[ ! "$parent_owner" =~ ^[0-9]+$ || ! "$parent_mode" =~ ^[0-7]+$ || -n "$extra" ]]; then
+        exec 7<&-
+        return 2
+    fi
+    if [[ "$parent_owner" != "$current_uid" && "$parent_owner" != "0" \
+        && "$parent_owner" != "$root_owner" ]]; then
+        exec 7<&-
+        echo "Scheduler runtime security path is controlled by an untrusted owner at $parent_path." >&2
+        return 2
+    fi
+    parent_mode_value=$(((8#$parent_mode) & 07777))
+    if (( parent_mode_value & 0022 )) \
+        && { (( ! (parent_mode_value & 01000) )) \
+            || [[ "$file_owner" != "$current_uid" && "$file_owner" != "0" \
+                && "$file_owner" != "$root_owner" ]]; }; then
+        exec 7<&-
+        echo "Scheduler runtime security path is replaceable through writable ancestor $parent_path." >&2
+        return 2
+    fi
+    file_mode_value=$(((8#$file_mode) & 07777))
+    if [[ "$file_owner" != "$current_uid" && "$file_owner" != "0" && "$file_owner" != "$root_owner" ]]; then
+        exec 7<&-
+        echo "Scheduler runtime security file is controlled by an untrusted owner: $path" >&2
+        return 2
+    fi
+    if (( file_mode_value & 0022 )); then
+        exec 7<&-
+        echo "Scheduler runtime security file must not be group- or world-writable: $path" >&2
+        return 2
+    fi
+    if (( file_links != 1 )); then
+        exec 7<&-
+        echo "Scheduler runtime security file must not have multiple hard links: $path" >&2
+        return 2
+    fi
+
+    source_status=0
+    # shellcheck source=runtime-security
+    builtin source "$descriptor_path" || source_status=$?
+    exec 7<&-
+    return "$source_status"
+}
+
+bootstrap_source_runtime_security "$runtime_security_file" || exit $?
+repo_dir="$(cd -P -- "$script_dir/../.." && pwd -P)"
 cd "$repo_dir"
 
 if [[ -n "${UV_BIN:-}" ]]; then
     uv_bin="$UV_BIN"
 elif command -v uv >/dev/null 2>&1; then
     uv_bin="$(command -v uv)"
-elif [[ -x "$HOME/.local/bin/uv" ]]; then
+elif [[ -n "${HOME:-}" && -x "$HOME/.local/bin/uv" ]]; then
     uv_bin="$HOME/.local/bin/uv"
 else
     echo "Unable to find uv. Install uv or set UV_BIN to its executable path." >&2
     exit 127
 fi
+uv_bin="$(runtime_security_validate_trusted_executable "$uv_bin" "uv executable")" || exit $?
 
-exec "$uv_bin" run leveraged-trader "$@"
+project_environment="$repo_dir/.venv"
+trader_python_entry="$project_environment/bin/python"
+if [[ ! -f "$trader_python_entry" || ! -x "$trader_python_entry" ]]; then
+    echo "Locked project environment is missing the Python executable: $trader_python_entry" >&2
+    echo "Run 'cd $repo_dir && $uv_bin sync --locked' before scheduled operation." >&2
+    exit 127
+fi
+trader_python="$(
+    runtime_security_validate_trusted_executable_entry "$trader_python_entry" "project Python executable"
+)" || exit $?
+
+# Validate the environment without modifying it.  The scheduler remains the
+# published fallback-lock owner while this read-only uv check runs, then execs
+# isolated Python module entry point so that the same PID performs all workflow
+# and broker side effects.  `-I` ignores inherited Python environment settings
+# and the user site, preventing a sitecustomize supplied through either from
+# changing scheduled trading code.
+# `uv run` cannot be used here: uv remains a parent of the Python command, and
+# SIGKILLing that parent can orphan a still-running trader.
+sync_status=0
+(
+    # The scheduler must check this checkout and its complete default dependency
+    # selection even if the user's login environment contains uv overrides.
+    runtime_security_clear_uv_environment
+    UV_PROJECT_ENVIRONMENT="$project_environment" \
+        "$uv_bin" sync \
+        --project "$repo_dir" \
+        --directory "$repo_dir" \
+        --locked \
+        --check
+) || sync_status=$?
+if (( sync_status != 0 )); then
+    echo "Locked project environment is not synchronized with pyproject.toml and uv.lock." >&2
+    echo "Run 'cd $repo_dir && $uv_bin sync --locked' before scheduled operation." >&2
+    exit "$sync_status"
+fi
+
+# Revalidate after uv inspected the environment. The entry's non-replaceable
+# ancestry makes the required virtual-environment invocation stable.
+trader_python="$(
+    runtime_security_validate_trusted_executable_entry "$trader_python_entry" "project Python executable"
+)" || exit $?
+
+# Validate the complete virtual-environment import tree, its configuration, and
+# the editable project package without importing them. This runs after uv's
+# read-only check and immediately before Python starts processing .pth files.
+runtime_security_validate_leveraged_trader_import_paths \
+    "$repo_dir" \
+    "$project_environment" \
+    "$trader_python" || exit $?
+
+exec "$trader_python" -I -m leveraged_trader "$@"

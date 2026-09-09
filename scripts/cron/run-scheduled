@@ -1,0 +1,1973 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+# Prevent a direct invocation from carrying startup hooks into the production
+# runner. The installed cron command clears them before this shell starts.
+unset BASH_ENV ENV
+
+contains_ascii_control() {
+    local LC_ALL=C
+    [[ "$1" =~ [[:cntrl:]] ]]
+}
+
+require_control_free_path() {
+    local value="$1"
+    local description="$2"
+    if contains_ascii_control "$value"; then
+        echo "Scheduler $description must not contain ASCII control characters." >&2
+        return 2
+    fi
+}
+
+absolute_lexical_path() {
+    local input="$1"
+    local component normalized=""
+    local component_count=0
+    local -a input_components=()
+    local -a normalized_components=()
+
+    require_control_free_path "$input" "runtime path" || return $?
+    if [[ "$input" != /* ]]; then
+        input="$PWD/$input"
+    fi
+    IFS='/' read -r -a input_components <<< "$input"
+    for component in "${input_components[@]}"; do
+        case "$component" in
+            ""|.)
+                ;;
+            ..)
+                echo "Scheduler runtime paths must not contain '..' components: $input" >&2
+                return 2
+                ;;
+            *)
+                normalized_components[component_count]="$component"
+                component_count=$((component_count + 1))
+                ;;
+        esac
+    done
+    if (( component_count == 0 )); then
+        printf '/\n'
+        return 0
+    fi
+    for component in "${normalized_components[@]}"; do
+        normalized="$normalized/$component"
+    done
+    printf '%s\n' "$normalized"
+}
+
+script_origin="${BASH_SOURCE[0]:-$0}"
+require_control_free_path "$script_origin" "script path" || exit $?
+require_control_free_path "$PWD" "initial working directory" || exit $?
+script_path="$(absolute_lexical_path "$script_origin")" || exit $?
+unset script_origin
+script_dir="${script_path%/*}"
+if [[ -z "$script_dir" ]]; then
+    script_dir="/"
+fi
+runtime_security_file="$script_dir/runtime-security"
+
+# Bootstrap this trust boundary without executing code from the helper first.
+# Source a stable, verified descriptor after checking its complete ancestry and
+# opened-file metadata.
+bootstrap_source_runtime_security() {
+    local path="$1"
+    local stat_bin root_owner current_uid parent_path relative_parent component child_path child_owner
+    local parent_status parent_owner parent_mode parent_mode_value
+    local file_status file_owner file_mode file_links file_mode_value extra source_status
+    local descriptor_path="/dev/fd/7"
+    local -a path_components=()
+
+    if contains_ascii_control "$path" || [[ "$path" != /* ]]; then
+        echo "Scheduler runtime security path must be an absolute control-free path." >&2
+        return 2
+    fi
+    if [[ -x /usr/bin/stat ]]; then
+        stat_bin=/usr/bin/stat
+    elif [[ -x /bin/stat ]]; then
+        stat_bin=/bin/stat
+    else
+        echo "Unable to find the system stat executable required to verify scheduler runtime security." >&2
+        return 2
+    fi
+    if ! root_owner="$($stat_bin -c '%u' -- / 2>/dev/null)"; then
+        root_owner="$($stat_bin -f '%u' / 2>/dev/null)" || return 2
+    fi
+    [[ "$root_owner" =~ ^[0-9]+$ ]] || return 2
+    current_uid="$EUID"
+
+    parent_path="${path%/*}"
+    [[ -n "$parent_path" ]] || parent_path="/"
+    relative_parent="${parent_path#/}"
+    if [[ -n "$relative_parent" ]]; then
+        IFS='/' read -r -a path_components <<< "$relative_parent"
+    fi
+    parent_path="/"
+    for component in "${path_components[@]}"; do
+        if [[ -z "$component" || "$component" == "." || "$component" == ".." ]]; then
+            echo "Scheduler runtime security path contains an unsafe component." >&2
+            return 2
+        fi
+        if [[ "$parent_path" == "/" ]]; then
+            child_path="/$component"
+        else
+            child_path="$parent_path/$component"
+        fi
+        if [[ -L "$child_path" || ! -d "$child_path" ]]; then
+            echo "Scheduler runtime security ancestor must not be a symbolic link: $child_path" >&2
+            return 2
+        fi
+        if ! child_owner="$($stat_bin -c '%u' -- "$child_path" 2>/dev/null)"; then
+            child_owner="$($stat_bin -f '%u' "$child_path" 2>/dev/null)" || return 2
+        fi
+        if ! parent_status="$($stat_bin -Lc '%u %a' -- "$parent_path" 2>/dev/null)"; then
+            parent_status="$($stat_bin -Lf '%u %p' "$parent_path" 2>/dev/null)" || return 2
+        fi
+        read -r parent_owner parent_mode extra <<< "$parent_status"
+        if [[ ! "$child_owner" =~ ^[0-9]+$ || ! "$parent_owner" =~ ^[0-9]+$ \
+            || ! "$parent_mode" =~ ^[0-7]+$ || -n "$extra" ]]; then
+            return 2
+        fi
+        if [[ "$parent_owner" != "$current_uid" && "$parent_owner" != "0" \
+            && "$parent_owner" != "$root_owner" ]]; then
+            echo "Scheduler runtime security path is controlled by an untrusted owner at $parent_path." >&2
+            return 2
+        fi
+        parent_mode_value=$(((8#$parent_mode) & 07777))
+        if (( parent_mode_value & 0022 )) \
+            && { (( ! (parent_mode_value & 01000) )) \
+                || [[ "$child_owner" != "$current_uid" && "$child_owner" != "0" \
+                    && "$child_owner" != "$root_owner" ]]; }; then
+            echo "Scheduler runtime security path is replaceable through writable ancestor $parent_path." >&2
+            return 2
+        fi
+        parent_path="$child_path"
+    done
+
+    if [[ -L "$path" || ! -f "$path" ]]; then
+        echo "Unable to load scheduler runtime security checks: $path" >&2
+        return 2
+    fi
+    exec 7< "$path" || return 2
+    if [[ ! -f "$descriptor_path" || ! "$path" -ef "$descriptor_path" || -L "$path" ]]; then
+        exec 7<&-
+        echo "Scheduler runtime security file changed while it was being opened: $path" >&2
+        return 2
+    fi
+    if ! file_status="$($stat_bin -Lc '%u %a %h' -- "$descriptor_path" 2>/dev/null)"; then
+        file_status="$($stat_bin -Lf '%u %p %l' "$descriptor_path" 2>/dev/null)" || {
+            exec 7<&-
+            return 2
+        }
+    fi
+    read -r file_owner file_mode file_links extra <<< "$file_status"
+    if [[ ! "$file_owner" =~ ^[0-9]+$ || ! "$file_mode" =~ ^[0-7]+$ \
+        || ! "$file_links" =~ ^[1-9][0-9]*$ || -n "$extra" ]]; then
+        exec 7<&-
+        return 2
+    fi
+    if ! parent_status="$($stat_bin -Lc '%u %a' -- "$parent_path" 2>/dev/null)"; then
+        parent_status="$($stat_bin -Lf '%u %p' "$parent_path" 2>/dev/null)" || {
+            exec 7<&-
+            return 2
+        }
+    fi
+    read -r parent_owner parent_mode extra <<< "$parent_status"
+    if [[ ! "$parent_owner" =~ ^[0-9]+$ || ! "$parent_mode" =~ ^[0-7]+$ || -n "$extra" ]]; then
+        exec 7<&-
+        return 2
+    fi
+    if [[ "$parent_owner" != "$current_uid" && "$parent_owner" != "0" \
+        && "$parent_owner" != "$root_owner" ]]; then
+        exec 7<&-
+        echo "Scheduler runtime security path is controlled by an untrusted owner at $parent_path." >&2
+        return 2
+    fi
+    parent_mode_value=$(((8#$parent_mode) & 07777))
+    if (( parent_mode_value & 0022 )) \
+        && { (( ! (parent_mode_value & 01000) )) \
+            || [[ "$file_owner" != "$current_uid" && "$file_owner" != "0" \
+                && "$file_owner" != "$root_owner" ]]; }; then
+        exec 7<&-
+        echo "Scheduler runtime security path is replaceable through writable ancestor $parent_path." >&2
+        return 2
+    fi
+    file_mode_value=$(((8#$file_mode) & 07777))
+    if [[ "$file_owner" != "$current_uid" && "$file_owner" != "0" && "$file_owner" != "$root_owner" ]]; then
+        exec 7<&-
+        echo "Scheduler runtime security file is controlled by an untrusted owner: $path" >&2
+        return 2
+    fi
+    if (( file_mode_value & 0022 )); then
+        exec 7<&-
+        echo "Scheduler runtime security file must not be group- or world-writable: $path" >&2
+        return 2
+    fi
+    if (( file_links != 1 )); then
+        exec 7<&-
+        echo "Scheduler runtime security file must not have multiple hard links: $path" >&2
+        return 2
+    fi
+
+    source_status=0
+    # shellcheck source=runtime-security
+    builtin source "$descriptor_path" || source_status=$?
+    exec 7<&-
+    return "$source_status"
+}
+
+bootstrap_source_runtime_security "$runtime_security_file" || exit $?
+runner_bash_bin=""
+if [[ -n "${LEVERAGED_TRADER_RUNNER:-}" ]]; then
+    runner="$LEVERAGED_TRADER_RUNNER"
+else
+    runner="$script_dir/run-leveraged-trader"
+    # The installed cron command starts this scheduler with a validated
+    # absolute Bash executable. Reuse that already-running interpreter for the
+    # production runner instead of depending on /usr/bin/env and the minimal
+    # managed PATH to locate Bash again.
+    runner_bash_bin="${BASH:-}"
+    require_control_free_path "$runner_bash_bin" "Bash executable path" || exit $?
+    if [[ "$runner_bash_bin" != /* || ! -f "$runner_bash_bin" || ! -x "$runner_bash_bin" ]]; then
+        echo "Scheduler Bash executable must be an absolute executable file: $runner_bash_bin" >&2
+        exit 2
+    fi
+    runner_bash_bin="$(
+        runtime_security_validate_trusted_executable "$runner_bash_bin" "Bash executable"
+    )" || exit $?
+    runner="$(runtime_security_validate_trusted_executable "$runner" "production runner")" || exit $?
+fi
+require_control_free_path "$runner" "runner path" || exit $?
+log_file="${LEVERAGED_TRADER_LOG_FILE:-}"
+log_max_bytes="${LEVERAGED_TRADER_LOG_MAX_BYTES:-10485760}"
+fallback_lock_dir=""
+fallback_lock_busy_status=75
+fallback_owner_publish_grace_seconds=120
+fallback_acquisition_gate_dir=""
+fallback_acquisition_gate_held=0
+fallback_gate_recovery_claim_dir=""
+fallback_gate_recovery_claim_held=0
+runtime_current_uid="${EUID}"
+runtime_root_owner_uid=""
+secured_private_directory=""
+scheduler_logging_ready=0
+scheduler_lock_backend=""
+
+path_owner_uid_lstat() {
+    local path="$1"
+    local owner_uid
+    if owner_uid="$(stat -c '%u' -- "$path" 2>/dev/null)"; then
+        :
+    elif owner_uid="$(stat -f '%u' "$path" 2>/dev/null)"; then
+        :
+    else
+        return 1
+    fi
+    [[ "$owner_uid" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$owner_uid"
+}
+
+directory_owner_mode_follow() {
+    local path="$1"
+    local status owner_uid mode extra
+    if status="$(stat -Lc '%u %a' -- "$path" 2>/dev/null)"; then
+        :
+    elif status="$(stat -Lf '%u %p' "$path" 2>/dev/null)"; then
+        :
+    else
+        return 1
+    fi
+    read -r owner_uid mode extra <<< "$status"
+    [[ "$owner_uid" =~ ^[0-9]+$ && "$mode" =~ ^[0-7]+$ && -z "$extra" ]] || return 1
+    printf '%s %s\n' "$owner_uid" "$mode"
+}
+
+runtime_owner_is_trusted() {
+    local owner_uid="$1"
+    [[ "$owner_uid" == "$runtime_current_uid" \
+        || "$owner_uid" == "0" \
+        || "$owner_uid" == "$runtime_root_owner_uid" ]]
+}
+
+require_trusted_directory_parent() {
+    local child_path="$1"
+    local child_owner_uid="$2"
+    local parent_path="$3"
+    local description="$4"
+    local parent_status parent_owner_uid parent_mode parent_mode_value
+
+    if [[ -L "$parent_path" || ! -d "$parent_path" ]]; then
+        echo "Scheduler $description ancestor must be a regular directory: $parent_path" >&2
+        return 2
+    fi
+    if ! parent_status="$(directory_owner_mode_follow "$parent_path")"; then
+        echo "Cannot verify scheduler $description ancestor metadata: $parent_path" >&2
+        return 2
+    fi
+    read -r parent_owner_uid parent_mode <<< "$parent_status"
+    if ! runtime_owner_is_trusted "$parent_owner_uid"; then
+        echo "Scheduler $description entry $child_path is unsafe because parent $parent_path is controlled by an untrusted owner." >&2
+        return 2
+    fi
+
+    # GNU %a is permission-only, while BSD %p includes the file-type bits.
+    # Retain only rwx/special bits so both formats share the same checks.
+    parent_mode_value=$(((8#$parent_mode) & 07777))
+    if (( parent_mode_value & 0022 )); then
+        if (( ! (parent_mode_value & 01000) )) || ! runtime_owner_is_trusted "$child_owner_uid"; then
+            echo "Scheduler $description entry $child_path is unsafe because parent $parent_path permits directory-entry substitution." >&2
+            return 2
+        fi
+    fi
+}
+
+regular_file_link_count() {
+    local path="$1"
+    local link_count
+    if link_count="$(stat -Lc '%h' -- "$path" 2>/dev/null)"; then
+        :
+    elif link_count="$(stat -Lf '%l' "$path" 2>/dev/null)"; then
+        :
+    else
+        return 1
+    fi
+    [[ "$link_count" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s\n' "$link_count"
+}
+
+path_modified_epoch() {
+    local path="$1"
+    local modified
+    if modified="$(stat -c '%Y' -- "$path" 2>/dev/null)"; then
+        :
+    elif modified="$(stat -f '%m' "$path" 2>/dev/null)"; then
+        :
+    else
+        return 1
+    fi
+    [[ "$modified" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$modified"
+}
+
+require_regular_file_or_missing() {
+    local path="$1"
+    local description="$2"
+    local link_count
+    if [[ -L "$path" ]]; then
+        echo "Scheduler $description path must not be a symbolic link: $path" >&2
+        return 2
+    fi
+    if [[ -e "$path" && ! -f "$path" ]]; then
+        echo "Scheduler $description path must be a regular file: $path" >&2
+        return 2
+    fi
+    if [[ -e "$path" ]]; then
+        if ! link_count="$(regular_file_link_count "$path")"; then
+            echo "Cannot verify scheduler $description link count: $path" >&2
+            return 2
+        fi
+        if (( link_count != 1 )); then
+            echo "Scheduler $description path must not have multiple hard links: $path" >&2
+            return 2
+        fi
+    fi
+}
+
+validate_open_regular_file() {
+    local descriptor="$1"
+    local path="$2"
+    local description="$3"
+    local descriptor_path="/dev/fd/$descriptor"
+    local link_count
+
+    if [[ ! -f "$descriptor_path" || -L "$path" || ! -f "$path" ]] \
+        || ! [[ "$path" -ef "$descriptor_path" ]]; then
+        echo "Scheduler $description path changed while it was being opened: $path" >&2
+        return 2
+    fi
+    if ! link_count="$(regular_file_link_count "$descriptor_path")"; then
+        echo "Cannot verify opened scheduler $description link count: $path" >&2
+        return 2
+    fi
+    if (( link_count != 1 )); then
+        echo "Scheduler $description path must not have multiple hard links: $path" >&2
+        return 2
+    fi
+    chmod 600 "$descriptor_path" || return $?
+    if [[ -L "$path" || ! -f "$path" ]] || ! [[ "$path" -ef "$descriptor_path" ]]; then
+        echo "Scheduler $description path changed while it was being secured: $path" >&2
+        return 2
+    fi
+    if ! link_count="$(regular_file_link_count "$descriptor_path")" || (( link_count != 1 )); then
+        echo "Scheduler $description path gained another hard link while it was being secured: $path" >&2
+        return 2
+    fi
+}
+
+secure_existing_regular_file() {
+    local path="$1"
+    local description="$2"
+    local validation_status=0
+    require_regular_file_or_missing "$path" "$description" || return $?
+    if [[ -e "$path" ]]; then
+        exec 7< "$path"
+        validate_open_regular_file 7 "$path" "$description" || validation_status=$?
+        if (( validation_status != 0 )); then
+            exec 7<&-
+            return "$validation_status"
+        fi
+        exec 7<&-
+    fi
+}
+
+create_private_regular_file() {
+    local path="$1"
+    local description="$2"
+    require_regular_file_or_missing "$path" "$description" || return $?
+    if [[ ! -e "$path" ]]; then
+        # noclobber makes creation fail rather than following a path that was
+        # installed between the validation above and this redirection.
+        if ! (set -o noclobber; : > "$path") 2>/dev/null; then
+            require_regular_file_or_missing "$path" "$description" || return $?
+            if [[ ! -e "$path" ]]; then
+                echo "Cannot create scheduler $description file: $path" >&2
+                return 2
+            fi
+        fi
+    fi
+    require_regular_file_or_missing "$path" "$description"
+}
+
+secure_private_directory() {
+    local requested_directory="$1"
+    local description="$2"
+    local descriptor_path="/dev/fd/6"
+    local directory relative_path component parent_path child_path child_owner_uid
+    local component_exists
+    local -a path_components=()
+
+    if ! directory="$(absolute_lexical_path "$requested_directory")"; then
+        echo "Cannot normalize scheduler $description directory: $requested_directory" >&2
+        return 2
+    fi
+    if ! runtime_root_owner_uid="$(path_owner_uid_lstat /)"; then
+        echo "Cannot verify scheduler $description filesystem-root ownership." >&2
+        return 2
+    fi
+
+    parent_path="/"
+    relative_path="${directory#/}"
+    if [[ -n "$relative_path" ]]; then
+        IFS='/' read -r -a path_components <<< "$relative_path"
+    fi
+    for component in "${path_components[@]}"; do
+        if [[ "$parent_path" == "/" ]]; then
+            child_path="/$component"
+        else
+            child_path="$parent_path/$component"
+        fi
+        if [[ -L "$child_path" ]]; then
+            echo "Scheduler $description ancestor must not be a symbolic link: $child_path" >&2
+            return 2
+        fi
+
+        component_exists=0
+        if [[ -e "$child_path" ]]; then
+            component_exists=1
+            if [[ ! -d "$child_path" ]]; then
+                echo "Scheduler $description ancestor must be a regular directory: $child_path" >&2
+                return 2
+            fi
+            if ! child_owner_uid="$(path_owner_uid_lstat "$child_path")"; then
+                echo "Cannot verify scheduler $description ancestor ownership: $child_path" >&2
+                return 2
+            fi
+        else
+            child_owner_uid="$runtime_current_uid"
+        fi
+
+        require_trusted_directory_parent \
+            "$child_path" \
+            "$child_owner_uid" \
+            "$parent_path" \
+            "$description" || return $?
+
+        if (( ! component_exists )); then
+            if ! mkdir -m 700 "$child_path" 2>/dev/null; then
+                if [[ -L "$child_path" || ! -d "$child_path" ]]; then
+                    echo "Cannot privately create scheduler $description directory: $child_path" >&2
+                    return 2
+                fi
+            fi
+            if [[ -L "$child_path" || ! -d "$child_path" ]]; then
+                echo "Scheduler $description directory changed while it was being created: $child_path" >&2
+                return 2
+            fi
+            if ! child_owner_uid="$(path_owner_uid_lstat "$child_path")" \
+                || [[ "$child_owner_uid" != "$runtime_current_uid" ]]; then
+                echo "Scheduler $description created directory must be owned by the current user: $child_path" >&2
+                return 2
+            fi
+            require_trusted_directory_parent \
+                "$child_path" \
+                "$child_owner_uid" \
+                "$parent_path" \
+                "$description" || return $?
+            chmod 700 "$child_path"
+        fi
+        parent_path="$child_path"
+    done
+
+    if [[ -L "$directory" || ! -d "$directory" || ! -O "$directory" ]]; then
+        echo "Scheduler $description directory must be an owned regular directory: $directory" >&2
+        return 2
+    fi
+    exec 6< "$directory"
+    if [[ ! -d "$descriptor_path" ]] || ! [[ "$directory" -ef "$descriptor_path" ]]; then
+        exec 6<&-
+        echo "Scheduler $description directory changed while it was being opened: $directory" >&2
+        return 2
+    fi
+    chmod 700 "$descriptor_path"
+    if [[ -L "$directory" || ! -d "$directory" ]] || ! [[ "$directory" -ef "$descriptor_path" ]]; then
+        exec 6<&-
+        echo "Scheduler $description directory changed while it was being secured: $directory" >&2
+        return 2
+    fi
+    exec 6<&-
+    secured_private_directory="$directory"
+}
+
+process_start_identity() {
+    local pid="$1"
+    local process_stat process_fields started
+    if [[ -r "/proc/$pid/stat" ]]; then
+        IFS= read -r process_stat < "/proc/$pid/stat" || return 1
+        process_stat="${process_stat##*) }"
+        read -r -a process_fields <<< "$process_stat"
+        if [[ ! "${process_fields[19]:-}" =~ ^[0-9]+$ ]]; then
+            return 1
+        fi
+        printf 'proc:%s\n' "${process_fields[19]}"
+        return 0
+    fi
+
+    if ! command -v ps >/dev/null 2>&1; then
+        return 1
+    fi
+    # BSD/macOS `ps` formats lstart with the locale-dependent `%c` format in
+    # the invoking process's timezone. Lock identities must remain stable when
+    # a manual invocation and cron (or two cron configurations) use different
+    # locale or timezone environments. UTC0 is a portable POSIX fixed zone and
+    # avoids consulting inherited timezone paths.
+    started="$(TZ=UTC0 LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)" || return 1
+    started="${started#"${started%%[![:space:]]*}"}"
+    if [[ -z "$started" ]]; then
+        return 1
+    fi
+    printf 'ps:%s\n' "$started"
+}
+
+read_fallback_lock_owner() {
+    local owner_file="$1"
+    local owner_line
+    if [[ ! -f "$owner_file" || -L "$owner_file" ]]; then
+        return 1
+    fi
+    IFS= read -r owner_line < "$owner_file" || return 1
+    if [[ "$owner_line" != *" "* ]]; then
+        return 1
+    fi
+    fallback_owner_pid="${owner_line%% *}"
+    fallback_owner_start="${owner_line#* }"
+    [[ "$fallback_owner_pid" =~ ^[1-9][0-9]*$ && -n "$fallback_owner_start" ]]
+}
+
+fallback_lock_is_stale() {
+    local lock_dir="$1"
+    local require_ownerless_age="${2:-1}"
+    local owner_start modified_epoch now_epoch
+    local fallback_owner_pid="" fallback_owner_start=""
+
+    if read_fallback_lock_owner "$lock_dir/owner"; then
+        if kill -0 "$fallback_owner_pid" 2>/dev/null; then
+            if ! owner_start="$(process_start_identity "$fallback_owner_pid")"; then
+                echo "Cannot verify scheduler fallback lock owner process $fallback_owner_pid." >&2
+                return 2
+            fi
+            if [[ "$owner_start" == "$fallback_owner_start" ]]; then
+                return "$fallback_lock_busy_status"
+            fi
+        fi
+    elif [[ -f "$lock_dir/pid" && ! -L "$lock_dir/pid" ]]; then
+        # Recover dead locks written by releases that predate process-start
+        # identities. A live legacy owner is reported for manual handling
+        # instead of risking PID-reuse lockout or overlapping execution.
+        IFS= read -r fallback_owner_pid < "$lock_dir/pid" || fallback_owner_pid=""
+        if [[ "$fallback_owner_pid" =~ ^[1-9][0-9]*$ ]] \
+            && kill -0 "$fallback_owner_pid" 2>/dev/null; then
+            echo "Cannot safely verify legacy scheduler lock owner $fallback_owner_pid; remove $lock_dir after confirming it is stale." >&2
+            return 2
+        fi
+    elif (( require_ownerless_age )); then
+        if ! modified_epoch="$(path_modified_epoch "$lock_dir")" \
+            || ! now_epoch="$(date '+%s')" \
+            || [[ ! "$now_epoch" =~ ^[0-9]+$ ]]; then
+            echo "Cannot determine age of scheduler fallback lock $lock_dir." >&2
+            return 2
+        fi
+        if (( now_epoch < modified_epoch \
+            || now_epoch - modified_epoch < fallback_owner_publish_grace_seconds )); then
+            # A creator may have won mkdir but not yet atomically published its
+            # owner file. A killed creator is recoverable after this grace.
+            return "$fallback_lock_busy_status"
+        fi
+    fi
+    return 0
+}
+
+release_fallback_acquisition_gate() {
+    local fallback_owner_pid="" fallback_owner_start="" current_start=""
+    local release_status=0
+    local gate_descriptor_path="/dev/fd/3"
+
+    if (( ! fallback_acquisition_gate_held )); then
+        return 0
+    fi
+    current_start="$(process_start_identity "$$")" || true
+    if [[ ! -d "$fallback_acquisition_gate_dir" ]] \
+        || ! [[ "$fallback_acquisition_gate_dir" -ef "$gate_descriptor_path" ]] \
+        || ! (
+            cd -P -- "$fallback_acquisition_gate_dir" || exit 2
+            [[ . -ef "$gate_descriptor_path" ]] || exit 2
+            fallback_owner_pid=""
+            fallback_owner_start=""
+            read_fallback_lock_owner ./owner \
+                && [[ "$fallback_owner_pid" == "$$" \
+                    && "$fallback_owner_start" == "$current_start" ]] \
+                || exit 2
+            rm -f ./owner || exit $?
+        ); then
+        release_status=2
+    elif ! [[ "$fallback_acquisition_gate_dir" -ef "$gate_descriptor_path" ]] \
+        || ! rmdir "$fallback_acquisition_gate_dir" 2>/dev/null; then
+        release_status=2
+    fi
+    exec 3<&- || true
+    if (( release_status != 0 )); then
+        echo "Cannot release scheduler fallback acquisition gate $fallback_acquisition_gate_dir; inspect it manually." >&2
+    fi
+    fallback_acquisition_gate_held=0
+    fallback_acquisition_gate_dir=""
+    return "$release_status"
+}
+
+release_fallback_gate_recovery_claim() {
+    local fallback_owner_pid="" fallback_owner_start="" current_start=""
+    local release_status=0 claim_descriptor_path="/dev/fd/6"
+
+    if (( ! fallback_gate_recovery_claim_held )); then
+        return 0
+    fi
+    current_start="$(process_start_identity "$$")" || true
+    if [[ ! -d "$fallback_gate_recovery_claim_dir" ]] \
+        || ! [[ "$fallback_gate_recovery_claim_dir" -ef "$claim_descriptor_path" ]] \
+        || ! (
+            cd -P -- "$fallback_gate_recovery_claim_dir" || exit 2
+            [[ . -ef "$claim_descriptor_path" ]] || exit 2
+            fallback_owner_pid=""
+            fallback_owner_start=""
+            read_fallback_lock_owner ./owner \
+                && [[ "$fallback_owner_pid" == "$$" \
+                    && "$fallback_owner_start" == "$current_start" ]] \
+                || exit 2
+            rm -f ./owner || exit $?
+        ); then
+        release_status=2
+    elif ! [[ "$fallback_gate_recovery_claim_dir" -ef "$claim_descriptor_path" ]] \
+        || ! rmdir "$fallback_gate_recovery_claim_dir" 2>/dev/null; then
+        release_status=2
+    fi
+    exec 6<&- || true
+    if (( release_status != 0 )); then
+        echo "Cannot release scheduler fallback gate recovery claim $fallback_gate_recovery_claim_dir; inspect it manually." >&2
+    fi
+    fallback_gate_recovery_claim_held=0
+    fallback_gate_recovery_claim_dir=""
+    return "$release_status"
+}
+
+fallback_gate_recovery_claims_are_clear() {
+    local gate_dir="$1"
+    local claim claim_descriptor_path="/dev/fd/6" owner_start modified_epoch now_epoch
+    local stale_owner_pid stale_owner_start cleanup_status invalid_owner
+    local fallback_owner_pid="" fallback_owner_start=""
+    local restore_nullglob=1
+    local -a claims=()
+
+    if shopt -q nullglob; then
+        restore_nullglob=0
+    else
+        shopt -s nullglob
+    fi
+    claims=("${gate_dir}.recovery."*)
+    if (( restore_nullglob )); then
+        shopt -u nullglob
+    fi
+    for claim in "${claims[@]}"; do
+        if [[ -L "$claim" || ! -d "$claim" ]]; then
+            echo "Scheduler fallback gate recovery claim has an unsafe type: $claim" >&2
+            return 2
+        fi
+        if ! exec 6< "$claim"; then
+            if [[ ! -e "$claim" ]]; then
+                continue
+            fi
+            echo "Cannot safely inspect scheduler fallback gate recovery claim $claim." >&2
+            return 2
+        fi
+        if ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+            exec 6<&-
+            if [[ -L "$claim" || ( -e "$claim" && ! -d "$claim" ) ]]; then
+                echo "Scheduler fallback gate recovery claim changed to an unsafe type: $claim" >&2
+                return 2
+            fi
+            return "$fallback_lock_busy_status"
+        fi
+
+        fallback_owner_pid=""
+        fallback_owner_start=""
+        if read_fallback_lock_owner "$claim/owner"; then
+            stale_owner_pid="$fallback_owner_pid"
+            stale_owner_start="$fallback_owner_start"
+            if ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+                exec 6<&-
+                return "$fallback_lock_busy_status"
+            fi
+            if kill -0 "$stale_owner_pid" 2>/dev/null; then
+                if ! owner_start="$(process_start_identity "$stale_owner_pid")"; then
+                    if ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+                        exec 6<&-
+                        return "$fallback_lock_busy_status"
+                    fi
+                    exec 6<&-
+                    echo "Cannot verify scheduler fallback gate recovery owner $stale_owner_pid." >&2
+                    return 2
+                fi
+                if [[ "$owner_start" == "$stale_owner_start" ]]; then
+                    exec 6<&-
+                    return "$fallback_lock_busy_status"
+                fi
+            fi
+            if ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+                exec 6<&-
+                return "$fallback_lock_busy_status"
+            fi
+            cleanup_status=0
+            (
+                cd -P -- "$claim" || exit 2
+                [[ . -ef "$claim_descriptor_path" ]] || exit 2
+                fallback_owner_pid=""
+                fallback_owner_start=""
+                read_fallback_lock_owner ./owner \
+                    && [[ "$fallback_owner_pid" == "$stale_owner_pid" \
+                        && "$fallback_owner_start" == "$stale_owner_start" ]] \
+                    || exit 2
+                rm -f ./owner || exit $?
+            ) || cleanup_status=$?
+        else
+            if ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+                exec 6<&-
+                return "$fallback_lock_busy_status"
+            fi
+            invalid_owner=0
+            if [[ -L "$claim/owner" \
+                || ( -e "$claim/owner" && ! -f "$claim/owner" ) \
+                || -L "$claim/owner.pending" \
+                || ( -e "$claim/owner.pending" && ! -f "$claim/owner.pending" ) ]]; then
+                exec 6<&-
+                echo "Scheduler fallback gate recovery claim has unsafe ownership metadata: $claim" >&2
+                return 2
+            fi
+            if [[ -f "$claim/owner" ]]; then
+                invalid_owner=1
+            fi
+            if ! modified_epoch="$(path_modified_epoch "$claim")" \
+                || ! now_epoch="$(date '+%s')" \
+                || [[ ! "$now_epoch" =~ ^[0-9]+$ ]]; then
+                if ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+                    exec 6<&-
+                    return "$fallback_lock_busy_status"
+                fi
+                exec 6<&-
+                echo "Cannot determine scheduler fallback gate recovery claim age: $claim" >&2
+                return 2
+            fi
+            if (( now_epoch < modified_epoch \
+                || now_epoch - modified_epoch < fallback_owner_publish_grace_seconds )); then
+                exec 6<&-
+                return "$fallback_lock_busy_status"
+            fi
+            if ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+                exec 6<&-
+                return "$fallback_lock_busy_status"
+            fi
+            cleanup_status=0
+            (
+                cd -P -- "$claim" || exit 2
+                [[ . -ef "$claim_descriptor_path" ]] || exit 2
+                if (( invalid_owner )); then
+                    [[ -f ./owner && ! -L ./owner ]] || exit 2
+                    fallback_owner_pid=""
+                    fallback_owner_start=""
+                    if read_fallback_lock_owner ./owner; then
+                        exit 2
+                    fi
+                    rm -f ./owner || exit $?
+                elif [[ -e ./owner || -L ./owner ]]; then
+                    exit 2
+                fi
+                if [[ -e ./owner.pending || -L ./owner.pending ]]; then
+                    [[ -f ./owner.pending && ! -L ./owner.pending ]] || exit 2
+                    rm -f ./owner.pending || exit $?
+                fi
+            ) || cleanup_status=$?
+        fi
+        if (( cleanup_status != 0 )); then
+            if ! [[ "$claim" -ef "$claim_descriptor_path" ]] \
+                || { [[ ! -e "$claim/owner" && ! -L "$claim/owner" ]] \
+                    && [[ ! -e "$claim/owner.pending" && ! -L "$claim/owner.pending" ]]; }; then
+                exec 6<&-
+                return "$fallback_lock_busy_status"
+            fi
+            exec 6<&-
+            echo "Cannot safely retire scheduler fallback gate recovery claim $claim." >&2
+            return 2
+        fi
+        if ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+            exec 6<&-
+            return "$fallback_lock_busy_status"
+        fi
+        if ! rmdir "$claim" 2>/dev/null; then
+            if [[ ! -e "$claim" ]] || ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+                exec 6<&-
+                return "$fallback_lock_busy_status"
+            fi
+            exec 6<&-
+            echo "Cannot safely retire scheduler fallback gate recovery claim $claim." >&2
+            return 2
+        fi
+        exec 6<&-
+    done
+    return 0
+}
+
+# Recovery claims live beside, rather than inside, the reusable gate name. A
+# claimant that is killed at any publication stage can therefore be aged or
+# process-identity checked without blocking inspection of the abandoned gate.
+# New gate creators check these claims again after mkdir, closing the rename
+# race in which a delayed retiree could otherwise move a freshly-created gate.
+create_fallback_gate_recovery_claim() {
+    local gate_dir="$1" current_start="$2"
+    local claim candidate_attempt claim_descriptor_path="/dev/fd/6"
+    local fallback_owner_pid="" fallback_owner_start=""
+
+    for candidate_attempt in {1..16}; do
+        claim="${gate_dir}.recovery.$$.$RANDOM.$RANDOM"
+        if [[ -e "$claim" || -L "$claim" ]]; then
+            continue
+        fi
+        if ! mkdir "$claim" 2>/dev/null; then
+            if [[ -e "$claim" || -L "$claim" ]]; then
+                continue
+            fi
+            echo "Cannot create scheduler fallback gate recovery claim." >&2
+            return 2
+        fi
+        if ! exec 6< "$claim"; then
+            rmdir "$claim" 2>/dev/null || true
+            return 2
+        fi
+        if ! [[ "$claim" -ef "$claim_descriptor_path" ]] \
+            || ! (
+                cd -P -- "$claim" || exit 2
+                [[ . -ef "$claim_descriptor_path" ]] || exit 2
+                set -o noclobber
+                printf '%s %s\n' "$$" "$current_start" > ./owner
+            ) 2>/dev/null \
+            || ! read_fallback_lock_owner "$claim/owner" \
+            || [[ "$fallback_owner_pid" != "$$" \
+                || "$fallback_owner_start" != "$current_start" ]] \
+            || ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+            if [[ -d "$claim" && "$claim" -ef "$claim_descriptor_path" ]]; then
+                (
+                    cd -P -- "$claim" || exit 2
+                    [[ . -ef "$claim_descriptor_path" ]] || exit 2
+                    rm -f ./owner.pending ./owner 2>/dev/null || true
+                ) || true
+                if [[ -d "$claim" && "$claim" -ef "$claim_descriptor_path" ]]; then
+                    rmdir "$claim" 2>/dev/null || true
+                fi
+            fi
+            exec 6<&-
+            echo "Cannot publish scheduler fallback gate recovery ownership." >&2
+            return 2
+        fi
+        fallback_gate_recovery_claim_dir="$claim"
+        fallback_gate_recovery_claim_held=1
+        return 0
+    done
+    echo "Cannot allocate a unique scheduler fallback gate recovery claim." >&2
+    return 2
+}
+
+retire_fallback_acquisition_gate() {
+    local gate_dir="$1" expected_state="$2"
+    local expected_owner_pid="${3:-}" expected_owner_start="${4:-}"
+    local current_start quarantine_dir="" candidate_attempt cleanup_status=0
+    local gate_descriptor_path="/dev/fd/3"
+    local fallback_owner_pid="" fallback_owner_start=""
+
+    current_start="$(process_start_identity "$$")" || return 2
+    create_fallback_gate_recovery_claim "$gate_dir" "$current_start" || return $?
+    if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+        release_fallback_gate_recovery_claim || true
+        return "$fallback_lock_busy_status"
+    fi
+    for candidate_attempt in {1..16}; do
+        quarantine_dir="${gate_dir}.quarantine.$$.$RANDOM.$RANDOM"
+        if [[ -e "$quarantine_dir" || -L "$quarantine_dir" ]]; then
+            quarantine_dir=""
+            continue
+        fi
+        if mkdir "$quarantine_dir" 2>/dev/null; then
+            break
+        fi
+        if [[ ! -e "$quarantine_dir" && ! -L "$quarantine_dir" ]]; then
+            quarantine_dir=""
+            break
+        fi
+        quarantine_dir=""
+    done
+    if [[ -z "$quarantine_dir" ]]; then
+        release_fallback_gate_recovery_claim || true
+        echo "Cannot allocate scheduler fallback gate quarantine." >&2
+        return 2
+    fi
+    if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]] \
+        || ! mv "$gate_dir" "$quarantine_dir/gate" 2>/dev/null; then
+        rmdir "$quarantine_dir" 2>/dev/null || true
+        if [[ ! -e "$gate_dir" ]] || ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+            release_fallback_gate_recovery_claim || true
+            return "$fallback_lock_busy_status"
+        fi
+        release_fallback_gate_recovery_claim || true
+        echo "Cannot quarantine stale scheduler fallback acquisition gate $gate_dir." >&2
+        return 2
+    fi
+    if [[ ! -d "$quarantine_dir/gate" ]] \
+        || ! [[ "$quarantine_dir/gate" -ef "$gate_descriptor_path" ]]; then
+        release_fallback_gate_recovery_claim || true
+        echo "Scheduler fallback acquisition gate identity changed during quarantine; preserved $quarantine_dir for inspection." >&2
+        return 2
+    fi
+    (
+        cd -P -- "$quarantine_dir/gate" || exit 2
+        [[ . -ef "$gate_descriptor_path" ]] || exit 2
+        if [[ "$expected_state" == "owned" ]]; then
+            fallback_owner_pid=""
+            fallback_owner_start=""
+            read_fallback_lock_owner ./owner \
+                && [[ "$fallback_owner_pid" == "$expected_owner_pid" \
+                    && "$fallback_owner_start" == "$expected_owner_start" ]] \
+                || exit 2
+            rm -f ./owner || exit $?
+        elif [[ "$expected_state" == "invalid" ]]; then
+            [[ -f ./owner && ! -L ./owner ]] || exit 2
+            fallback_owner_pid=""
+            fallback_owner_start=""
+            if read_fallback_lock_owner ./owner; then
+                exit 2
+            fi
+            rm -f ./owner || exit $?
+        elif [[ -e ./owner || -L ./owner ]]; then
+            exit 2
+        fi
+        if [[ -e ./owner.pending || -L ./owner.pending ]]; then
+            [[ -f ./owner.pending && ! -L ./owner.pending ]] || exit 2
+            rm -f ./owner.pending || exit $?
+        fi
+    ) || cleanup_status=$?
+    if (( cleanup_status != 0 )) \
+        || ! [[ "$quarantine_dir/gate" -ef "$gate_descriptor_path" ]] \
+        || ! rmdir "$quarantine_dir/gate" 2>/dev/null \
+        || ! rmdir "$quarantine_dir" 2>/dev/null; then
+        release_fallback_gate_recovery_claim || true
+        echo "Cannot safely remove quarantined scheduler fallback acquisition gate $quarantine_dir; inspect it manually." >&2
+        return 2
+    fi
+    release_fallback_gate_recovery_claim || return $?
+    return 0
+}
+
+cleanup_scheduler_fallback_locks() {
+    cleanup_fallback_lock || true
+    release_fallback_acquisition_gate || true
+    release_fallback_gate_recovery_claim || true
+}
+
+acquire_fallback_acquisition_gate() {
+    local gate_dir="${log_file}.lock.acquire.d"
+    local gate_descriptor_path="/dev/fd/3"
+    local attempt current_start owner_start modified_epoch now_epoch
+    local claim_status retirement_status stale_owner_pid stale_owner_start invalid_owner
+    local saw_identity_churn=0
+    local fallback_owner_pid="" fallback_owner_start=""
+
+    current_start="$(process_start_identity "$$")" || {
+        echo "Cannot determine scheduler process identity for fallback acquisition serialization." >&2
+        return 2
+    }
+    # A normal owner unlinks its owner file immediately before rmdir. A
+    # contender can therefore lose mkdir and then observe either no path or an
+    # opened directory whose pathname has just disappeared. Treat those
+    # transient identities as contention and retry. Stable abandoned metadata
+    # is recovered through an owned sibling claim and inode-checked quarantine;
+    # unsafe types remain fatal.
+    for attempt in 1 2 3; do
+        claim_status=0
+        fallback_gate_recovery_claims_are_clear "$gate_dir" || claim_status=$?
+        if (( claim_status != 0 )); then
+            return "$claim_status"
+        fi
+        if [[ -L "$gate_dir" || ( -e "$gate_dir" && ! -d "$gate_dir" ) ]]; then
+            echo "Scheduler fallback acquisition gate has an unsafe type: $gate_dir" >&2
+            return 2
+        fi
+        if mkdir "$gate_dir" 2>/dev/null; then
+            if ! exec 3< "$gate_dir"; then
+                rmdir "$gate_dir" 2>/dev/null || true
+                return 2
+            fi
+            claim_status=0
+            fallback_gate_recovery_claims_are_clear "$gate_dir" || claim_status=$?
+            if (( claim_status != 0 )); then
+                if [[ -d "$gate_dir" && "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                    rmdir "$gate_dir" 2>/dev/null || true
+                fi
+                exec 3<&-
+                return "$claim_status"
+            fi
+            fallback_acquisition_gate_dir="$gate_dir"
+            fallback_acquisition_gate_held=1
+            if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]] \
+                || ! (
+                    cd -P -- "$gate_dir" || exit 2
+                    [[ . -ef "$gate_descriptor_path" ]] || exit 2
+                    set -o noclobber
+                    printf '%s %s\n' "$$" "$current_start" > ./owner
+                ) 2>/dev/null \
+                || ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]] \
+                || ! read_fallback_lock_owner "$gate_dir/owner" \
+                || [[ "$fallback_owner_pid" != "$$" || "$fallback_owner_start" != "$current_start" ]] \
+                || ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                if [[ -d "$gate_dir" && "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                    (
+                        cd -P -- "$gate_dir" || exit 2
+                        [[ . -ef "$gate_descriptor_path" ]] || exit 2
+                        rm -f ./owner.pending ./owner 2>/dev/null || true
+                    ) || true
+                    if [[ -d "$gate_dir" && "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                        rmdir "$gate_dir" 2>/dev/null || true
+                    fi
+                fi
+                exec 3<&-
+                fallback_acquisition_gate_held=0
+                fallback_acquisition_gate_dir=""
+                echo "Cannot publish scheduler fallback acquisition gate ownership." >&2
+                return 2
+            fi
+            trap cleanup_scheduler_fallback_locks EXIT
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            return 0
+        fi
+
+        if [[ -L "$gate_dir" || ( -e "$gate_dir" && ! -d "$gate_dir" ) ]]; then
+            echo "Scheduler fallback acquisition gate has an unsafe type: $gate_dir" >&2
+            return 2
+        fi
+        if [[ ! -e "$gate_dir" ]]; then
+            continue
+        fi
+        if ! exec 3< "$gate_dir"; then
+            if [[ ! -e "$gate_dir" ]]; then
+                continue
+            fi
+            if [[ -L "$gate_dir" || ! -d "$gate_dir" ]]; then
+                echo "Scheduler fallback acquisition gate has an unsafe type: $gate_dir" >&2
+            else
+                echo "Cannot safely inspect scheduler fallback acquisition gate $gate_dir." >&2
+            fi
+            return 2
+        fi
+        if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+            saw_identity_churn=1
+            exec 3<&-
+            if [[ -L "$gate_dir" || ( -e "$gate_dir" && ! -d "$gate_dir" ) ]]; then
+                echo "Scheduler fallback acquisition gate has an unsafe type: $gate_dir" >&2
+                return 2
+            fi
+            continue
+        fi
+
+        fallback_owner_pid=""
+        fallback_owner_start=""
+        if read_fallback_lock_owner "$gate_dir/owner"; then
+            if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                saw_identity_churn=1
+                exec 3<&-
+                continue
+            fi
+            if kill -0 "$fallback_owner_pid" 2>/dev/null; then
+                if ! owner_start="$(process_start_identity "$fallback_owner_pid")"; then
+                    if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                        saw_identity_churn=1
+                        exec 3<&-
+                        continue
+                    fi
+                    exec 3<&-
+                    echo "Cannot verify scheduler fallback acquisition gate owner $fallback_owner_pid." >&2
+                    return 2
+                fi
+                if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                    saw_identity_churn=1
+                    exec 3<&-
+                    continue
+                fi
+                if [[ "$owner_start" == "$fallback_owner_start" ]]; then
+                    exec 3<&-
+                    return "$fallback_lock_busy_status"
+                fi
+            fi
+            if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                saw_identity_churn=1
+                exec 3<&-
+                continue
+            fi
+            stale_owner_pid="$fallback_owner_pid"
+            stale_owner_start="$fallback_owner_start"
+            retirement_status=0
+            retire_fallback_acquisition_gate \
+                "$gate_dir" owned "$stale_owner_pid" "$stale_owner_start" \
+                || retirement_status=$?
+            exec 3<&-
+            if (( retirement_status == 0 )); then
+                continue
+            fi
+            if (( retirement_status == fallback_lock_busy_status )); then
+                saw_identity_churn=1
+                continue
+            fi
+            return "$retirement_status"
+        fi
+        if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+            saw_identity_churn=1
+            exec 3<&-
+            continue
+        fi
+        invalid_owner=0
+        if [[ -L "$gate_dir/owner" \
+            || ( -e "$gate_dir/owner" && ! -f "$gate_dir/owner" ) \
+            || -L "$gate_dir/owner.pending" \
+            || ( -e "$gate_dir/owner.pending" && ! -f "$gate_dir/owner.pending" ) ]]; then
+            exec 3<&-
+            echo "Scheduler fallback acquisition gate has unsafe ownership metadata: $gate_dir" >&2
+            return 2
+        fi
+        if [[ -f "$gate_dir/owner" ]]; then
+            invalid_owner=1
+        fi
+        if ! modified_epoch="$(path_modified_epoch "$gate_dir")" \
+            || ! now_epoch="$(date '+%s')" \
+            || [[ ! "$now_epoch" =~ ^[0-9]+$ ]]; then
+            if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                saw_identity_churn=1
+                exec 3<&-
+                continue
+            fi
+            exec 3<&-
+            echo "Cannot verify scheduler fallback acquisition gate state at $gate_dir." >&2
+            return 2
+        fi
+        if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+            saw_identity_churn=1
+            exec 3<&-
+            continue
+        fi
+        if (( now_epoch >= modified_epoch \
+            && now_epoch - modified_epoch < fallback_owner_publish_grace_seconds )); then
+            exec 3<&-
+            return "$fallback_lock_busy_status"
+        fi
+        if (( now_epoch < modified_epoch )); then
+            exec 3<&-
+            echo "Cannot verify scheduler fallback acquisition gate age at $gate_dir." >&2
+            return 2
+        fi
+        retirement_status=0
+        if (( invalid_owner )); then
+            retire_fallback_acquisition_gate "$gate_dir" invalid || retirement_status=$?
+        else
+            retire_fallback_acquisition_gate "$gate_dir" ownerless || retirement_status=$?
+        fi
+        exec 3<&-
+        if (( retirement_status == 0 )); then
+            continue
+        fi
+        if (( retirement_status == fallback_lock_busy_status )); then
+            saw_identity_churn=1
+            continue
+        fi
+        return "$retirement_status"
+    done
+
+    if (( saw_identity_churn )); then
+        # Continuous identity churn is indistinguishable from ordinary
+        # contention; do not turn it into an operational failure.
+        return "$fallback_lock_busy_status"
+    fi
+    echo "Cannot create scheduler fallback acquisition gate $gate_dir." >&2
+    return 2
+}
+
+cleanup_fallback_lock() {
+    if [[ -z "$fallback_lock_dir" ]]; then
+        return 0
+    fi
+
+    local fallback_owner_pid="" fallback_owner_start="" current_start=""
+    local lock_descriptor_path="/dev/fd/5" release_status=0
+    current_start="$(process_start_identity "$$")" || true
+    if [[ ! -d "$fallback_lock_dir" ]] \
+        || ! [[ "$fallback_lock_dir" -ef "$lock_descriptor_path" ]] \
+        || ! (
+            cd -P -- "$fallback_lock_dir" || exit 2
+            [[ . -ef "$lock_descriptor_path" ]] || exit 2
+            fallback_owner_pid=""
+            fallback_owner_start=""
+            read_fallback_lock_owner ./owner \
+                && [[ "$fallback_owner_pid" == "$$" \
+                    && "$fallback_owner_start" == "$current_start" ]] \
+                || exit 2
+            rm -f ./owner || exit $?
+        ); then
+        release_status=2
+    elif ! [[ "$fallback_lock_dir" -ef "$lock_descriptor_path" ]] \
+        || ! rmdir "$fallback_lock_dir" 2>/dev/null; then
+        release_status=2
+    fi
+    exec 5<&- || true
+    if (( release_status != 0 )); then
+        echo "Cannot safely release scheduler fallback lock $fallback_lock_dir; inspect it manually." >&2
+    fi
+    fallback_lock_dir=""
+    return "$release_status"
+}
+
+acquire_fallback_lock() {
+    local lock_dir="${log_file}.lock.d"
+    local attempt current_start owner_path owner_temp
+    local publication_status retirement_status stale_status
+    local lock_descriptor_path="/dev/fd/5"
+    local fallback_owner_pid="" fallback_owner_start=""
+    local saw_identity_churn=0
+    if ! current_start="$(process_start_identity "$$")"; then
+        echo "Cannot determine scheduler process start identity for fallback locking." >&2
+        return 2
+    fi
+
+    if [[ -L "$lock_dir" || ( -e "$lock_dir" && ! -d "$lock_dir" ) ]]; then
+        echo "Scheduler fallback lock path must be a regular directory, not a symbolic link or other file: $lock_dir" >&2
+        return 2
+    fi
+
+    for attempt in 1 2 3; do
+        if mkdir "$lock_dir" 2>/dev/null; then
+            fallback_lock_dir="$lock_dir"
+            if ! exec 5< "$fallback_lock_dir"; then
+                rmdir "$fallback_lock_dir" 2>/dev/null || true
+                fallback_lock_dir=""
+                echo "Cannot open scheduler fallback lock directory for ownership publication." >&2
+                return 2
+            fi
+            # Linux exposes an opened directory as a traversable symlink below
+            # /dev/fd, but macOS exposes a descriptor vnode whose children
+            # cannot be looked up. Publish through the private pathname and use
+            # the opened descriptor only as a stable identity anchor around
+            # every pathname operation.
+            owner_path="$fallback_lock_dir/owner"
+            owner_temp="$fallback_lock_dir/owner.pending"
+            publication_status=0
+            if ! [[ "$fallback_lock_dir" -ef "$lock_descriptor_path" ]]; then
+                publication_status=2
+            elif ! (
+                cd -P -- "$fallback_lock_dir" || exit 2
+                [[ . -ef "$lock_descriptor_path" ]] || exit 2
+                set -o noclobber
+                printf '%s %s\n' "$$" "$current_start" > ./owner.pending
+                [[ . -ef "$lock_descriptor_path" ]] || exit 2
+                mv ./owner.pending ./owner
+            ) 2>/dev/null; then
+                publication_status=2
+            elif ! [[ "$fallback_lock_dir" -ef "$lock_descriptor_path" ]]; then
+                publication_status=2
+            elif ! exec 4< "$owner_path"; then
+                publication_status=2
+            else
+                validate_open_regular_file 4 "$owner_path" "fallback lock owner" || publication_status=$?
+                if (( publication_status == 0 )); then
+                    fallback_owner_pid=""
+                    fallback_owner_start=""
+                    if ! read_fallback_lock_owner "$owner_path" \
+                        || [[ "$fallback_owner_pid" != "$$" \
+                            || "$fallback_owner_start" != "$current_start" ]] \
+                        || ! [[ "$fallback_lock_dir" -ef "$lock_descriptor_path" ]]; then
+                        publication_status=2
+                    fi
+                fi
+                exec 4<&-
+            fi
+            if (( publication_status != 0 )); then
+                # Remove files only while the pathname still names the opened
+                # directory; otherwise leave a concurrently substituted path
+                # untouched for manual inspection.
+                if [[ -d "$fallback_lock_dir" ]] \
+                    && [[ "$fallback_lock_dir" -ef "$lock_descriptor_path" ]]; then
+                    (
+                        cd -P -- "$fallback_lock_dir" || exit 2
+                        [[ . -ef "$lock_descriptor_path" ]] || exit 2
+                        rm -f ./owner.pending ./owner 2>/dev/null || true
+                    ) || true
+                    if [[ -d "$fallback_lock_dir" ]] \
+                        && [[ "$fallback_lock_dir" -ef "$lock_descriptor_path" ]]; then
+                        rmdir "$fallback_lock_dir" 2>/dev/null || true
+                    fi
+                fi
+                exec 5<&-
+                fallback_lock_dir=""
+                echo "Cannot publish scheduler fallback lock ownership metadata." >&2
+                return 2
+            fi
+            trap cleanup_scheduler_fallback_locks EXIT
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            return 0
+        fi
+
+        if [[ -L "$lock_dir" || ( -e "$lock_dir" && ! -d "$lock_dir" ) ]]; then
+            echo "Scheduler fallback lock path must remain a regular directory: $lock_dir" >&2
+            return 2
+        fi
+        if [[ ! -e "$lock_dir" ]]; then
+            continue
+        fi
+
+        # Keep the directory we inspect open as an identity anchor. A competing
+        # stale-lock recovery can replace the pathname between the owner check
+        # and retirement; never treat that replacement as the abandoned
+        # directory whose metadata was inspected.
+        if ! exec 5< "$lock_dir"; then
+            if [[ ! -e "$lock_dir" ]]; then
+                continue
+            fi
+            if [[ -L "$lock_dir" || ! -d "$lock_dir" ]]; then
+                echo "Scheduler fallback lock path must remain a regular directory: $lock_dir" >&2
+                return 2
+            fi
+            echo "Cannot open scheduler fallback lock directory for stale-lock inspection." >&2
+            return 2
+        fi
+        if ! [[ "$lock_dir" -ef "$lock_descriptor_path" ]]; then
+            saw_identity_churn=1
+            exec 5<&-
+            if [[ -L "$lock_dir" || ( -e "$lock_dir" && ! -d "$lock_dir" ) ]]; then
+                echo "Scheduler fallback lock path must remain a regular directory: $lock_dir" >&2
+                return 2
+            fi
+            continue
+        fi
+
+        stale_status=0
+        fallback_lock_is_stale "$lock_dir" || stale_status=$?
+        if (( stale_status != 0 )); then
+            if ! [[ "$lock_dir" -ef "$lock_descriptor_path" ]]; then
+                saw_identity_churn=1
+                exec 5<&-
+                if [[ -L "$lock_dir" || ( -e "$lock_dir" && ! -d "$lock_dir" ) ]]; then
+                    echo "Scheduler fallback lock path must remain a regular directory: $lock_dir" >&2
+                    return 2
+                fi
+                continue
+            fi
+            exec 5<&-
+            return "$stale_status"
+        fi
+        if ! [[ "$lock_dir" -ef "$lock_descriptor_path" ]]; then
+            saw_identity_churn=1
+            exec 5<&-
+            continue
+        fi
+
+        # Every conforming contender holds the sibling acquisition gate here,
+        # so no other contender can retire or recreate the reusable pathname.
+        # Anchor all inner cleanup to the opened directory anyway: if a
+        # nonconforming process replaces the pathname, relative operations
+        # still touch only the stale directory whose identity was inspected.
+        retirement_status=0
+        (
+            cd -P -- "$lock_dir" || exit 2
+            [[ . -ef "$lock_descriptor_path" ]] || exit 2
+            rm -f ./owner ./pid ./owner.pending ./owner.[0-9]* 2>/dev/null || true
+            if [[ -L ./.stale-recovery \
+                || ( -e ./.stale-recovery && ! -d ./.stale-recovery ) ]]; then
+                exit 2
+            fi
+            if [[ -d ./.stale-recovery ]]; then
+                rm -f ./.stale-recovery/owner ./.stale-recovery/owner.pending 2>/dev/null || true
+                rmdir ./.stale-recovery 2>/dev/null || exit 2
+            fi
+        ) || retirement_status=$?
+        if (( retirement_status != 0 )); then
+            if ! [[ "$lock_dir" -ef "$lock_descriptor_path" ]]; then
+                saw_identity_churn=1
+                exec 5<&-
+                if [[ -L "$lock_dir" || ( -e "$lock_dir" && ! -d "$lock_dir" ) ]]; then
+                    echo "Scheduler fallback lock path must remain a regular directory: $lock_dir" >&2
+                    return 2
+                fi
+                continue
+            fi
+            exec 5<&-
+            echo "Cannot safely retire stale scheduler fallback lock $lock_dir; inspect it manually." >&2
+            return 2
+        fi
+        if ! [[ "$lock_dir" -ef "$lock_descriptor_path" ]]; then
+            saw_identity_churn=1
+            exec 5<&-
+            if [[ -L "$lock_dir" || ( -e "$lock_dir" && ! -d "$lock_dir" ) ]]; then
+                echo "Scheduler fallback lock path must remain a regular directory: $lock_dir" >&2
+                return 2
+            fi
+            continue
+        fi
+        if ! rmdir "$lock_dir" 2>/dev/null; then
+            if ! [[ "$lock_dir" -ef "$lock_descriptor_path" ]]; then
+                saw_identity_churn=1
+                exec 5<&-
+                if [[ -L "$lock_dir" || ( -e "$lock_dir" && ! -d "$lock_dir" ) ]]; then
+                    echo "Scheduler fallback lock path must remain a regular directory: $lock_dir" >&2
+                    return 2
+                fi
+                continue
+            fi
+            exec 5<&-
+            echo "Cannot remove stale scheduler fallback lock $lock_dir after serialized recovery; inspect it manually." >&2
+            return 2
+        fi
+        exec 5<&-
+    done
+    if (( saw_identity_churn )); then
+        return "$fallback_lock_busy_status"
+    fi
+    echo "Cannot create scheduler fallback lock $lock_dir." >&2
+    return 2
+}
+
+rotate_log_if_needed() {
+    if [[ ! "$log_max_bytes" =~ ^[1-9][0-9]*$ ]]; then
+        echo "LEVERAGED_TRADER_LOG_MAX_BYTES must be a positive integer." >&2
+        return 2
+    fi
+
+    local log_size
+    secure_existing_regular_file "$log_file" "log" || return $?
+    secure_existing_regular_file "${log_file}.1" "backup log" || return $?
+    if [[ -f "$log_file" ]]; then
+        log_size="$(wc -c < "$log_file")"
+        if (( log_size >= log_max_bytes )); then
+            mv -f "$log_file" "${log_file}.1"
+        fi
+    fi
+}
+
+open_log_for_append() {
+    local validation_status=0
+    create_private_regular_file "$log_file" "log" || return $?
+    exec 8>> "$log_file"
+    validate_open_regular_file 8 "$log_file" "log" || validation_status=$?
+    if (( validation_status != 0 )); then
+        exec 8>&-
+        return "$validation_status"
+    fi
+}
+
+flock_conflict_exit_code_capability() {
+    local help_output help_status=0
+    help_output="$(flock --help 2>&1)" || help_status=$?
+    if [[ "$help_output" == *"--conflict-exit-code"* ]]; then
+        return 0
+    fi
+    # BusyBox and other reduced implementations advertise a flock usage
+    # grammar but omit util-linux's -E option. Select the portable lock before
+    # opening the flock lock file instead of mistaking an option error for a
+    # genuine acquisition failure.
+    if [[ "$help_output" == *"Usage:"* || "$help_output" == *"usage:"* ]]; then
+        return 1
+    fi
+    # An unrecognizable or failed help probe is not evidence that flock lacks
+    # -E. Preserve fail-closed behavior by attempting the real acquisition;
+    # any resulting error remains fatal rather than silently changing locks.
+    return 2
+}
+
+prepare_scheduler_logging() {
+    local normalized_log_file log_directory log_name
+    case "$log_file" in
+        */|.|*/.)
+            echo "Scheduler log path must name a file, not a directory spelling: $log_file" >&2
+            return 2
+            ;;
+    esac
+    if ! normalized_log_file="$(absolute_lexical_path "$log_file")"; then
+        echo "Cannot normalize scheduler log path: $log_file" >&2
+        return 2
+    fi
+    log_name="${normalized_log_file##*/}"
+    if [[ -z "$log_name" || "$log_name" == "." || "$log_name" == ".." ]]; then
+        echo "Scheduler log path must name a regular file: $log_file" >&2
+        return 2
+    fi
+    log_directory="${normalized_log_file%/*}"
+    if [[ -z "$log_directory" ]]; then
+        log_directory="/"
+    fi
+    secure_private_directory "$log_directory" "log" || return $?
+    if [[ "$secured_private_directory" == "/" ]]; then
+        log_file="/$log_name"
+    else
+        log_file="$secured_private_directory/$log_name"
+    fi
+
+    local flock_capability_status=1
+    if command -v flock >/dev/null 2>&1; then
+        flock_capability_status=0
+        flock_conflict_exit_code_capability || flock_capability_status=$?
+    fi
+    if (( flock_capability_status != 1 )); then
+        # Hold one automatically released descriptor lock across rotation and
+        # the complete append. The lock is opened read-only so it cannot
+        # truncate an unrelated target even if the path changes concurrently.
+        # Use a fixed descriptor for Bash 3 compatibility.
+        create_private_regular_file "${log_file}.lock" "lock" || return $?
+        exec 9< "${log_file}.lock"
+        local lock_validation_status=0
+        validate_open_regular_file 9 "${log_file}.lock" "lock" || lock_validation_status=$?
+        if (( lock_validation_status != 0 )); then
+            exec 9<&-
+            return "$lock_validation_status"
+        fi
+        local flock_status=0
+        flock -E "$fallback_lock_busy_status" -n 9 || flock_status=$?
+        if (( flock_status == fallback_lock_busy_status )); then
+            return "$fallback_lock_busy_status"
+        fi
+        if (( flock_status != 0 )); then
+            echo "Scheduler flock failed with status $flock_status." >&2
+            return "$flock_status"
+        fi
+        scheduler_lock_backend="flock"
+        scheduler_logging_ready=1
+        return 0
+    fi
+
+    # macOS and other systems without flock use a PID-and-process-start
+    # directory lock. A matching live owner makes this minute a no-op; an
+    # abandoned or PID-reused lock is recovered while a short-lived sibling
+    # gate serializes every conforming creator and recovery contender.
+    local fallback_status=0 gate_release_status=0
+    acquire_fallback_acquisition_gate || fallback_status=$?
+    if (( fallback_status != 0 )); then
+        return "$fallback_status"
+    fi
+    acquire_fallback_lock || fallback_status=$?
+    release_fallback_acquisition_gate || gate_release_status=$?
+    if (( gate_release_status != 0 )); then
+        cleanup_fallback_lock || true
+        return "$gate_release_status"
+    fi
+    if (( fallback_status == fallback_lock_busy_status )); then
+        return "$fallback_lock_busy_status"
+    fi
+    if (( fallback_status != 0 )); then
+        return "$fallback_status"
+    fi
+    scheduler_lock_backend="fallback"
+    scheduler_logging_ready=1
+}
+
+append_scheduler_preflight_failure() {
+    local message="$1"
+    local failure_status="$2"
+    local logging_status=0
+
+    if [[ -z "$message" ]]; then
+        message="Scheduler preflight failed without diagnostic output."
+    fi
+    printf '%s\n' "$message" >&2
+    if (( ! scheduler_logging_ready )); then
+        return 0
+    fi
+
+    rotate_log_if_needed || logging_status=$?
+    if (( logging_status == 0 )); then
+        open_log_for_append || logging_status=$?
+    fi
+    if (( logging_status == 0 )); then
+        printf 'Scheduler preflight failed with status %s:\n%s\n' "$failure_status" "$message" >&8
+        exec 8>&-
+        return 0
+    fi
+
+    echo "Unable to append the scheduler preflight failure to $log_file (status $logging_status)." >&2
+    return "$logging_status"
+}
+
+report_scheduler_preflight_failure() {
+    local message="$1"
+    local failure_status="$2"
+    local logging_status=0
+
+    # Preflight intentionally runs without the execution lock. Acquire it only
+    # long enough to append the diagnostic; contention must not hide the
+    # original failure from cron's standard error.
+    if [[ -n "$log_file" ]] && (( ! scheduler_logging_ready )); then
+        prepare_scheduler_logging || logging_status=$?
+    fi
+    append_scheduler_preflight_failure "$message" "$failure_status" || true
+    if (( logging_status != 0 && logging_status != fallback_lock_busy_status )); then
+        echo "Unable to prepare scheduler logging for the preflight failure (status $logging_status)." >&2
+    fi
+}
+
+exec_scheduled_runner() {
+    if [[ -n "$runner_bash_bin" ]]; then
+        exec "$runner_bash_bin" "$runner" "$@"
+    fi
+    exec "$runner" "$@"
+}
+
+run_scheduled_command() {
+    if [[ -z "$log_file" ]]; then
+        exec_scheduled_runner "$@"
+    fi
+    if (( ! scheduler_logging_ready )); then
+        echo "Scheduler logging lock was not prepared before a due command." >&2
+        return 2
+    fi
+
+    rotate_log_if_needed || return $?
+    open_log_for_append || return $?
+    if [[ "$scheduler_lock_backend" == "flock" ]]; then
+        exec_scheduled_runner "$@" >&8 2>&1
+    fi
+
+    # Keep the published PID and process-start identity alive for the complete
+    # command.  Spawning the runner as a child would let a SIGKILL of this
+    # wrapper leave that child mutating state after the next minute recovered
+    # the apparently abandoned lock.  A successful exec preserves both owner
+    # fields across the runner and its final CLI exec.  The production runner
+    # performs only a completed, read-only environment check before that exec;
+    # it never leaves a side-effecting trader as a child of the lock owner. The
+    # directory intentionally remains after exit and the next due invocation
+    # atomically recovers it once this owner is no longer alive.
+    trap - EXIT INT TERM
+    exec 5<&-
+    exec_scheduled_runner "$@" >&8 2>&1
+}
+
+schedule_preflight_not_due="not_due"
+if [[ -n "${LEVERAGED_TRADER_SCHEDULE_NOW+x}" ]]; then
+    schedule_now="$LEVERAGED_TRADER_SCHEDULE_NOW"
+else
+    # GNU/BSD date can silently interpret an unresolvable TZ as UTC (notably
+    # when an inherited TZDIR points at missing zoneinfo files).  Use the
+    # locked project's Python and its pinned tzdata package instead.  Resetting
+    # TZPATH to empty deliberately prevents system or inherited zoneinfo paths
+    # from changing the schedule. -I ignores inherited Python settings and the
+    # user site; the validated project site remains available for pinned
+    # tzdata. A missing/stale project environment therefore fails loudly
+    # instead of running the trading workflow at the wrong wall clock.
+    determine_schedule_now() {
+        local schedule_repo_dir schedule_project_environment schedule_python schedule_python_entry
+        local schedule_clock_snapshot schedule_epoch schedule_utc_weekday
+        local schedule_utc_hour schedule_utc_minute schedule_utc_hhmm
+        local schedule_lock_line schedule_previous_lock_line=""
+        local schedule_tzdata_package_count=0
+        local schedule_coarse_gate_tzdata_matches=0
+        local schedule_uv_bin schedule_sync_status schedule_sync_output
+        local resolved_schedule_now resolved_weekday resolved_hour resolved_minute resolved_hhmm
+
+        schedule_repo_dir="${script_dir%/*}"
+        schedule_repo_dir="${schedule_repo_dir%/*}"
+        schedule_project_environment="$schedule_repo_dir/.venv"
+        schedule_python_entry="$schedule_project_environment/bin/python"
+        require_control_free_path "$schedule_python_entry" "project Python path" || return $?
+        if [[ ! -f "$schedule_python_entry" || ! -x "$schedule_python_entry" ]]; then
+            echo "Locked project environment is missing the Python executable needed for America/New_York scheduling: $schedule_python_entry" >&2
+            echo "Run 'cd $schedule_repo_dir && uv sync --locked' before scheduled operation." >&2
+            return 2
+        fi
+        schedule_python="$(
+            runtime_security_validate_trusted_executable_entry "$schedule_python_entry" "project Python executable"
+        )" || return $?
+
+        # Freeze the invocation instant before any potentially slow import-tree
+        # or locked-environment scan. -S prevents site initialization, including
+        # every virtual-environment .pth file and sitecustomize module, while
+        # `time` is a built-in module. The frozen epoch is converted with pinned
+        # tzdata only after the complete site tree has been validated below.
+        schedule_sync_status=0
+        schedule_clock_snapshot="$(
+            "$schedule_python" -I -S -c \
+                'import time
+epoch = time.time_ns() // 1_000_000_000
+utc = time.gmtime(epoch)
+print(f"{epoch} {utc.tm_wday + 1} {utc.tm_hour:02d}:{utc.tm_min:02d}")' 2>&1
+        )" || schedule_sync_status=$?
+        if (( schedule_sync_status != 0 )); then
+            if [[ -n "$schedule_clock_snapshot" ]]; then
+                printf '%s\n' "$schedule_clock_snapshot" >&2
+            fi
+            echo "Unable to snapshot the current time from the locked project Python." >&2
+            return 2
+        fi
+        if [[ ! "$schedule_clock_snapshot" =~ ^([0-9]+)[[:space:]]+([1-7])[[:space:]]+([0-2][0-9]):([0-5][0-9])$ ]]; then
+            echo "The locked project Python returned invalid UTC clock metadata: $schedule_clock_snapshot" >&2
+            return 2
+        fi
+        schedule_epoch="${BASH_REMATCH[1]}"
+        schedule_utc_weekday="${BASH_REMATCH[2]}"
+        schedule_utc_hour="${BASH_REMATCH[3]}"
+        schedule_utc_minute="${BASH_REMATCH[4]}"
+        if (( 10#$schedule_utc_hour > 23 )); then
+            echo "The locked project Python returned an invalid UTC hour: $schedule_utc_hour" >&2
+            return 2
+        fi
+
+        # tzdata 2025.3 defines New York as UTC-4/-5 for every nonnegative Unix
+        # epoch: 08:45 ET is 12:45 or 13:45 UTC, while 09:30-16:00 ET is within
+        # 13:30-21:00 UTC. Enable that fast rejection only while the validated
+        # lockfile still pins the audited release. A lock update disables the
+        # shortcut and falls through to the exact pinned conversion below,
+        # preventing future timezone-rule changes from creating false skips.
+        if runtime_security_validate_trusted_regular_file \
+            "$schedule_repo_dir/uv.lock" \
+            "uv lockfile" >/dev/null 2>&1; then
+            while IFS= read -r schedule_lock_line || [[ -n "$schedule_lock_line" ]]; do
+                if [[ "$schedule_lock_line" == 'name = "tzdata"' ]]; then
+                    schedule_tzdata_package_count=$((schedule_tzdata_package_count + 1))
+                fi
+                if [[ "$schedule_previous_lock_line" == 'name = "tzdata"' \
+                    && "$schedule_lock_line" == 'version = "2025.3"' ]]; then
+                    schedule_coarse_gate_tzdata_matches=$((schedule_coarse_gate_tzdata_matches + 1))
+                fi
+                schedule_previous_lock_line="$schedule_lock_line"
+            done < "$schedule_repo_dir/uv.lock"
+        fi
+        schedule_utc_hhmm="$schedule_utc_hour$schedule_utc_minute"
+        if (( schedule_tzdata_package_count == 1 && schedule_coarse_gate_tzdata_matches == 1 )) \
+            && { (( schedule_utc_weekday > 5 )) \
+            || [[ "$schedule_utc_hhmm" != "1245" \
+                && ( "$schedule_utc_hhmm" < "1330" || "$schedule_utc_hhmm" > "2100" ) ]]; }; then
+            printf '%s' "$schedule_preflight_not_due"
+            return 0
+        fi
+
+        # -I still imports site and processes the virtual environment's .pth
+        # files and sitecustomize module. Validate the complete import tree
+        # before enabling site for the timezone conversion, just as the
+        # production runner does immediately before its module exec.
+        runtime_security_validate_leveraged_trader_import_paths \
+            "$schedule_repo_dir" \
+            "$schedule_project_environment" \
+            "$schedule_python" || return $?
+
+        if [[ -n "${UV_BIN:-}" ]]; then
+            schedule_uv_bin="$UV_BIN"
+        elif command -v uv >/dev/null 2>&1; then
+            schedule_uv_bin="$(command -v uv)"
+        elif [[ -n "${HOME:-}" && -x "$HOME/.local/bin/uv" ]]; then
+            schedule_uv_bin="$HOME/.local/bin/uv"
+        else
+            echo "Unable to find uv for the locked-environment scheduling check. Install uv or set UV_BIN to its executable path." >&2
+            return 127
+        fi
+        require_control_free_path "$schedule_uv_bin" "uv executable path" || return $?
+        schedule_uv_bin="$(
+            runtime_security_validate_trusted_executable "$schedule_uv_bin" "uv executable"
+        )" || return $?
+
+        # The Python executable can exist while its packages (including tzdata)
+        # are stale relative to uv.lock. Verify without modifying the environment
+        # before using those packages for an exact due/not-due decision. A due
+        # command is checked again by run-leveraged-trader while holding the
+        # execution lock.
+        schedule_sync_status=0
+        schedule_sync_output="$(
+            (
+                cd -- "$schedule_repo_dir" || exit $?
+                runtime_security_clear_uv_environment
+                UV_PROJECT_ENVIRONMENT="$schedule_project_environment" \
+                    "$schedule_uv_bin" sync \
+                    --project "$schedule_repo_dir" \
+                    --directory "$schedule_repo_dir" \
+                    --locked \
+                    --check \
+                    --quiet
+            ) 2>&1
+        )" || schedule_sync_status=$?
+        if (( schedule_sync_status != 0 )); then
+            if [[ -n "$schedule_sync_output" ]]; then
+                printf '%s\n' "$schedule_sync_output" >&2
+            fi
+            echo "Locked project environment is not synchronized with pyproject.toml and uv.lock; no scheduled command was selected." >&2
+            echo "Run 'cd $schedule_repo_dir && uv sync --locked' before scheduled operation." >&2
+            return "$schedule_sync_status"
+        fi
+
+        # Verify the environment entry again after uv inspected it. The entry's
+        # non-replaceable ancestry makes the sampled clock executable stable.
+        schedule_python="$(
+            runtime_security_validate_trusted_executable_entry "$schedule_python_entry" "project Python executable"
+        )" || return $?
+
+        # Convert the already-frozen instant only after the site tree is safe and
+        # the installed packages are proven to match uv.lock. An 08:45 invocation
+        # remains the 08:45 invocation even if either preflight ends at 08:46.
+        schedule_sync_status=0
+        resolved_schedule_now="$("$schedule_python" -I -c '
+from datetime import datetime
+import sys
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, reset_tzpath
+
+reset_tzpath(())
+ZoneInfo.clear_cache()
+try:
+    eastern = ZoneInfo("America/New_York")
+except ZoneInfoNotFoundError:
+    sys.stderr.write(
+        "The locked project environment does not contain America/New_York tzdata. "
+        "Run uv sync --locked before scheduled operation.\n"
+    )
+    raise SystemExit(2)
+sys.stdout.write(datetime.fromtimestamp(int(sys.argv[1]), eastern).strftime("%u %H:%M"))
+' "$schedule_epoch" 2>&1)" || schedule_sync_status=$?
+        if (( schedule_sync_status != 0 )); then
+            if [[ -n "$resolved_schedule_now" ]]; then
+                printf '%s\n' "$resolved_schedule_now" >&2
+            fi
+            echo "Unable to determine the current America/New_York schedule time from the locked project environment." >&2
+            return 2
+        fi
+        if [[ ! "$resolved_schedule_now" =~ ^[1-7][[:space:]]+[0-2][0-9]:[0-5][0-9]$ ]]; then
+            echo "The locked project Python returned invalid America/New_York clock output: $resolved_schedule_now" >&2
+            return 2
+        fi
+        resolved_weekday="${resolved_schedule_now%% *}"
+        resolved_hour="${resolved_schedule_now#* }"
+        resolved_minute="${resolved_hour#*:}"
+        resolved_hour="${resolved_hour%%:*}"
+        if (( 10#$resolved_hour > 23 )); then
+            echo "The locked project Python returned an invalid America/New_York hour: $resolved_hour" >&2
+            return 2
+        fi
+        resolved_hhmm="$resolved_hour$resolved_minute"
+        if (( resolved_weekday > 5 )) \
+            || [[ "$resolved_hhmm" != "0845" \
+                && ( "$resolved_hhmm" < "0930" || "$resolved_hhmm" > "1600" ) ]]; then
+            printf '%s' "$schedule_preflight_not_due"
+            return 0
+        fi
+
+        # ASCII file-separator cannot occur in either validated executable path
+        # or the fixed-format clock output, so return both values without an
+        # extra temporary file.
+        printf '%s\034%s' "$schedule_uv_bin" "$resolved_schedule_now"
+    }
+
+    schedule_preflight_status=0
+    schedule_preflight_output="$(determine_schedule_now 2>&1)" || schedule_preflight_status=$?
+    if (( schedule_preflight_status != 0 )); then
+        report_scheduler_preflight_failure "$schedule_preflight_output" "$schedule_preflight_status"
+        exit "$schedule_preflight_status"
+    fi
+    if [[ "$schedule_preflight_output" == "$schedule_preflight_not_due" ]]; then
+        exit 0
+    fi
+    schedule_preflight_delimiter=$'\034'
+    if [[ "$schedule_preflight_output" != *"$schedule_preflight_delimiter"* ]]; then
+        report_scheduler_preflight_failure \
+            "Scheduler preflight returned malformed clock metadata." \
+            2
+        exit 2
+    fi
+    schedule_uv_bin="${schedule_preflight_output%%"$schedule_preflight_delimiter"*}"
+    schedule_now="${schedule_preflight_output#*"$schedule_preflight_delimiter"}"
+    # Reuse the exact checked uv executable if this minute proceeds to the
+    # production runner, rather than resolving PATH a second time.
+    export UV_BIN="$schedule_uv_bin"
+fi
+
+if [[ ! "$schedule_now" =~ ^([1-7])[[:space:]]+([0-2][0-9]):([0-5][0-9])$ ]]; then
+    echo "Invalid scheduled time '$schedule_now'; expected '<ISO weekday 1-7> <HH:MM>'." >&2
+    exit 2
+fi
+weekday="${BASH_REMATCH[1]}"
+hour="${BASH_REMATCH[2]}"
+minute="${BASH_REMATCH[3]}"
+if (( 10#$hour > 23 )); then
+    echo "Invalid scheduled hour '$hour'; expected 00 through 23." >&2
+    exit 2
+fi
+
+if (( weekday > 5 )); then
+    exit 0
+fi
+
+hhmm="$hour$minute"
+scheduled_arguments=()
+if [[ "$hhmm" == "0845" ]]; then
+    scheduled_arguments=(
+        --require-workflow-source-success
+        --alpaca-submit-buy-orders
+        --alpaca-submit-sell-orders
+    )
+elif [[ "$hhmm" > "0929" && "$hhmm" < "1601" ]]; then
+    scheduled_arguments=(--reconcile-only --alpaca-submit-sell-orders)
+else
+    exit 0
+fi
+
+# Non-due invocations never acquire the execution/log lock. This keeps a slow
+# 08:44 preflight from occupying the one 08:45 full-workflow opportunity.
+logging_prepare_status=0
+if [[ -n "$log_file" ]]; then
+    prepare_scheduler_logging || logging_prepare_status=$?
+    if (( logging_prepare_status == fallback_lock_busy_status )); then
+        exit 0
+    fi
+    if (( logging_prepare_status != 0 )); then
+        exit "$logging_prepare_status"
+    fi
+fi
+run_scheduled_command "${scheduled_arguments[@]}"

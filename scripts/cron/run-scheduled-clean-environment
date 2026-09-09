@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+# The installer authenticates this source as inert data before Bash evaluates
+# it. Startup hooks have already been removed by the empty cron environment;
+# keep direct test invocations from reintroducing either hook.
+unset BASH_ENV ENV
+
+if (( $# != 5 )); then
+    echo "The installed scheduler bootstrap requires validated Bash, uv, and SHA-256 settings." >&2
+    exit 2
+fi
+
+bash_bin=$1
+uv_bin=$2
+sha256_bin=$3
+sha256_mode=$4
+runtime_security_sha256=$5
+launcher_origin="${LEVERAGED_TRADER_AUTHENTICATED_LAUNCHER_PATH:-$0}"
+unset LEVERAGED_TRADER_AUTHENTICATED_LAUNCHER_PATH
+
+contains_ascii_control() {
+    local LC_ALL=C
+    [[ "$1" =~ [[:cntrl:]] ]]
+}
+
+require_control_free_path() {
+    local value="$1"
+    local description="$2"
+    if contains_ascii_control "$value"; then
+        echo "Scheduler $description must not contain ASCII control characters." >&2
+        return 2
+    fi
+}
+
+require_absolute_path() {
+    local value="$1"
+    local description="$2"
+    require_control_free_path "$value" "$description" || return $?
+    if [[ "$value" != /* ]]; then
+        echo "Scheduler $description must be absolute: $value" >&2
+        return 2
+    fi
+}
+
+absolute_lexical_path() {
+    local input="$1"
+    local component normalized=""
+    local component_count=0
+    local -a input_components=()
+    local -a normalized_components=()
+
+    require_control_free_path "$input" "runtime path" || return $?
+    if [[ "$input" != /* ]]; then
+        input="$PWD/$input"
+    fi
+    IFS='/' read -r -a input_components <<< "$input"
+    for component in "${input_components[@]}"; do
+        case "$component" in
+            ""|.)
+                ;;
+            ..)
+                echo "Scheduler runtime paths must not contain '..' components: $input" >&2
+                return 2
+                ;;
+            *)
+                normalized_components[component_count]="$component"
+                component_count=$((component_count + 1))
+                ;;
+        esac
+    done
+    if (( component_count == 0 )); then
+        printf '/\n'
+        return 0
+    fi
+    for component in "${normalized_components[@]}"; do
+        normalized="$normalized/$component"
+    done
+    printf '%s\n' "$normalized"
+}
+
+sha256_text() {
+    local content="$1"
+    local output digest
+
+    case "$sha256_mode" in
+        plain)
+            output="$(printf '%s' "$content" | "$sha256_bin")" || return $?
+            ;;
+        shasum)
+            output="$(printf '%s' "$content" | "$sha256_bin" -a 256)" || return $?
+            ;;
+        *)
+            echo "The installed scheduler bootstrap has an invalid SHA-256 mode." >&2
+            return 2
+            ;;
+    esac
+    if [[ ! "$output" =~ ^([0-9A-Fa-f]{64})[[:space:]][[:space:]]*-$ ]]; then
+        echo "The scheduler SHA-256 executable returned malformed output." >&2
+        return 2
+    fi
+    digest="${BASH_REMATCH[1]}"
+    printf '%s\n' "$digest"
+}
+
+ascii_byte_length() {
+    local LC_ALL=C
+    printf '%s\n' "${#1}"
+}
+
+file_byte_size() {
+    local path="$1"
+    local size
+    if size="$("$runtime_security_stat_bin" -Lc '%s' -- "$path" 2>/dev/null)"; then
+        :
+    elif size="$("$runtime_security_stat_bin" -Lf '%z' "$path" 2>/dev/null)"; then
+        :
+    else
+        return 1
+    fi
+    [[ "$size" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$size"
+}
+
+require_absolute_path "$launcher_origin" "launcher path" || exit $?
+require_absolute_path "$bash_bin" "Bash executable path" || exit $?
+require_absolute_path "$uv_bin" "uv executable path" || exit $?
+require_absolute_path "$sha256_bin" "SHA-256 executable path" || exit $?
+if [[ ! "$runtime_security_sha256" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+    echo "The installed scheduler bootstrap has an invalid runtime-security digest." >&2
+    exit 2
+fi
+
+script_path="$(absolute_lexical_path "$launcher_origin")" || exit $?
+script_dir="${script_path%/*}"
+if [[ -z "$script_dir" ]]; then
+    script_dir="/"
+fi
+runtime_security_file="$script_dir/runtime-security"
+scheduler_path="$script_dir/run-scheduled"
+
+# Read the helper as data, including all trailing newlines. A successful
+# NUL-delimited read means the file contains a byte Bash cannot represent and
+# must be rejected. Only authenticated text is sourced.
+exec 7< "$runtime_security_file" || {
+    echo "Unable to open scheduler runtime security checks: $runtime_security_file" >&2
+    exit 2
+}
+if [[ ! -f /dev/fd/7 || ! "$runtime_security_file" -ef /dev/fd/7 ]]; then
+    exec 7<&-
+    echo "Scheduler runtime security file changed while it was being opened: $runtime_security_file" >&2
+    exit 2
+fi
+runtime_security_source=""
+if IFS= read -r -d '' runtime_security_source <&7; then
+    exec 7<&-
+    echo "Scheduler runtime security checks must not contain NUL bytes." >&2
+    exit 2
+fi
+if [[ ! "$runtime_security_file" -ef /dev/fd/7 ]]; then
+    exec 7<&-
+    echo "Scheduler runtime security file changed while it was being read: $runtime_security_file" >&2
+    exit 2
+fi
+exec 7<&-
+actual_runtime_security_sha256="$(sha256_text "$runtime_security_source")" || exit $?
+if [[ "$actual_runtime_security_sha256" != "$runtime_security_sha256" ]]; then
+    echo "Scheduler runtime security checks changed after crontab installation; reinstall the crontab." >&2
+    exit 2
+fi
+
+source_status=0
+# The source is an authenticated in-memory snapshot, not the mutable checkout
+# path. Process substitution preserves the exact final byte instead of adding
+# the newline that a here-string would append.
+builtin source /dev/stdin < <(printf '%s' "$runtime_security_source") || source_status=$?
+unset runtime_security_source actual_runtime_security_sha256
+if (( source_status != 0 )); then
+    exit "$source_status"
+fi
+unset source_status
+
+# Now that the authenticated helper is loaded, reject permission or ancestry
+# drift on every checkout entry and every external executable used below.
+runtime_security_validate_trusted_executable \
+    "$script_path" \
+    "scheduler clean-environment launcher" >/dev/null || exit $?
+runtime_security_validate_trusted_regular_file \
+    "$runtime_security_file" \
+    "runtime security file" >/dev/null || exit $?
+runtime_security_links="$(runtime_security_regular_file_link_count "$runtime_security_file")" || exit $?
+if (( runtime_security_links != 1 )); then
+    echo "Scheduler runtime security file must not have multiple hard links: $runtime_security_file" >&2
+    exit 2
+fi
+unset runtime_security_links
+bash_bin="$(runtime_security_validate_trusted_executable "$bash_bin" "Bash executable")" || exit $?
+uv_bin="$(runtime_security_validate_trusted_executable "$uv_bin" "uv executable")" || exit $?
+sha256_bin="$(
+    runtime_security_validate_trusted_executable "$sha256_bin" "SHA-256 executable"
+)" || exit $?
+scheduler_path="$(
+    runtime_security_validate_trusted_executable "$scheduler_path" "scheduler executable"
+)" || exit $?
+
+validate_open_scheduler_descriptor() {
+    local descriptor_path=/dev/fd/8
+    local file_status file_owner file_mode file_mode_value file_links
+
+    if [[ ! -f "$descriptor_path" || ! -x "$descriptor_path" ]]; then
+        echo "The opened scheduler must be an executable regular file." >&2
+        return 2
+    fi
+    file_status="$(runtime_security_owner_mode_follow "$descriptor_path")" || return $?
+    read -r file_owner file_mode <<< "$file_status"
+    if ! runtime_security_owner_is_trusted "$file_owner"; then
+        echo "The opened scheduler is controlled by an untrusted owner." >&2
+        return 2
+    fi
+    file_mode_value=$(((8#$file_mode) & 07777))
+    if (( file_mode_value & 0022 )); then
+        echo "The opened scheduler must not be group- or world-writable." >&2
+        return 2
+    fi
+    file_links="$(runtime_security_regular_file_link_count "$descriptor_path")" || return $?
+    if (( file_links != 1 )); then
+        echo "The opened scheduler must not have multiple hard links." >&2
+        return 2
+    fi
+}
+
+# Bind validation to the exact scheduler bytes that will execute. The second
+# path validation and descriptor metadata checks close replacement/mode races
+# during the lossless capture; later changes cannot affect the in-memory
+# snapshot passed to Bash.
+exec 8< "$scheduler_path" || {
+    echo "Unable to open the validated scheduler executable: $scheduler_path" >&2
+    exit 2
+}
+if [[ ! -f /dev/fd/8 || ! "$scheduler_path" -ef /dev/fd/8 ]]; then
+    exec 8<&-
+    echo "Scheduler executable changed while it was being opened: $scheduler_path" >&2
+    exit 2
+fi
+validate_open_scheduler_descriptor || {
+    scheduler_status=$?
+    exec 8<&-
+    exit "$scheduler_status"
+}
+scheduler_expected_size="$(file_byte_size /dev/fd/8)" || {
+    exec 8<&-
+    exit 2
+}
+if (( scheduler_expected_size == 0 || scheduler_expected_size > 1048576 )); then
+    exec 8<&-
+    echo "Scheduler source must contain between 1 and 1048576 bytes." >&2
+    exit 2
+fi
+scheduler_source=""
+if IFS= read -r -d '' scheduler_source <&8; then
+    exec 8<&-
+    echo "Scheduler executable must not contain NUL bytes." >&2
+    exit 2
+fi
+scheduler_source_byte_count="$(ascii_byte_length "$scheduler_source")" || {
+    exec 8<&-
+    exit 2
+}
+scheduler_final_size="$(file_byte_size /dev/fd/8)" || {
+    exec 8<&-
+    exit 2
+}
+if (( scheduler_source_byte_count != scheduler_expected_size \
+    || scheduler_final_size != scheduler_expected_size )); then
+    exec 8<&-
+    echo "Scheduler executable changed or was truncated while it was being read." >&2
+    exit 2
+fi
+revalidated_scheduler="$(
+    runtime_security_validate_trusted_executable "$scheduler_path" "scheduler executable"
+)" || {
+    scheduler_status=$?
+    exec 8<&-
+    exit "$scheduler_status"
+}
+if [[ ! "$revalidated_scheduler" -ef /dev/fd/8 || ! "$scheduler_path" -ef /dev/fd/8 ]]; then
+    exec 8<&-
+    echo "Scheduler executable changed while it was being read: $scheduler_path" >&2
+    exit 2
+fi
+validate_open_scheduler_descriptor || {
+    scheduler_status=$?
+    exec 8<&-
+    exit "$scheduler_status"
+}
+exec 8<&-
+unset revalidated_scheduler scheduler_expected_size scheduler_final_size
+
+repo_dir="${script_dir%/*}"
+repo_dir="${repo_dir%/*}"
+if [[ -z "$repo_dir" ]]; then
+    repo_dir="/"
+fi
+
+export SHELL=/bin/sh
+export PATH=/usr/bin:/bin
+export UV_BIN="$uv_bin"
+if [[ "$repo_dir" == / ]]; then
+    export LEVERAGED_TRADER_LOG_FILE=/outputs/cron.log
+else
+    export LEVERAGED_TRADER_LOG_FILE="$repo_dir/outputs/cron.log"
+fi
+
+# Buffer the authenticated snapshot completely in the child before evaluating
+# it. The byte-count check detects a failed/truncated process-substitution
+# writer, while stdin avoids the platform's single-argument size ceiling. $0
+# retains the original checkout path and run-scheduled falls back to it when
+# BASH_SOURCE is empty during eval.
+scheduler_eval_code='set -euo pipefail;expected=$1;shift;snapshot=;if IFS= read -r -d "" snapshot;then echo "Scheduler snapshot must not contain NUL bytes." >&2;exit 2;fi;LC_ALL=C;actual=${#snapshot};unset LC_ALL;[[ $actual == "$expected" ]]||{ echo "Scheduler snapshot was truncated before execution." >&2;exit 2;};builtin eval "$snapshot"'
+exec "$bash_bin" --noprofile --norc -c \
+    "$scheduler_eval_code" \
+    "$scheduler_path" \
+    "$scheduler_source_byte_count" \
+    < <(printf '%s' "$scheduler_source")

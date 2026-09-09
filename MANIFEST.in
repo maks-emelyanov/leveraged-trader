@@ -1,0 +1,10 @@
+include .env.example
+include .python-version
+include main.py
+include uv.lock
+recursive-include docs *.md
+include scripts/cron/install-crontab
+include scripts/cron/run-leveraged-trader
+include scripts/cron/run-scheduled
+include scripts/cron/run-scheduled-clean-environment
+include scripts/cron/runtime-security

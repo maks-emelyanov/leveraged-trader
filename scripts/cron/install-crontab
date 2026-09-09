@@ -1,43 +1,1943 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-repo_dir="$(cd -- "$script_dir/../.." && pwd)"
-runner="$script_dir/run-leveraged-trader"
-log_file="$repo_dir/outputs/cron.log"
+contains_ascii_control() {
+    local LC_ALL=C
+    [[ "$1" =~ [[:cntrl:]] ]]
+}
+
+require_control_free_path() {
+    local value="$1"
+    local description="$2"
+    if contains_ascii_control "$value"; then
+        echo "Scheduler $description must not contain ASCII control characters." >&2
+        return 2
+    fi
+}
+
+absolute_lexical_path() {
+    local input="$1"
+    local component normalized=""
+    local component_count=0
+    local -a input_components=()
+    local -a normalized_components=()
+
+    require_control_free_path "$input" "runtime path" || return $?
+    if [[ "$input" != /* ]]; then
+        input="$PWD/$input"
+    fi
+    IFS='/' read -r -a input_components <<< "$input"
+    for component in "${input_components[@]}"; do
+        case "$component" in
+            ""|.)
+                ;;
+            ..)
+                echo "Scheduler runtime paths must not contain '..' components: $input" >&2
+                return 2
+                ;;
+            *)
+                normalized_components[component_count]="$component"
+                component_count=$((component_count + 1))
+                ;;
+        esac
+    done
+    if (( component_count == 0 )); then
+        printf '/\n'
+        return 0
+    fi
+    for component in "${normalized_components[@]}"; do
+        normalized="$normalized/$component"
+    done
+    printf '%s\n' "$normalized"
+}
+
+logical_directory_path() {
+    local requested_directory="$1"
+    local marker=$'\001'
+    local captured
+    require_control_free_path "$requested_directory" "directory path" || return $?
+    captured="$(cd -L -- "$requested_directory" && printf '%s%s' "$PWD" "$marker")" || return $?
+    case "$captured" in
+        *"$marker")
+            captured="${captured%"$marker"}"
+            ;;
+        *)
+            return 2
+            ;;
+    esac
+    require_control_free_path "$captured" "logical directory path" || return $?
+    printf '%s\n' "$captured"
+}
+
+posix_shell_quote() {
+    local value="$1"
+    local description="$2"
+    local escaped
+    require_control_free_path "$value" "$description" || return $?
+    # Break and immediately reopen the single-quoted word before every percent.
+    # Cron uses the parity of the raw backslash run before `%` to decide whether
+    # it starts standard-input data.  The quote boundary keeps literal path
+    # backslashes out of that run, so the cron escape added below is always the
+    # sole backslash and can be removed without changing the shell word.
+    escaped="$(printf '%s' "$value" | sed -e "s/'/'\\\\''/g" -e "s/%/''%/g")" || return $?
+    printf "'%s'" "$escaped"
+}
+
+ascii_byte_length() {
+    local LC_ALL=C
+    printf '%s\n' "${#1}"
+}
+
+sha256_file_digest() {
+    local path="$1"
+    local output digest
+
+    case "$sha256_mode" in
+        plain)
+            output="$("$sha256_bin" < "$path")" || return $?
+            ;;
+        shasum)
+            output="$("$sha256_bin" -a 256 < "$path")" || return $?
+            ;;
+        *)
+            return 2
+            ;;
+    esac
+    if [[ ! "$output" =~ ^([0-9A-Fa-f]{64})[[:space:]][[:space:]]*-$ ]]; then
+        echo "The SHA-256 executable returned malformed output for $path." >&2
+        return 2
+    fi
+    digest="${BASH_REMATCH[1]}"
+    printf '%s\n' "$digest"
+}
+
+file_byte_size() {
+    local path="$1"
+    local size
+    if size="$("$runtime_security_stat_bin" -Lc '%s' -- "$path" 2>/dev/null)"; then
+        :
+    elif size="$("$runtime_security_stat_bin" -Lf '%z' "$path" 2>/dev/null)"; then
+        :
+    else
+        return 1
+    fi
+    [[ "$size" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$size"
+}
+
+require_control_free_path "${BASH_SOURCE[0]}" "script path" || exit $?
+require_control_free_path "$PWD" "initial working directory" || exit $?
+script_path="$(absolute_lexical_path "${BASH_SOURCE[0]}")" || exit $?
+script_dir="${script_path%/*}"
+if [[ -z "$script_dir" ]]; then
+    script_dir="/"
+fi
+runtime_security_file="$script_dir/runtime-security"
+
+# This check must not depend on code from runtime-security: sourcing a writable
+# helper would execute it before the executable trust checks it provides. Open a
+# verified file descriptor and source that stable descriptor only after checking
+# every ancestor and the opened file's owner, mode, and hard-link count.
+bootstrap_source_runtime_security() {
+    local path="$1"
+    local stat_bin root_owner current_uid parent_path relative_parent component child_path child_owner
+    local parent_status parent_owner parent_mode parent_mode_value
+    local file_status file_owner file_mode file_links file_mode_value extra source_status
+    local descriptor_path="/dev/fd/7"
+    local -a path_components=()
+
+    if contains_ascii_control "$path" || [[ "$path" != /* ]]; then
+        echo "Scheduler runtime security path must be an absolute control-free path." >&2
+        return 2
+    fi
+    if [[ -x /usr/bin/stat ]]; then
+        stat_bin=/usr/bin/stat
+    elif [[ -x /bin/stat ]]; then
+        stat_bin=/bin/stat
+    else
+        echo "Unable to find the system stat executable required to verify scheduler runtime security." >&2
+        return 2
+    fi
+    if ! root_owner="$($stat_bin -c '%u' -- / 2>/dev/null)"; then
+        root_owner="$($stat_bin -f '%u' / 2>/dev/null)" || return 2
+    fi
+    [[ "$root_owner" =~ ^[0-9]+$ ]] || return 2
+    current_uid="$EUID"
+
+    parent_path="${path%/*}"
+    [[ -n "$parent_path" ]] || parent_path="/"
+    relative_parent="${parent_path#/}"
+    if [[ -n "$relative_parent" ]]; then
+        IFS='/' read -r -a path_components <<< "$relative_parent"
+    fi
+    parent_path="/"
+    for component in "${path_components[@]}"; do
+        if [[ -z "$component" || "$component" == "." || "$component" == ".." ]]; then
+            echo "Scheduler runtime security path contains an unsafe component." >&2
+            return 2
+        fi
+        if [[ "$parent_path" == "/" ]]; then
+            child_path="/$component"
+        else
+            child_path="$parent_path/$component"
+        fi
+        if [[ -L "$child_path" || ! -d "$child_path" ]]; then
+            echo "Scheduler runtime security ancestor must not be a symbolic link: $child_path" >&2
+            return 2
+        fi
+        if ! child_owner="$($stat_bin -c '%u' -- "$child_path" 2>/dev/null)"; then
+            child_owner="$($stat_bin -f '%u' "$child_path" 2>/dev/null)" || return 2
+        fi
+        if ! parent_status="$($stat_bin -Lc '%u %a' -- "$parent_path" 2>/dev/null)"; then
+            parent_status="$($stat_bin -Lf '%u %p' "$parent_path" 2>/dev/null)" || return 2
+        fi
+        read -r parent_owner parent_mode extra <<< "$parent_status"
+        if [[ ! "$child_owner" =~ ^[0-9]+$ || ! "$parent_owner" =~ ^[0-9]+$ \
+            || ! "$parent_mode" =~ ^[0-7]+$ || -n "$extra" ]]; then
+            return 2
+        fi
+        if [[ "$parent_owner" != "$current_uid" && "$parent_owner" != "0" \
+            && "$parent_owner" != "$root_owner" ]]; then
+            echo "Scheduler runtime security path is controlled by an untrusted owner at $parent_path." >&2
+            return 2
+        fi
+        parent_mode_value=$(((8#$parent_mode) & 07777))
+        if (( parent_mode_value & 0022 )) \
+            && { (( ! (parent_mode_value & 01000) )) \
+                || [[ "$child_owner" != "$current_uid" && "$child_owner" != "0" \
+                    && "$child_owner" != "$root_owner" ]]; }; then
+            echo "Scheduler runtime security path is replaceable through writable ancestor $parent_path." >&2
+            return 2
+        fi
+        parent_path="$child_path"
+    done
+
+    if [[ -L "$path" || ! -f "$path" ]]; then
+        echo "Unable to load scheduler runtime security checks: $path" >&2
+        return 2
+    fi
+    exec 7< "$path" || return 2
+    if [[ ! -f "$descriptor_path" || ! "$path" -ef "$descriptor_path" || -L "$path" ]]; then
+        exec 7<&-
+        echo "Scheduler runtime security file changed while it was being opened: $path" >&2
+        return 2
+    fi
+    if ! file_status="$($stat_bin -Lc '%u %a %h' -- "$descriptor_path" 2>/dev/null)"; then
+        file_status="$($stat_bin -Lf '%u %p %l' "$descriptor_path" 2>/dev/null)" || {
+            exec 7<&-
+            return 2
+        }
+    fi
+    read -r file_owner file_mode file_links extra <<< "$file_status"
+    if [[ ! "$file_owner" =~ ^[0-9]+$ || ! "$file_mode" =~ ^[0-7]+$ \
+        || ! "$file_links" =~ ^[1-9][0-9]*$ || -n "$extra" ]]; then
+        exec 7<&-
+        return 2
+    fi
+    if ! parent_status="$($stat_bin -Lc '%u %a' -- "$parent_path" 2>/dev/null)"; then
+        parent_status="$($stat_bin -Lf '%u %p' "$parent_path" 2>/dev/null)" || {
+            exec 7<&-
+            return 2
+        }
+    fi
+    read -r parent_owner parent_mode extra <<< "$parent_status"
+    if [[ ! "$parent_owner" =~ ^[0-9]+$ || ! "$parent_mode" =~ ^[0-7]+$ || -n "$extra" ]]; then
+        exec 7<&-
+        return 2
+    fi
+    if [[ "$parent_owner" != "$current_uid" && "$parent_owner" != "0" \
+        && "$parent_owner" != "$root_owner" ]]; then
+        exec 7<&-
+        echo "Scheduler runtime security path is controlled by an untrusted owner at $parent_path." >&2
+        return 2
+    fi
+    parent_mode_value=$(((8#$parent_mode) & 07777))
+    if (( parent_mode_value & 0022 )) \
+        && { (( ! (parent_mode_value & 01000) )) \
+            || [[ "$file_owner" != "$current_uid" && "$file_owner" != "0" \
+                && "$file_owner" != "$root_owner" ]]; }; then
+        exec 7<&-
+        echo "Scheduler runtime security path is replaceable through writable ancestor $parent_path." >&2
+        return 2
+    fi
+    file_mode_value=$(((8#$file_mode) & 07777))
+    if [[ "$file_owner" != "$current_uid" && "$file_owner" != "0" && "$file_owner" != "$root_owner" ]]; then
+        exec 7<&-
+        echo "Scheduler runtime security file is controlled by an untrusted owner: $path" >&2
+        return 2
+    fi
+    if (( file_mode_value & 0022 )); then
+        exec 7<&-
+        echo "Scheduler runtime security file must not be group- or world-writable: $path" >&2
+        return 2
+    fi
+    if (( file_links != 1 )); then
+        exec 7<&-
+        echo "Scheduler runtime security file must not have multiple hard links: $path" >&2
+        return 2
+    fi
+
+    source_status=0
+    # shellcheck source=runtime-security
+    builtin source "$descriptor_path" || source_status=$?
+    exec 7<&-
+    return "$source_status"
+}
+
+bootstrap_source_runtime_security "$runtime_security_file" || exit $?
+# The repository traversal is fixed by this script's checked-in location. Use
+# logical resolution so a symbolic-link component in the invocation ancestry
+# remains visible to the output-directory validator below.
+repo_dir="$(logical_directory_path "$script_dir/../..")" || exit $?
+scheduler="$script_dir/run-scheduled"
+clean_environment_launcher="$script_dir/run-scheduled-clean-environment"
+output_dir="$repo_dir/outputs"
+log_file="$output_dir/cron.log"
 marker_start="# BEGIN leveraged-trader managed schedule"
 marker_end="# END leveraged-trader managed schedule"
+runtime_current_uid="${EUID}"
+runtime_root_owner_uid=""
+secured_private_directory=""
 
-if command -v uv >/dev/null 2>&1; then
-    uv_bin="$(command -v uv)"
-elif [[ -x "$HOME/.local/bin/uv" ]]; then
-    uv_bin="$HOME/.local/bin/uv"
-else
+path_owner_uid_lstat() {
+    local path="$1"
+    local owner_uid
+    if owner_uid="$(stat -c '%u' -- "$path" 2>/dev/null)"; then
+        :
+    elif owner_uid="$(stat -f '%u' "$path" 2>/dev/null)"; then
+        :
+    else
+        return 1
+    fi
+    [[ "$owner_uid" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$owner_uid"
+}
+
+directory_owner_mode_follow() {
+    local path="$1"
+    local status owner_uid mode extra
+    if status="$(stat -Lc '%u %a' -- "$path" 2>/dev/null)"; then
+        :
+    elif status="$(stat -Lf '%u %p' "$path" 2>/dev/null)"; then
+        :
+    else
+        return 1
+    fi
+    read -r owner_uid mode extra <<< "$status"
+    [[ "$owner_uid" =~ ^[0-9]+$ && "$mode" =~ ^[0-7]+$ && -z "$extra" ]] || return 1
+    printf '%s %s\n' "$owner_uid" "$mode"
+}
+
+runtime_owner_is_trusted() {
+    local owner_uid="$1"
+    [[ "$owner_uid" == "$runtime_current_uid" \
+        || "$owner_uid" == "0" \
+        || "$owner_uid" == "$runtime_root_owner_uid" ]]
+}
+
+require_trusted_directory_parent() {
+    local child_path="$1"
+    local child_owner_uid="$2"
+    local parent_path="$3"
+    local description="$4"
+    local parent_status parent_owner_uid parent_mode parent_mode_value
+
+    if [[ -L "$parent_path" || ! -d "$parent_path" ]]; then
+        echo "Scheduler $description ancestor must be a regular directory: $parent_path" >&2
+        return 2
+    fi
+    if ! parent_status="$(directory_owner_mode_follow "$parent_path")"; then
+        echo "Cannot verify scheduler $description ancestor metadata: $parent_path" >&2
+        return 2
+    fi
+    read -r parent_owner_uid parent_mode <<< "$parent_status"
+    if ! runtime_owner_is_trusted "$parent_owner_uid"; then
+        echo "Scheduler $description entry $child_path is unsafe because parent $parent_path is controlled by an untrusted owner." >&2
+        return 2
+    fi
+
+    # GNU %a is permission-only, while BSD %p includes the file-type bits.
+    # Retain only rwx/special bits so both formats share the same checks.
+    parent_mode_value=$(((8#$parent_mode) & 07777))
+    if (( parent_mode_value & 0022 )); then
+        if (( ! (parent_mode_value & 01000) )) || ! runtime_owner_is_trusted "$child_owner_uid"; then
+            echo "Scheduler $description entry $child_path is unsafe because parent $parent_path permits directory-entry substitution." >&2
+            return 2
+        fi
+    fi
+}
+
+secure_private_directory() {
+    local requested_directory="$1"
+    local description="$2"
+    local descriptor_path="/dev/fd/6"
+    local directory relative_path component parent_path child_path child_owner_uid
+    local component_exists
+    local -a path_components=()
+
+    if ! directory="$(absolute_lexical_path "$requested_directory")"; then
+        echo "Cannot normalize scheduler $description directory: $requested_directory" >&2
+        return 2
+    fi
+    if ! runtime_root_owner_uid="$(path_owner_uid_lstat /)"; then
+        echo "Cannot verify scheduler $description filesystem-root ownership." >&2
+        return 2
+    fi
+
+    parent_path="/"
+    relative_path="${directory#/}"
+    if [[ -n "$relative_path" ]]; then
+        IFS='/' read -r -a path_components <<< "$relative_path"
+    fi
+    for component in "${path_components[@]}"; do
+        if [[ "$parent_path" == "/" ]]; then
+            child_path="/$component"
+        else
+            child_path="$parent_path/$component"
+        fi
+        if [[ -L "$child_path" ]]; then
+            echo "Scheduler $description ancestor must not be a symbolic link: $child_path" >&2
+            return 2
+        fi
+
+        component_exists=0
+        if [[ -e "$child_path" ]]; then
+            component_exists=1
+            if [[ ! -d "$child_path" ]]; then
+                echo "Scheduler $description ancestor must be a regular directory: $child_path" >&2
+                return 2
+            fi
+            if ! child_owner_uid="$(path_owner_uid_lstat "$child_path")"; then
+                echo "Cannot verify scheduler $description ancestor ownership: $child_path" >&2
+                return 2
+            fi
+        else
+            child_owner_uid="$runtime_current_uid"
+        fi
+
+        require_trusted_directory_parent \
+            "$child_path" \
+            "$child_owner_uid" \
+            "$parent_path" \
+            "$description" || return $?
+
+        if (( ! component_exists )); then
+            if ! mkdir -m 700 "$child_path" 2>/dev/null; then
+                if [[ -L "$child_path" || ! -d "$child_path" ]]; then
+                    echo "Cannot privately create scheduler $description directory: $child_path" >&2
+                    return 2
+                fi
+            fi
+            if [[ -L "$child_path" || ! -d "$child_path" ]]; then
+                echo "Scheduler $description directory changed while it was being created: $child_path" >&2
+                return 2
+            fi
+            if ! child_owner_uid="$(path_owner_uid_lstat "$child_path")" \
+                || [[ "$child_owner_uid" != "$runtime_current_uid" ]]; then
+                echo "Scheduler $description created directory must be owned by the current user: $child_path" >&2
+                return 2
+            fi
+            require_trusted_directory_parent \
+                "$child_path" \
+                "$child_owner_uid" \
+                "$parent_path" \
+                "$description" || return $?
+            chmod 700 "$child_path"
+        fi
+        parent_path="$child_path"
+    done
+
+    if [[ -L "$directory" || ! -d "$directory" || ! -O "$directory" ]]; then
+        echo "Scheduler $description directory must be an owned regular directory: $directory" >&2
+        return 2
+    fi
+    exec 6< "$directory"
+    if [[ ! -d "$descriptor_path" ]] || ! [[ "$directory" -ef "$descriptor_path" ]]; then
+        exec 6<&-
+        echo "Scheduler $description directory changed while it was being opened: $directory" >&2
+        return 2
+    fi
+    chmod 700 "$descriptor_path"
+    if [[ -L "$directory" || ! -d "$directory" ]] || ! [[ "$directory" -ef "$descriptor_path" ]]; then
+        exec 6<&-
+        echo "Scheduler $description directory changed while it was being secured: $directory" >&2
+        return 2
+    fi
+    exec 6<&-
+    secured_private_directory="$directory"
+}
+
+current_crontab=""
+read_current_crontab() {
+    local crontab_error_file crontab_status crontab_error
+    local no_crontab_pattern
+
+    crontab_error_file="$(mktemp)" || return $?
+    if current_crontab="$(LC_ALL=C crontab -l 2>"$crontab_error_file")"; then
+        rm -f "$crontab_error_file"
+        return 0
+    else
+        crontab_status=$?
+    fi
+
+    crontab_error="$(<"$crontab_error_file")"
+    rm -f "$crontab_error_file"
+    no_crontab_pattern='^(crontab:[[:space:]]*)?no[[:space:]]+crontab[[:space:]]+for[[:space:]]+[^[:space:]]+$'
+    if (( crontab_status == 1 )) && [[ "$crontab_error" =~ $no_crontab_pattern ]]; then
+        current_crontab=""
+        return 0
+    fi
+
+    echo "Unable to read the existing crontab; no changes were made." >&2
+    if [[ -n "$crontab_error" ]]; then
+        echo "$crontab_error" >&2
+    fi
+    return "$crontab_status"
+}
+
+path_modified_epoch() {
+    local path="$1"
+    local modified
+    if modified="$(stat -c '%Y' -- "$path" 2>/dev/null)"; then
+        :
+    elif modified="$(stat -f '%m' "$path" 2>/dev/null)"; then
+        :
+    else
+        return 1
+    fi
+    [[ "$modified" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$modified"
+}
+
+process_start_identity() {
+    local pid="$1"
+    local process_stat started ps_bin
+    local -a process_fields=()
+    if [[ -r "/proc/$pid/stat" ]]; then
+        IFS= read -r process_stat < "/proc/$pid/stat" || return 1
+        process_stat="${process_stat##*) }"
+        read -r -a process_fields <<< "$process_stat"
+        [[ "${process_fields[19]:-}" =~ ^[0-9]+$ ]] || return 1
+        printf 'proc:%s\n' "${process_fields[19]}"
+        return 0
+    fi
+
+    if [[ -x /bin/ps ]]; then
+        ps_bin=/bin/ps
+    elif [[ -x /usr/bin/ps ]]; then
+        ps_bin=/usr/bin/ps
+    else
+        return 1
+    fi
+    started="$(TZ=UTC0 LC_ALL=C "$ps_bin" -o lstart= -p "$pid" 2>/dev/null)" || return 1
+    started="${started#"${started%%[![:space:]]*}"}"
+    [[ -n "$started" ]] || return 1
+    printf 'ps:%s\n' "$started"
+}
+
+crontab_install_lock_root=""
+crontab_install_lock_dir=""
+crontab_install_lock_held=0
+crontab_install_lock_owner_pid=""
+crontab_install_lock_owner_start=""
+crontab_install_lock_busy_status=75
+crontab_install_lock_publish_grace_seconds=120
+crontab_install_gate_dir=""
+crontab_install_gate_held=0
+crontab_install_gate_recovery_claim_dir=""
+crontab_install_gate_recovery_claim_held=0
+scheduler_bootstrap_pending_file=""
+
+read_crontab_install_lock_owner() {
+    local owner_file="$1"
+    local owner_line
+
+    if [[ ! -f "$owner_file" || -L "$owner_file" ]]; then
+        return 1
+    fi
+    IFS= read -r owner_line < "$owner_file" || return 1
+    if [[ "$owner_line" != *" "* ]]; then
+        return 1
+    fi
+    crontab_install_lock_owner_pid="${owner_line%% *}"
+    crontab_install_lock_owner_start="${owner_line#* }"
+    [[ "$crontab_install_lock_owner_pid" =~ ^[1-9][0-9]*$ \
+        && -n "$crontab_install_lock_owner_start" ]]
+}
+
+crontab_install_lock_is_stale() {
+    local lock_dir="$1"
+    local require_ownerless_age="${2:-1}"
+    local owner_start modified_epoch now_epoch
+
+    crontab_install_lock_owner_pid=""
+    crontab_install_lock_owner_start=""
+    if read_crontab_install_lock_owner "$lock_dir/owner"; then
+        if kill -0 "$crontab_install_lock_owner_pid" 2>/dev/null; then
+            if ! owner_start="$(process_start_identity "$crontab_install_lock_owner_pid")"; then
+                echo "Cannot verify the crontab installer lock owner; no changes were made." >&2
+                return 2
+            fi
+            if [[ "$owner_start" == "$crontab_install_lock_owner_start" ]]; then
+                echo "Another leveraged-trader crontab installation is already in progress; no changes were made." >&2
+                return "$crontab_install_lock_busy_status"
+            fi
+        fi
+    elif (( require_ownerless_age )); then
+        if ! modified_epoch="$(path_modified_epoch "$lock_dir")" \
+            || ! now_epoch="$(date '+%s')" \
+            || [[ ! "$now_epoch" =~ ^[0-9]+$ ]]; then
+            echo "Cannot determine the age of the crontab installer lock; no changes were made." >&2
+            return 2
+        fi
+        if (( now_epoch < modified_epoch \
+            || now_epoch - modified_epoch < crontab_install_lock_publish_grace_seconds )); then
+            echo "Another leveraged-trader crontab installation is already in progress; no changes were made." >&2
+            return "$crontab_install_lock_busy_status"
+        fi
+    fi
+    return 0
+}
+
+release_crontab_install_gate() {
+    local current_start="" release_status=0
+    local gate_descriptor_path="/dev/fd/3"
+
+    if (( ! crontab_install_gate_held )); then
+        return 0
+    fi
+    current_start="$(process_start_identity "$$")" || true
+    if [[ ! -d "$crontab_install_gate_dir" ]] \
+        || ! [[ "$crontab_install_gate_dir" -ef "$gate_descriptor_path" ]] \
+        || ! (
+            cd -P -- "$crontab_install_gate_dir" || exit 2
+            [[ . -ef "$gate_descriptor_path" ]] || exit 2
+            crontab_install_lock_owner_pid=""
+            crontab_install_lock_owner_start=""
+            read_crontab_install_lock_owner ./owner \
+                && [[ "$crontab_install_lock_owner_pid" == "$$" \
+                    && "$crontab_install_lock_owner_start" == "$current_start" ]] \
+                || exit 2
+            rm -f ./owner || exit $?
+        ); then
+        release_status=2
+    elif ! [[ "$crontab_install_gate_dir" -ef "$gate_descriptor_path" ]] \
+        || ! rmdir "$crontab_install_gate_dir" 2>/dev/null; then
+        release_status=2
+    fi
+    exec 3<&- || :
+    if (( release_status != 0 )); then
+        echo "Cannot release crontab installer acquisition gate $crontab_install_gate_dir; inspect it manually and no changes were made." >&2
+    fi
+    crontab_install_gate_held=0
+    crontab_install_gate_dir=""
+    return "$release_status"
+}
+
+release_crontab_install_gate_recovery_claim() {
+    local current_start="" release_status=0
+    local claim_descriptor_path="/dev/fd/6"
+
+    if (( ! crontab_install_gate_recovery_claim_held )); then
+        return 0
+    fi
+    current_start="$(process_start_identity "$$")" || true
+    if [[ ! -d "$crontab_install_gate_recovery_claim_dir" ]] \
+        || ! [[ "$crontab_install_gate_recovery_claim_dir" -ef "$claim_descriptor_path" ]] \
+        || ! (
+            cd -P -- "$crontab_install_gate_recovery_claim_dir" || exit 2
+            [[ . -ef "$claim_descriptor_path" ]] || exit 2
+            crontab_install_lock_owner_pid=""
+            crontab_install_lock_owner_start=""
+            read_crontab_install_lock_owner ./owner \
+                && [[ "$crontab_install_lock_owner_pid" == "$$" \
+                    && "$crontab_install_lock_owner_start" == "$current_start" ]] \
+                || exit 2
+            rm -f ./owner || exit $?
+        ); then
+        release_status=2
+    elif ! [[ "$crontab_install_gate_recovery_claim_dir" -ef "$claim_descriptor_path" ]] \
+        || ! rmdir "$crontab_install_gate_recovery_claim_dir" 2>/dev/null; then
+        release_status=2
+    fi
+    exec 6<&- || :
+    if (( release_status != 0 )); then
+        echo "Cannot release the crontab installer gate recovery claim $crontab_install_gate_recovery_claim_dir; inspect it manually and no changes were made." >&2
+    fi
+    crontab_install_gate_recovery_claim_held=0
+    crontab_install_gate_recovery_claim_dir=""
+    return "$release_status"
+}
+
+crontab_install_gate_recovery_claims_are_clear() {
+    local gate_dir="$1"
+    local claim claim_descriptor_path="/dev/fd/6" owner_start modified_epoch now_epoch
+    local stale_owner_pid stale_owner_start cleanup_status invalid_owner
+    local restore_nullglob=1
+    local -a claims=()
+
+    if shopt -q nullglob; then
+        restore_nullglob=0
+    else
+        shopt -s nullglob
+    fi
+    claims=("${gate_dir}.recovery."*)
+    if (( restore_nullglob )); then
+        shopt -u nullglob
+    fi
+    for claim in "${claims[@]}"; do
+        if [[ -L "$claim" || ! -d "$claim" ]]; then
+            echo "The crontab installer gate recovery claim has an unsafe type; no changes were made: $claim" >&2
+            return 2
+        fi
+        if ! exec 6< "$claim"; then
+            if [[ ! -e "$claim" ]]; then
+                continue
+            fi
+            echo "Cannot safely inspect the crontab installer gate recovery claim; no changes were made: $claim" >&2
+            return 2
+        fi
+        if ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+            exec 6<&-
+            if [[ -L "$claim" || ( -e "$claim" && ! -d "$claim" ) ]]; then
+                echo "The crontab installer gate recovery claim changed to an unsafe type; no changes were made: $claim" >&2
+                return 2
+            fi
+            return "$crontab_install_lock_busy_status"
+        fi
+
+        crontab_install_lock_owner_pid=""
+        crontab_install_lock_owner_start=""
+        if read_crontab_install_lock_owner "$claim/owner"; then
+            stale_owner_pid="$crontab_install_lock_owner_pid"
+            stale_owner_start="$crontab_install_lock_owner_start"
+            if ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+                exec 6<&-
+                return "$crontab_install_lock_busy_status"
+            fi
+            if kill -0 "$stale_owner_pid" 2>/dev/null; then
+                if ! owner_start="$(process_start_identity "$stale_owner_pid")"; then
+                    if ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+                        exec 6<&-
+                        return "$crontab_install_lock_busy_status"
+                    fi
+                    exec 6<&-
+                    echo "Cannot verify the crontab installer gate recovery owner; no changes were made." >&2
+                    return 2
+                fi
+                if [[ "$owner_start" == "$stale_owner_start" ]]; then
+                    exec 6<&-
+                    return "$crontab_install_lock_busy_status"
+                fi
+            fi
+            if ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+                exec 6<&-
+                return "$crontab_install_lock_busy_status"
+            fi
+            cleanup_status=0
+            (
+                cd -P -- "$claim" || exit 2
+                [[ . -ef "$claim_descriptor_path" ]] || exit 2
+                crontab_install_lock_owner_pid=""
+                crontab_install_lock_owner_start=""
+                read_crontab_install_lock_owner ./owner \
+                    && [[ "$crontab_install_lock_owner_pid" == "$stale_owner_pid" \
+                        && "$crontab_install_lock_owner_start" == "$stale_owner_start" ]] \
+                    || exit 2
+                rm -f ./owner || exit $?
+            ) || cleanup_status=$?
+        else
+            if ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+                exec 6<&-
+                return "$crontab_install_lock_busy_status"
+            fi
+            invalid_owner=0
+            if [[ -L "$claim/owner" \
+                || ( -e "$claim/owner" && ! -f "$claim/owner" ) \
+                || -L "$claim/owner.pending" \
+                || ( -e "$claim/owner.pending" && ! -f "$claim/owner.pending" ) ]]; then
+                exec 6<&-
+                echo "The crontab installer gate recovery claim has unsafe ownership metadata; no changes were made: $claim" >&2
+                return 2
+            fi
+            if [[ -f "$claim/owner" ]]; then
+                invalid_owner=1
+            fi
+            if ! modified_epoch="$(path_modified_epoch "$claim")" \
+                || ! now_epoch="$(date '+%s')" \
+                || [[ ! "$now_epoch" =~ ^[0-9]+$ ]]; then
+                if ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+                    exec 6<&-
+                    return "$crontab_install_lock_busy_status"
+                fi
+                exec 6<&-
+                echo "Cannot determine the crontab installer gate recovery claim age; no changes were made." >&2
+                return 2
+            fi
+            if (( now_epoch < modified_epoch \
+                || now_epoch - modified_epoch < crontab_install_lock_publish_grace_seconds )); then
+                exec 6<&-
+                return "$crontab_install_lock_busy_status"
+            fi
+            if ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+                exec 6<&-
+                return "$crontab_install_lock_busy_status"
+            fi
+            cleanup_status=0
+            (
+                cd -P -- "$claim" || exit 2
+                [[ . -ef "$claim_descriptor_path" ]] || exit 2
+                if (( invalid_owner )); then
+                    [[ -f ./owner && ! -L ./owner ]] || exit 2
+                    crontab_install_lock_owner_pid=""
+                    crontab_install_lock_owner_start=""
+                    if read_crontab_install_lock_owner ./owner; then
+                        exit 2
+                    fi
+                    rm -f ./owner || exit $?
+                elif [[ -e ./owner || -L ./owner ]]; then
+                    exit 2
+                fi
+                if [[ -e ./owner.pending || -L ./owner.pending ]]; then
+                    [[ -f ./owner.pending && ! -L ./owner.pending ]] || exit 2
+                    rm -f ./owner.pending || exit $?
+                fi
+            ) || cleanup_status=$?
+        fi
+        if (( cleanup_status != 0 )); then
+            if ! [[ "$claim" -ef "$claim_descriptor_path" ]] \
+                || { [[ ! -e "$claim/owner" && ! -L "$claim/owner" ]] \
+                    && [[ ! -e "$claim/owner.pending" && ! -L "$claim/owner.pending" ]]; }; then
+                exec 6<&-
+                return "$crontab_install_lock_busy_status"
+            fi
+            exec 6<&-
+            echo "Cannot safely retire the crontab installer gate recovery claim; no changes were made: $claim" >&2
+            return 2
+        fi
+        if ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+            exec 6<&-
+            return "$crontab_install_lock_busy_status"
+        fi
+        if ! rmdir "$claim" 2>/dev/null; then
+            if [[ ! -e "$claim" ]] || ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+                exec 6<&-
+                return "$crontab_install_lock_busy_status"
+            fi
+            exec 6<&-
+            echo "Cannot safely retire the crontab installer gate recovery claim; no changes were made: $claim" >&2
+            return 2
+        fi
+        exec 6<&-
+    done
+    return 0
+}
+
+# Keep recovery ownership outside the reusable acquisition.gate name. Every
+# fresh gate creator rechecks sibling claims after mkdir, so a delayed retiree
+# cannot publish over that new identity. Claims carry PID/start metadata and
+# are themselves recoverable after a crash or incomplete owner publication.
+create_crontab_install_gate_recovery_claim() {
+    local gate_dir="$1" current_start="$2"
+    local claim candidate_attempt claim_descriptor_path="/dev/fd/6"
+
+    for candidate_attempt in {1..16}; do
+        claim="${gate_dir}.recovery.$$.$RANDOM.$RANDOM"
+        if [[ -e "$claim" || -L "$claim" ]]; then
+            continue
+        fi
+        if ! mkdir -m 700 "$claim" 2>/dev/null; then
+            if [[ -e "$claim" || -L "$claim" ]]; then
+                continue
+            fi
+            echo "Cannot create the crontab installer gate recovery claim; no changes were made." >&2
+            return 2
+        fi
+        if ! exec 6< "$claim"; then
+            rmdir "$claim" 2>/dev/null || :
+            return 2
+        fi
+        crontab_install_lock_owner_pid=""
+        crontab_install_lock_owner_start=""
+        if ! [[ "$claim" -ef "$claim_descriptor_path" ]] \
+            || ! (
+                cd -P -- "$claim" || exit 2
+                [[ . -ef "$claim_descriptor_path" ]] || exit 2
+                set -o noclobber
+                printf '%s %s\n' "$$" "$current_start" > ./owner
+            ) 2>/dev/null \
+            || ! read_crontab_install_lock_owner "$claim/owner" \
+            || [[ "$crontab_install_lock_owner_pid" != "$$" \
+                || "$crontab_install_lock_owner_start" != "$current_start" ]] \
+            || ! [[ "$claim" -ef "$claim_descriptor_path" ]]; then
+            if [[ -d "$claim" && "$claim" -ef "$claim_descriptor_path" ]]; then
+                (
+                    cd -P -- "$claim" || exit 2
+                    [[ . -ef "$claim_descriptor_path" ]] || exit 2
+                    rm -f ./owner.pending ./owner 2>/dev/null || :
+                ) || :
+                if [[ -d "$claim" && "$claim" -ef "$claim_descriptor_path" ]]; then
+                    rmdir "$claim" 2>/dev/null || :
+                fi
+            fi
+            exec 6<&-
+            echo "Cannot publish crontab installer gate recovery ownership; no changes were made." >&2
+            return 2
+        fi
+        crontab_install_gate_recovery_claim_dir="$claim"
+        crontab_install_gate_recovery_claim_held=1
+        return 0
+    done
+    echo "Cannot allocate a unique crontab installer gate recovery claim; no changes were made." >&2
+    return 2
+}
+
+retire_crontab_install_gate() {
+    local gate_dir="$1" expected_state="$2"
+    local expected_owner_pid="${3:-}" expected_owner_start="${4:-}"
+    local current_start quarantine_dir="" candidate_attempt cleanup_status=0
+    local gate_descriptor_path="/dev/fd/3"
+
+    current_start="$(process_start_identity "$$")" || return 2
+    create_crontab_install_gate_recovery_claim "$gate_dir" "$current_start" || return $?
+    if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+        release_crontab_install_gate_recovery_claim || :
+        return "$crontab_install_lock_busy_status"
+    fi
+    for candidate_attempt in {1..16}; do
+        quarantine_dir="${gate_dir}.quarantine.$$.$RANDOM.$RANDOM"
+        if [[ -e "$quarantine_dir" || -L "$quarantine_dir" ]]; then
+            quarantine_dir=""
+            continue
+        fi
+        if mkdir -m 700 "$quarantine_dir" 2>/dev/null; then
+            break
+        fi
+        if [[ ! -e "$quarantine_dir" && ! -L "$quarantine_dir" ]]; then
+            quarantine_dir=""
+            break
+        fi
+        quarantine_dir=""
+    done
+    if [[ -z "$quarantine_dir" ]]; then
+        release_crontab_install_gate_recovery_claim || :
+        echo "Cannot allocate the crontab installer gate quarantine; no changes were made." >&2
+        return 2
+    fi
+    if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]] \
+        || ! mv "$gate_dir" "$quarantine_dir/gate" 2>/dev/null; then
+        rmdir "$quarantine_dir" 2>/dev/null || :
+        if [[ ! -e "$gate_dir" ]] || ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+            release_crontab_install_gate_recovery_claim || :
+            return "$crontab_install_lock_busy_status"
+        fi
+        release_crontab_install_gate_recovery_claim || :
+        echo "Cannot quarantine the stale crontab installer acquisition gate; no changes were made." >&2
+        return 2
+    fi
+    if [[ ! -d "$quarantine_dir/gate" ]] \
+        || ! [[ "$quarantine_dir/gate" -ef "$gate_descriptor_path" ]]; then
+        release_crontab_install_gate_recovery_claim || :
+        echo "The crontab installer acquisition gate identity changed during quarantine; preserved $quarantine_dir for inspection and no changes were made." >&2
+        return 2
+    fi
+    (
+        cd -P -- "$quarantine_dir/gate" || exit 2
+        [[ . -ef "$gate_descriptor_path" ]] || exit 2
+        if [[ "$expected_state" == "owned" ]]; then
+            crontab_install_lock_owner_pid=""
+            crontab_install_lock_owner_start=""
+            read_crontab_install_lock_owner ./owner \
+                && [[ "$crontab_install_lock_owner_pid" == "$expected_owner_pid" \
+                    && "$crontab_install_lock_owner_start" == "$expected_owner_start" ]] \
+                || exit 2
+            rm -f ./owner || exit $?
+        elif [[ "$expected_state" == "invalid" ]]; then
+            [[ -f ./owner && ! -L ./owner ]] || exit 2
+            crontab_install_lock_owner_pid=""
+            crontab_install_lock_owner_start=""
+            if read_crontab_install_lock_owner ./owner; then
+                exit 2
+            fi
+            rm -f ./owner || exit $?
+        elif [[ -e ./owner || -L ./owner ]]; then
+            exit 2
+        fi
+        if [[ -e ./owner.pending || -L ./owner.pending ]]; then
+            [[ -f ./owner.pending && ! -L ./owner.pending ]] || exit 2
+            rm -f ./owner.pending || exit $?
+        fi
+    ) || cleanup_status=$?
+    if (( cleanup_status != 0 )) \
+        || ! [[ "$quarantine_dir/gate" -ef "$gate_descriptor_path" ]] \
+        || ! rmdir "$quarantine_dir/gate" 2>/dev/null \
+        || ! rmdir "$quarantine_dir" 2>/dev/null; then
+        release_crontab_install_gate_recovery_claim || :
+        echo "Cannot safely remove the quarantined crontab installer acquisition gate $quarantine_dir; inspect it manually and no changes were made." >&2
+        return 2
+    fi
+    release_crontab_install_gate_recovery_claim || return $?
+    return 0
+}
+
+acquire_crontab_install_gate() {
+    local gate_dir="$crontab_install_lock_root/acquisition.gate"
+    local gate_descriptor_path="/dev/fd/3"
+    local attempt current_start owner_start modified_epoch now_epoch
+    local claim_status retirement_status stale_owner_pid stale_owner_start invalid_owner
+    local saw_identity_churn=0
+
+    current_start="$(process_start_identity "$$")" || {
+        echo "Cannot determine the crontab installer identity for acquisition serialization; no changes were made." >&2
+        return 2
+    }
+    # Normal release unlinks owner immediately before rmdir. Retry identities
+    # that vanish or change during inspection. Stable abandoned metadata is
+    # recovered through an owned sibling claim and inode-checked quarantine;
+    # unsafe types remain fatal.
+    for attempt in 1 2 3; do
+        claim_status=0
+        crontab_install_gate_recovery_claims_are_clear "$gate_dir" || claim_status=$?
+        if (( claim_status != 0 )); then
+            return "$claim_status"
+        fi
+        if [[ -L "$gate_dir" || ( -e "$gate_dir" && ! -d "$gate_dir" ) ]]; then
+            echo "The crontab installer acquisition gate has an unsafe type; no changes were made: $gate_dir" >&2
+            return 2
+        fi
+        if mkdir -m 700 "$gate_dir" 2>/dev/null; then
+            if ! exec 3< "$gate_dir"; then
+                rmdir "$gate_dir" 2>/dev/null || :
+                return 2
+            fi
+            claim_status=0
+            crontab_install_gate_recovery_claims_are_clear "$gate_dir" || claim_status=$?
+            if (( claim_status != 0 )); then
+                if [[ -d "$gate_dir" && "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                    rmdir "$gate_dir" 2>/dev/null || :
+                fi
+                exec 3<&-
+                return "$claim_status"
+            fi
+            crontab_install_gate_dir="$gate_dir"
+            crontab_install_gate_held=1
+            crontab_install_lock_owner_pid=""
+            crontab_install_lock_owner_start=""
+            if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]] \
+                || ! (
+                    cd -P -- "$gate_dir" || exit 2
+                    [[ . -ef "$gate_descriptor_path" ]] || exit 2
+                    set -o noclobber
+                    printf '%s %s\n' "$$" "$current_start" > ./owner
+                ) 2>/dev/null \
+                || ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]] \
+                || ! read_crontab_install_lock_owner "$gate_dir/owner" \
+                || [[ "$crontab_install_lock_owner_pid" != "$$" \
+                    || "$crontab_install_lock_owner_start" != "$current_start" ]] \
+                || ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                if [[ -d "$gate_dir" && "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                    (
+                        cd -P -- "$gate_dir" || exit 2
+                        [[ . -ef "$gate_descriptor_path" ]] || exit 2
+                        rm -f ./owner.pending ./owner 2>/dev/null || :
+                    ) || :
+                    if [[ -d "$gate_dir" && "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                        rmdir "$gate_dir" 2>/dev/null || :
+                    fi
+                fi
+                exec 3<&-
+                crontab_install_gate_held=0
+                crontab_install_gate_dir=""
+                echo "Cannot publish crontab installer acquisition gate ownership; no changes were made." >&2
+                return 2
+            fi
+            trap cleanup_crontab_install_locks EXIT
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            return 0
+        fi
+
+        if [[ -L "$gate_dir" || ( -e "$gate_dir" && ! -d "$gate_dir" ) ]]; then
+            echo "The crontab installer acquisition gate has an unsafe type; no changes were made: $gate_dir" >&2
+            return 2
+        fi
+        if [[ ! -e "$gate_dir" ]]; then
+            continue
+        fi
+        if ! exec 3< "$gate_dir"; then
+            if [[ ! -e "$gate_dir" ]]; then
+                continue
+            fi
+            if [[ -L "$gate_dir" || ! -d "$gate_dir" ]]; then
+                echo "The crontab installer acquisition gate has an unsafe type; no changes were made: $gate_dir" >&2
+            else
+                echo "Cannot safely inspect the crontab installer acquisition gate; no changes were made." >&2
+            fi
+            return 2
+        fi
+        if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+            saw_identity_churn=1
+            exec 3<&-
+            if [[ -L "$gate_dir" || ( -e "$gate_dir" && ! -d "$gate_dir" ) ]]; then
+                echo "The crontab installer acquisition gate has an unsafe type; no changes were made: $gate_dir" >&2
+                return 2
+            fi
+            continue
+        fi
+
+        crontab_install_lock_owner_pid=""
+        crontab_install_lock_owner_start=""
+        if read_crontab_install_lock_owner "$gate_dir/owner"; then
+            if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                saw_identity_churn=1
+                exec 3<&-
+                continue
+            fi
+            if kill -0 "$crontab_install_lock_owner_pid" 2>/dev/null; then
+                if ! owner_start="$(process_start_identity "$crontab_install_lock_owner_pid")"; then
+                    if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                        saw_identity_churn=1
+                        exec 3<&-
+                        continue
+                    fi
+                    exec 3<&-
+                    echo "Cannot verify the crontab installer acquisition gate owner; no changes were made." >&2
+                    return 2
+                fi
+                if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                    saw_identity_churn=1
+                    exec 3<&-
+                    continue
+                fi
+                if [[ "$owner_start" == "$crontab_install_lock_owner_start" ]]; then
+                    exec 3<&-
+                    echo "Another leveraged-trader crontab installation is acquiring the global lock; no changes were made." >&2
+                    return "$crontab_install_lock_busy_status"
+                fi
+            fi
+            if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                saw_identity_churn=1
+                exec 3<&-
+                continue
+            fi
+            stale_owner_pid="$crontab_install_lock_owner_pid"
+            stale_owner_start="$crontab_install_lock_owner_start"
+            retirement_status=0
+            retire_crontab_install_gate \
+                "$gate_dir" owned "$stale_owner_pid" "$stale_owner_start" \
+                || retirement_status=$?
+            exec 3<&-
+            if (( retirement_status == 0 )); then
+                continue
+            fi
+            if (( retirement_status == crontab_install_lock_busy_status )); then
+                saw_identity_churn=1
+                continue
+            fi
+            return "$retirement_status"
+        fi
+        if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+            saw_identity_churn=1
+            exec 3<&-
+            continue
+        fi
+        invalid_owner=0
+        if [[ -L "$gate_dir/owner" \
+            || ( -e "$gate_dir/owner" && ! -f "$gate_dir/owner" ) \
+            || -L "$gate_dir/owner.pending" \
+            || ( -e "$gate_dir/owner.pending" && ! -f "$gate_dir/owner.pending" ) ]]; then
+            exec 3<&-
+            echo "The crontab installer acquisition gate has unsafe ownership metadata; no changes were made." >&2
+            return 2
+        fi
+        if [[ -f "$gate_dir/owner" ]]; then
+            invalid_owner=1
+        fi
+        if ! modified_epoch="$(path_modified_epoch "$gate_dir")" \
+            || ! now_epoch="$(date '+%s')" \
+            || [[ ! "$now_epoch" =~ ^[0-9]+$ ]]; then
+            if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+                saw_identity_churn=1
+                exec 3<&-
+                continue
+            fi
+            exec 3<&-
+            echo "Cannot verify the crontab installer acquisition gate state; no changes were made." >&2
+            return 2
+        fi
+        if ! [[ "$gate_dir" -ef "$gate_descriptor_path" ]]; then
+            saw_identity_churn=1
+            exec 3<&-
+            continue
+        fi
+        if (( now_epoch >= modified_epoch \
+            && now_epoch - modified_epoch < crontab_install_lock_publish_grace_seconds )); then
+            exec 3<&-
+            echo "Another leveraged-trader crontab installation is publishing its acquisition gate; no changes were made." >&2
+            return "$crontab_install_lock_busy_status"
+        fi
+        if (( now_epoch < modified_epoch )); then
+            exec 3<&-
+            echo "Cannot verify the crontab installer acquisition gate age; no changes were made." >&2
+            return 2
+        fi
+        retirement_status=0
+        if (( invalid_owner )); then
+            retire_crontab_install_gate "$gate_dir" invalid || retirement_status=$?
+        else
+            retire_crontab_install_gate "$gate_dir" ownerless || retirement_status=$?
+        fi
+        exec 3<&-
+        if (( retirement_status == 0 )); then
+            continue
+        fi
+        if (( retirement_status == crontab_install_lock_busy_status )); then
+            saw_identity_churn=1
+            continue
+        fi
+        return "$retirement_status"
+    done
+
+    if (( saw_identity_churn )); then
+        echo "Another leveraged-trader crontab installation is changing its acquisition gate; no changes were made." >&2
+        return "$crontab_install_lock_busy_status"
+    fi
+    echo "Cannot create the crontab installer acquisition gate; no changes were made." >&2
+    return 2
+}
+
+release_crontab_install_lock() {
+    local current_start="" release_status=0
+    local lock_descriptor_path="/dev/fd/5"
+
+    if (( ! crontab_install_lock_held )); then
+        return 0
+    fi
+    current_start="$(process_start_identity "$$")" || true
+    if [[ ! -d "$crontab_install_lock_dir" ]] \
+        || ! [[ "$crontab_install_lock_dir" -ef "$lock_descriptor_path" ]] \
+        || ! (
+            cd -P -- "$crontab_install_lock_dir" || exit 2
+            [[ . -ef "$lock_descriptor_path" ]] || exit 2
+            crontab_install_lock_owner_pid=""
+            crontab_install_lock_owner_start=""
+            read_crontab_install_lock_owner ./owner \
+                && [[ "$crontab_install_lock_owner_pid" == "$$" \
+                    && "$crontab_install_lock_owner_start" == "$current_start" ]] \
+                || exit 2
+            rm -f ./owner || exit $?
+        ); then
+        release_status=2
+    elif ! [[ "$crontab_install_lock_dir" -ef "$lock_descriptor_path" ]] \
+        || ! rmdir "$crontab_install_lock_dir" 2>/dev/null; then
+        release_status=2
+    fi
+    exec 5<&- || :
+    if (( release_status != 0 )); then
+        echo "Cannot safely release crontab installer lock $crontab_install_lock_dir; inspect it manually and no changes were made." >&2
+    fi
+    crontab_install_lock_held=0
+    return "$release_status"
+}
+
+cleanup_crontab_install_locks() {
+    if [[ -n "$scheduler_bootstrap_pending_file" ]]; then
+        rm -f "$scheduler_bootstrap_pending_file" 2>/dev/null || :
+        scheduler_bootstrap_pending_file=""
+    fi
+    release_crontab_install_lock || :
+    release_crontab_install_gate || :
+    release_crontab_install_gate_recovery_claim || :
+}
+
+acquire_crontab_install_lock() {
+    local attempt current_start owner_path owner_temp
+    local publication_status retirement_status stale_status
+    local lock_descriptor_path="/dev/fd/5"
+    local saw_identity_churn=0
+
+    current_start="$(process_start_identity "$$")" || {
+        echo "Cannot determine the crontab installer process start identity; no changes were made." >&2
+        return 2
+    }
+    crontab_install_lock_dir="$crontab_install_lock_root/active.lock"
+    if [[ -L "$crontab_install_lock_dir" \
+        || ( -e "$crontab_install_lock_dir" && ! -d "$crontab_install_lock_dir" ) ]]; then
+        echo "The crontab installer lock path is not a regular directory; no changes were made." >&2
+        return 2
+    fi
+
+    for attempt in 1 2 3; do
+        if mkdir -m 700 "$crontab_install_lock_dir" 2>/dev/null; then
+            crontab_install_lock_held=1
+            if ! exec 5< "$crontab_install_lock_dir"; then
+                rmdir "$crontab_install_lock_dir" 2>/dev/null || :
+                crontab_install_lock_held=0
+                return 2
+            fi
+            owner_path="$crontab_install_lock_dir/owner"
+            owner_temp="$crontab_install_lock_dir/owner.pending"
+            publication_status=0
+            if ! [[ "$crontab_install_lock_dir" -ef "$lock_descriptor_path" ]]; then
+                publication_status=2
+            elif ! (
+                cd -P -- "$crontab_install_lock_dir" || exit 2
+                [[ . -ef "$lock_descriptor_path" ]] || exit 2
+                set -o noclobber
+                printf '%s %s\n' "$$" "$current_start" > ./owner.pending
+                [[ . -ef "$lock_descriptor_path" ]] || exit 2
+                mv ./owner.pending ./owner
+            ) 2>/dev/null; then
+                publication_status=2
+            elif ! [[ "$crontab_install_lock_dir" -ef "$lock_descriptor_path" ]]; then
+                publication_status=2
+            else
+                crontab_install_lock_owner_pid=""
+                crontab_install_lock_owner_start=""
+                if ! read_crontab_install_lock_owner "$owner_path" \
+                    || [[ "$crontab_install_lock_owner_pid" != "$$" \
+                        || "$crontab_install_lock_owner_start" != "$current_start" ]] \
+                    || ! [[ "$crontab_install_lock_dir" -ef "$lock_descriptor_path" ]]; then
+                    publication_status=2
+                fi
+            fi
+            if (( publication_status != 0 )); then
+                if [[ -d "$crontab_install_lock_dir" ]] \
+                    && [[ "$crontab_install_lock_dir" -ef "$lock_descriptor_path" ]]; then
+                    (
+                        cd -P -- "$crontab_install_lock_dir" || exit 2
+                        [[ . -ef "$lock_descriptor_path" ]] || exit 2
+                        rm -f ./owner.pending ./owner 2>/dev/null || :
+                    ) || :
+                    if [[ -d "$crontab_install_lock_dir" ]] \
+                        && [[ "$crontab_install_lock_dir" -ef "$lock_descriptor_path" ]]; then
+                        rmdir "$crontab_install_lock_dir" 2>/dev/null || :
+                    fi
+                fi
+                exec 5<&-
+                crontab_install_lock_held=0
+                echo "Cannot publish crontab installer lock ownership metadata; no changes were made." >&2
+                return 2
+            fi
+            trap cleanup_crontab_install_locks EXIT
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            return 0
+        fi
+
+        if [[ -L "$crontab_install_lock_dir" \
+            || ( -e "$crontab_install_lock_dir" && ! -d "$crontab_install_lock_dir" ) ]]; then
+            echo "The crontab installer lock path changed type; no changes were made." >&2
+            return 2
+        fi
+        if [[ ! -e "$crontab_install_lock_dir" ]]; then
+            continue
+        fi
+
+        # Keep the directory being inspected open so stale recovery is bound to
+        # that directory's identity, not merely to the reusable active.lock
+        # pathname. This prevents a replacement live lock from being mistaken
+        # for the stale directory after an owner check.
+        if ! exec 5< "$crontab_install_lock_dir"; then
+            if [[ ! -e "$crontab_install_lock_dir" ]]; then
+                continue
+            fi
+            if [[ -L "$crontab_install_lock_dir" || ! -d "$crontab_install_lock_dir" ]]; then
+                echo "The crontab installer lock path changed type; no changes were made." >&2
+                return 2
+            fi
+            echo "Cannot open the crontab installer lock for stale-lock inspection; no changes were made." >&2
+            return 2
+        fi
+        if ! [[ "$crontab_install_lock_dir" -ef "$lock_descriptor_path" ]]; then
+            saw_identity_churn=1
+            exec 5<&-
+            if [[ -L "$crontab_install_lock_dir" \
+                || ( -e "$crontab_install_lock_dir" && ! -d "$crontab_install_lock_dir" ) ]]; then
+                echo "The crontab installer lock path changed type; no changes were made." >&2
+                return 2
+            fi
+            continue
+        fi
+
+        stale_status=0
+        crontab_install_lock_is_stale "$crontab_install_lock_dir" || stale_status=$?
+        if (( stale_status != 0 )); then
+            if ! [[ "$crontab_install_lock_dir" -ef "$lock_descriptor_path" ]]; then
+                saw_identity_churn=1
+                exec 5<&-
+                if [[ -L "$crontab_install_lock_dir" \
+                    || ( -e "$crontab_install_lock_dir" && ! -d "$crontab_install_lock_dir" ) ]]; then
+                    echo "The crontab installer lock path changed type; no changes were made." >&2
+                    return 2
+                fi
+                continue
+            fi
+            exec 5<&-
+            return "$stale_status"
+        fi
+        if ! [[ "$crontab_install_lock_dir" -ef "$lock_descriptor_path" ]]; then
+            saw_identity_churn=1
+            exec 5<&-
+            continue
+        fi
+
+        # The sibling acquisition gate serializes every conforming contender.
+        # Relative cleanup from an anchored cwd additionally guarantees that a
+        # nonconforming pathname replacement is never mutated.
+        retirement_status=0
+        (
+            cd -P -- "$crontab_install_lock_dir" || exit 2
+            [[ . -ef "$lock_descriptor_path" ]] || exit 2
+            rm -f ./owner ./owner.pending 2>/dev/null || :
+            if [[ -L ./.stale-recovery \
+                || ( -e ./.stale-recovery && ! -d ./.stale-recovery ) ]]; then
+                exit 2
+            fi
+            if [[ -d ./.stale-recovery ]]; then
+                rm -f ./.stale-recovery/owner ./.stale-recovery/owner.pending 2>/dev/null || :
+                rmdir ./.stale-recovery 2>/dev/null || exit 2
+            fi
+        ) || retirement_status=$?
+        if (( retirement_status != 0 )); then
+            if ! [[ "$crontab_install_lock_dir" -ef "$lock_descriptor_path" ]]; then
+                saw_identity_churn=1
+                exec 5<&-
+                if [[ -L "$crontab_install_lock_dir" \
+                    || ( -e "$crontab_install_lock_dir" && ! -d "$crontab_install_lock_dir" ) ]]; then
+                    echo "The crontab installer lock path changed type; no changes were made." >&2
+                    return 2
+                fi
+                continue
+            fi
+            exec 5<&-
+            echo "Cannot safely retire the stale crontab installer lock; inspect it manually and no changes were made." >&2
+            return 2
+        fi
+        if ! [[ "$crontab_install_lock_dir" -ef "$lock_descriptor_path" ]]; then
+            saw_identity_churn=1
+            exec 5<&-
+            if [[ -L "$crontab_install_lock_dir" \
+                || ( -e "$crontab_install_lock_dir" && ! -d "$crontab_install_lock_dir" ) ]]; then
+                echo "The crontab installer lock path changed type; no changes were made." >&2
+                return 2
+            fi
+            continue
+        fi
+        if ! rmdir "$crontab_install_lock_dir" 2>/dev/null; then
+            if ! [[ "$crontab_install_lock_dir" -ef "$lock_descriptor_path" ]]; then
+                saw_identity_churn=1
+                exec 5<&-
+                if [[ -L "$crontab_install_lock_dir" \
+                    || ( -e "$crontab_install_lock_dir" && ! -d "$crontab_install_lock_dir" ) ]]; then
+                    echo "The crontab installer lock path changed type; no changes were made." >&2
+                    return 2
+                fi
+                continue
+            fi
+            exec 5<&-
+            echo "Cannot remove the stale crontab installer lock after serialized recovery; inspect it manually and no changes were made." >&2
+            return 2
+        fi
+        exec 5<&-
+    done
+
+    if (( saw_identity_churn )); then
+        echo "Another leveraged-trader crontab installation is changing the global lock; no changes were made." >&2
+        return "$crontab_install_lock_busy_status"
+    fi
+    echo "Cannot create the crontab installer lock; no changes were made." >&2
+    return 2
+}
+
+require_root_owned_bootstrap_executable() {
+    local path="$1"
+    local description="$2"
+    local root_owner file_status file_owner file_mode
+
+    root_owner="$(runtime_security_path_owner_uid_lstat /)" || return $?
+    file_status="$(runtime_security_owner_mode_follow "$path")" || return $?
+    read -r file_owner file_mode <<< "$file_status"
+    if [[ "$file_owner" != "$root_owner" ]]; then
+        echo "The scheduler bootstrap $description must be controlled by the filesystem-root owner: $path" >&2
+        return 2
+    fi
+}
+
+uv_bin=""
+# `command -v` may report a shell function, alias, or relative PATH hit.  Cron
+# needs one durable external executable after PATH is reduced, so ignore shell
+# wrappers and record an absolute lexical path.
+if uv_candidate="$(type -P uv 2>/dev/null)" && [[ -n "$uv_candidate" ]]; then
+    uv_bin="$(absolute_lexical_path "$uv_candidate")" || exit $?
+elif [[ -n "${HOME:-}" && -x "$HOME/.local/bin/uv" ]]; then
+    uv_bin="$(absolute_lexical_path "$HOME/.local/bin/uv")" || exit $?
+fi
+if [[ -z "$uv_bin" ]]; then
     echo "Unable to find uv. Install uv before installing the crontab." >&2
     exit 127
 fi
+require_control_free_path "$uv_bin" "uv executable path" || exit $?
+if [[ "$uv_bin" != /* || ! -f "$uv_bin" || ! -x "$uv_bin" ]]; then
+    echo "Unable to validate the uv executable: $uv_bin" >&2
+    exit 127
+fi
+uv_bin="$(runtime_security_validate_trusted_executable "$uv_bin" "uv executable")" || exit $?
 
-mkdir -p "$repo_dir/outputs"
+# Use the interpreter that is already running this installer. Its absolute
+# path remains usable when the scheduled command deliberately restricts PATH,
+# including on systems where Bash is installed outside /usr/bin and /bin.
+bash_bin="${BASH:-}"
+if [[ "$bash_bin" != /* ]]; then
+    bash_bin="$(command -v bash)"
+fi
+bash_bin="$(absolute_lexical_path "$bash_bin")" || exit $?
+require_control_free_path "$bash_bin" "Bash executable path" || exit $?
+if [[ ! -f "$bash_bin" || ! -x "$bash_bin" ]]; then
+    echo "Unable to validate the current Bash executable: $bash_bin" >&2
+    exit 127
+fi
+bash_bin="$(runtime_security_validate_trusted_executable "$bash_bin" "Bash executable")" || exit $?
+bootstrap_bash_bin=""
+for bootstrap_bash_candidate in /bin/bash /usr/bin/bash; do
+    if [[ -f "$bootstrap_bash_candidate" && -x "$bootstrap_bash_candidate" ]]; then
+        bootstrap_bash_bin="$(
+            runtime_security_validate_trusted_executable \
+                "$bootstrap_bash_candidate" \
+                "bootstrap Bash executable"
+        )" || exit $?
+        break
+    fi
+done
+unset bootstrap_bash_candidate
+if [[ -z "$bootstrap_bash_bin" ]]; then
+    echo "Unable to find a fixed system Bash executable for the scheduler bootstrap." >&2
+    exit 127
+fi
+require_root_owned_bootstrap_executable \
+    "$bootstrap_bash_bin" \
+    "Bash executable" || exit $?
+sha256_bin=""
+sha256_mode=""
+for sha256_candidate in /usr/bin/sha256sum /bin/sha256sum; do
+    if [[ -f "$sha256_candidate" && -x "$sha256_candidate" ]]; then
+        sha256_bin="$sha256_candidate"
+        sha256_mode=plain
+        break
+    fi
+done
+if [[ -z "$sha256_bin" ]]; then
+    for sha256_candidate in /usr/bin/shasum /bin/shasum; do
+        if [[ -f "$sha256_candidate" && -x "$sha256_candidate" ]]; then
+            sha256_bin="$sha256_candidate"
+            sha256_mode=shasum
+            break
+        fi
+    done
+fi
+unset sha256_candidate
+if [[ -z "$sha256_bin" ]]; then
+    echo "Unable to find the SHA-256 executable required by the scheduler bootstrap." >&2
+    exit 127
+fi
+sha256_bin="$(
+    runtime_security_validate_trusted_executable "$sha256_bin" "SHA-256 executable"
+)" || exit $?
+require_root_owned_bootstrap_executable \
+    "$sha256_bin" \
+    "SHA-256 executable" || exit $?
+if [[ ! -f /usr/bin/env || ! -x /usr/bin/env ]]; then
+    echo "Unable to find the required environment launcher: /usr/bin/env" >&2
+    exit 127
+fi
+env_bin="$(runtime_security_validate_trusted_executable /usr/bin/env "environment launcher")" || exit $?
+require_root_owned_bootstrap_executable \
+    "$env_bin" \
+    "environment launcher" || exit $?
+if [[ ! -f /bin/sh || ! -x /bin/sh ]]; then
+    echo "Unable to find the required POSIX shell launcher: /bin/sh" >&2
+    exit 127
+fi
+sh_bin="$(
+    runtime_security_validate_trusted_executable_entry /bin/sh "POSIX shell launcher"
+)" || exit $?
+require_root_owned_bootstrap_executable \
+    "$sh_bin" \
+    "POSIX shell launcher" || exit $?
+scheduler="$(runtime_security_validate_trusted_executable "$scheduler" "scheduler executable")" || exit $?
+clean_environment_launcher="$(
+    runtime_security_validate_trusted_executable \
+        "$clean_environment_launcher" \
+        "scheduler clean-environment launcher"
+)" || exit $?
+runtime_security_sha256="$(sha256_file_digest "$runtime_security_file")" || exit $?
 
-existing_crontab="$(crontab -l 2>/dev/null || true)"
+read_current_crontab || exit $?
+existing_crontab="$current_crontab"
+
+managed_block_count=0
+inside_managed_block=0
+marker_error=""
+while IFS= read -r line; do
+    if [[ "$line" == "$marker_start" ]]; then
+        if (( inside_managed_block )); then
+            marker_error="nested managed schedule start marker"
+            break
+        fi
+        if (( managed_block_count )); then
+            marker_error="duplicate managed schedule block"
+            break
+        fi
+        inside_managed_block=1
+        ((managed_block_count += 1))
+    elif [[ "$line" == "$marker_end" ]]; then
+        if (( ! inside_managed_block )); then
+            marker_error="orphaned or reversed managed schedule end marker"
+            break
+        fi
+        inside_managed_block=0
+    fi
+done <<< "$existing_crontab"
+if [[ -z "$marker_error" ]] && (( inside_managed_block )); then
+    marker_error="orphaned managed schedule start marker"
+fi
+if [[ -n "$marker_error" ]]; then
+    echo "Invalid existing leveraged-trader crontab markers ($marker_error); no changes were made." >&2
+    exit 1
+fi
+
 filtered_crontab="$(printf '%s\n' "$existing_crontab" | awk -v start="$marker_start" -v end="$marker_end" '
     $0 == start { managed = 1; next }
     $0 == end { managed = 0; next }
     !managed { print }
 ')"
 
-{
+# SHELL and ordinary environment assignments are positional in a crontab.
+# Select /bin/sh and neutral Bash startup-option values for the one managed
+# command, then restore the last preserved settings for jobs appended in the
+# future.  SHELLOPTS must be neutralized before cron starts its outer shell:
+# on systems where /bin/sh is Bash, an inherited `SHELLOPTS=noexec` would
+# otherwise make that shell silently skip the /usr/bin/env cleanup below.
+restored_shell_assignment="$(printf '%s\n' "$filtered_crontab" | awk '
+    /^[[:space:]]*SHELL[[:space:]]*=/ { assignment = $0 }
+    END { if (assignment != "") print assignment }
+')"
+if [[ -z "$restored_shell_assignment" ]]; then
+    restored_shell_assignment='SHELL=/bin/sh'
+fi
+restored_shellopts_assignment="$(printf '%s\n' "$filtered_crontab" | awk '
+    /^[[:space:]]*SHELLOPTS[[:space:]]*=/ { assignment = $0 }
+    END { if (assignment != "") print assignment }
+')"
+if [[ -z "$restored_shellopts_assignment" ]]; then
+    restored_shellopts_assignment='SHELLOPTS='
+fi
+restored_bashopts_assignment="$(printf '%s\n' "$filtered_crontab" | awk '
+    /^[[:space:]]*BASHOPTS[[:space:]]*=/ { assignment = $0 }
+    END { if (assignment != "") print assignment }
+')"
+if [[ -z "$restored_bashopts_assignment" ]]; then
+    restored_bashopts_assignment='BASHOPTS='
+fi
+
+# These variables can redirect shell startup, executable loading, or
+# credential-bearing HTTPS traffic before the clean environment is established.
+# Empty them as positional crontab assignments so they cannot affect cron's
+# outer shell; `env -i` then excludes them from the managed command, and the
+# prior assignments are restored for jobs appended below this block.
+boundary_environment_names=(
+    BASH_ENV
+    ENV
+    LD_PRELOAD
+    LD_LIBRARY_PATH
+    LD_AUDIT
+    DYLD_INSERT_LIBRARIES
+    DYLD_LIBRARY_PATH
+    DYLD_FRAMEWORK_PATH
+    DYLD_FALLBACK_LIBRARY_PATH
+    DYLD_FALLBACK_FRAMEWORK_PATH
+    LIBPATH
+    SHLIB_PATH
+    HTTP_PROXY
+    HTTPS_PROXY
+    ALL_PROXY
+    NO_PROXY
+    http_proxy
+    https_proxy
+    all_proxy
+    no_proxy
+    FTP_PROXY
+    ftp_proxy
+    REQUESTS_CA_BUNDLE
+    CURL_CA_BUNDLE
+    SSL_CERT_FILE
+    SSL_CERT_DIR
+    SSLKEYLOGFILE
+    OPENSSL_CONF
+    OPENSSL_CONF_INCLUDE
+    OPENSSL_MODULES
+    OPENSSL_ENGINES
+)
+restored_boundary_assignments=()
+for environment_name in "${boundary_environment_names[@]}"; do
+    restored_assignment="$(printf '%s\n' "$filtered_crontab" | awk -v name="$environment_name" '
+        $0 ~ "^[[:space:]]*" name "[[:space:]]*=" { assignment = $0 }
+        END { if (assignment != "") print assignment }
+    ')"
+    if [[ -z "$restored_assignment" ]]; then
+        restored_assignment="$environment_name="
+    fi
+    restored_boundary_assignments+=("$restored_assignment")
+done
+
+secure_private_directory "$output_dir" "output" || exit $?
+output_dir="$secured_private_directory"
+# Keep the cross-checkout installer lock below an owner-controlled namespace.
+# A predictable first-created entry in /tmp can be claimed permanently by a
+# different OS user even though sticky-directory semantics prevent replacing it.
+# Resolve ~ with HOME unset in a subshell so two callers with different HOME
+# values still select the same account-wide mutex without altering the HOME
+# used elsewhere by this installer. Tests may select an isolated account home
+# only through the explicit two-variable test gate below.
+installer_test_mode="${LEVERAGED_TRADER_INSTALLER_TEST_ONLY_MODE:-}"
+installer_test_account_home="${LEVERAGED_TRADER_INSTALLER_TEST_ONLY_ACCOUNT_HOME:-}"
+if [[ -n "$installer_test_mode" || -n "$installer_test_account_home" ]]; then
+    if [[ "$installer_test_mode" != "1" || -z "$installer_test_account_home" ]]; then
+        echo "The crontab installer test-only lock override is incomplete; no changes were made." >&2
+        exit 2
+    fi
+    crontab_install_home="$installer_test_account_home"
+else
+    crontab_install_home="$(unset HOME; cd -P -- ~ && pwd -P)" || {
+        echo "Cannot resolve the current user's home for the crontab installer lock; no changes were made." >&2
+        exit 2
+    }
+fi
+if [[ "$crontab_install_home" != /* ]]; then
+    echo "The current user's home must be absolute for the crontab installer lock; no changes were made." >&2
+    exit 2
+fi
+crontab_install_lock_root="$crontab_install_home/.local/state/leveraged-trader/crontab-install"
+secure_private_directory "$crontab_install_lock_root" "crontab installer lock" || exit $?
+crontab_install_lock_root="$secured_private_directory"
+scheduler_bootstrap_root="$crontab_install_home/.local/state/leveraged-trader/cron-runtime"
+secure_private_directory "$scheduler_bootstrap_root" "scheduler bootstrap" || exit $?
+scheduler_bootstrap_root="$secured_private_directory"
+crontab_install_status=0
+crontab_install_gate_release_status=0
+acquire_crontab_install_gate || crontab_install_status=$?
+if (( crontab_install_status == 0 )); then
+    acquire_crontab_install_lock || crontab_install_status=$?
+fi
+if (( crontab_install_gate_held )); then
+    release_crontab_install_gate || crontab_install_gate_release_status=$?
+fi
+if (( crontab_install_gate_release_status != 0 )); then
+    release_crontab_install_lock || :
+    exit "$crontab_install_gate_release_status"
+fi
+if (( crontab_install_status != 0 )); then
+    exit "$crontab_install_status"
+fi
+
+# A second cooperating installer cannot enter this section. Abort instead of
+# overwriting an edit made between our initial read and lock acquisition.
+read_current_crontab || exit $?
+if [[ "$current_crontab" != "$existing_crontab" ]]; then
+    echo "The crontab changed while the installer was preparing; no changes were made." >&2
+    exit 75
+fi
+if [[ "$output_dir" == "/" ]]; then
+    log_file="/cron.log"
+else
+    log_file="$output_dir/cron.log"
+fi
+
+# Build a content-addressed launcher below the account's private state
+# directory. The generated prefix binds the authenticated checked-in source to
+# this checkout and to the external tools validated above, while keeping long
+# checkout paths out of the portable 1,000-byte crontab line.
+clean_environment_source=""
+clean_environment_read_status=0
+exec 9< "$clean_environment_launcher" || {
+    echo "Unable to open the scheduler clean-environment launcher." >&2
+    exit 2
+}
+if [[ ! -f /dev/fd/9 || ! "$clean_environment_launcher" -ef /dev/fd/9 ]]; then
+    exec 9<&-
+    echo "The scheduler clean-environment launcher changed while it was being opened." >&2
+    exit 2
+fi
+clean_environment_expected_size="$(file_byte_size /dev/fd/9)" || {
+    exec 9<&-
+    exit 2
+}
+if (( clean_environment_expected_size == 0 || clean_environment_expected_size > 1048576 )); then
+    exec 9<&-
+    echo "The scheduler clean-environment launcher must contain between 1 and 1048576 bytes." >&2
+    exit 2
+fi
+if IFS= read -r -d '' clean_environment_source <&9; then
+    exec 9<&-
+    echo "The scheduler clean-environment launcher must not contain NUL bytes." >&2
+    exit 2
+else
+    clean_environment_read_status=$?
+fi
+clean_environment_actual_size="$(ascii_byte_length "$clean_environment_source")" || {
+    exec 9<&-
+    exit 2
+}
+clean_environment_final_size="$(file_byte_size /dev/fd/9)" || {
+    exec 9<&-
+    exit 2
+}
+if (( clean_environment_read_status != 1 \
+    || clean_environment_actual_size != clean_environment_expected_size \
+    || clean_environment_final_size != clean_environment_expected_size )) \
+    || [[ ! "$clean_environment_launcher" -ef /dev/fd/9 ]]; then
+    exec 9<&-
+    echo "Unable to read the scheduler clean-environment launcher losslessly." >&2
+    exit 2
+fi
+exec 9<&-
+unset clean_environment_read_status clean_environment_expected_size
+unset clean_environment_actual_size clean_environment_final_size
+
+quoted_launcher_origin="$(
+    posix_shell_quote "$clean_environment_launcher" "scheduler clean-environment launcher path"
+)" || exit $?
+quoted_bootstrap_bash="$(posix_shell_quote "$bash_bin" "Bash executable path")" || exit $?
+quoted_bootstrap_sha256="$(
+    posix_shell_quote "$sha256_bin" "SHA-256 executable path"
+)" || exit $?
+quoted_bootstrap_sha256_mode="$(
+    posix_shell_quote "$sha256_mode" "SHA-256 mode"
+)" || exit $?
+quoted_runtime_security_sha256="$(
+    posix_shell_quote "$runtime_security_sha256" "runtime-security digest"
+)" || exit $?
+printf -v scheduler_bootstrap_prefix \
+    'LEVERAGED_TRADER_AUTHENTICATED_LAUNCHER_PATH=%s\nset -- %s "$5" %s %s %s\n' \
+    "$quoted_launcher_origin" \
+    "$quoted_bootstrap_bash" \
+    "$quoted_bootstrap_sha256" \
+    "$quoted_bootstrap_sha256_mode" \
+    "$quoted_runtime_security_sha256"
+scheduler_bootstrap_content="$scheduler_bootstrap_prefix$clean_environment_source"
+unset scheduler_bootstrap_prefix clean_environment_source
+
+scheduler_bootstrap_pending_file="$(
+    mktemp "$scheduler_bootstrap_root/.run-scheduled-clean-environment.XXXXXXXX"
+)" || exit $?
+printf '%s' "$scheduler_bootstrap_content" > "$scheduler_bootstrap_pending_file" || exit $?
+chmod 400 "$scheduler_bootstrap_pending_file" || exit $?
+scheduler_bootstrap_sha256="$(
+    sha256_file_digest "$scheduler_bootstrap_pending_file"
+)" || exit $?
+scheduler_bootstrap_path="$scheduler_bootstrap_root/run-scheduled-clean-environment-$scheduler_bootstrap_sha256"
+if [[ -e "$scheduler_bootstrap_path" || -L "$scheduler_bootstrap_path" ]]; then
+    runtime_security_validate_trusted_regular_file \
+        "$scheduler_bootstrap_path" \
+        "installed scheduler bootstrap" >/dev/null || exit $?
+    existing_bootstrap_sha256="$(sha256_file_digest "$scheduler_bootstrap_path")" || exit $?
+    if [[ "$existing_bootstrap_sha256" != "$scheduler_bootstrap_sha256" ]]; then
+        echo "The content-addressed scheduler bootstrap has unexpected contents; no crontab changes were made." >&2
+        exit 2
+    fi
+    rm -f "$scheduler_bootstrap_pending_file" || exit $?
+else
+    mv "$scheduler_bootstrap_pending_file" "$scheduler_bootstrap_path" || exit $?
+fi
+scheduler_bootstrap_pending_file=""
+runtime_security_validate_trusted_regular_file \
+    "$scheduler_bootstrap_path" \
+    "installed scheduler bootstrap" >/dev/null || exit $?
+scheduler_bootstrap_links="$(
+    runtime_security_regular_file_link_count "$scheduler_bootstrap_path"
+)" || exit $?
+if (( scheduler_bootstrap_links != 1 )); then
+    echo "The installed scheduler bootstrap must not have multiple hard links." >&2
+    exit 2
+fi
+unset scheduler_bootstrap_links existing_bootstrap_sha256 scheduler_bootstrap_content
+
+# Establish an empty environment before trusted Bash starts. This compact code
+# reads the installed bootstrap as inert data, authenticates those exact bytes,
+# and evaluates the already-captured snapshot; later path changes cannot alter
+# the code that executes.
+cron_bootstrap_code='set -euo pipefail;p=$1;h=$2;m=$3;e=$4;c=;if IFS= read -r -d "" c < "$p";then echo "Scheduler bootstrap must not contain NUL bytes." >&2;exit 2;fi;case $m in plain)o=$(printf %s "$c"|"$h");;shasum)o=$(printf %s "$c"|"$h" -a 256);;*)exit 2;;esac;[[ $o =~ ^([0-9A-Fa-f]{64})[[:space:]][[:space:]]*-$ && ${BASH_REMATCH[1]} == "$e" ]]||{ echo "Scheduler bootstrap changed after crontab installation; reinstall the crontab." >&2;exit 2;};builtin eval "$c"'
+quoted_cron_bootstrap_code="$(
+    posix_shell_quote "$cron_bootstrap_code" "cron bootstrap code"
+)" || exit $?
+quoted_uv_bin="$(posix_shell_quote "$uv_bin" "uv executable path")" || exit $?
+quoted_cron_bash_bin="$(
+    posix_shell_quote "$bootstrap_bash_bin" "bootstrap Bash executable path"
+)" || exit $?
+quoted_scheduler_bootstrap_path="$(
+    posix_shell_quote "$scheduler_bootstrap_path" "installed scheduler bootstrap path"
+)" || exit $?
+quoted_sha256_bin="$(posix_shell_quote "$sha256_bin" "SHA-256 executable path")" || exit $?
+quoted_sha256_mode="$(posix_shell_quote "$sha256_mode" "SHA-256 mode")" || exit $?
+quoted_scheduler_bootstrap_sha256="$(
+    posix_shell_quote "$scheduler_bootstrap_sha256" "scheduler bootstrap digest"
+)" || exit $?
+shell_command="$env_bin -i SHELL=/bin/sh PATH=/usr/bin:/bin \
+$quoted_cron_bash_bin -c $quoted_cron_bootstrap_code cron-bootstrap \
+$quoted_scheduler_bootstrap_path $quoted_sha256_bin $quoted_sha256_mode \
+$quoted_scheduler_bootstrap_sha256 $quoted_uv_bin"
+# In a crontab command, an unescaped percent starts data for the command's
+# standard input even when the percent is inside shell quotes.  The quoting
+# helper ensures no percent is immediately preceded by a path backslash, so
+# each replacement creates an odd run of exactly one raw backslash. Cron removes
+# that extra backslash before the command reaches the shell.
+cron_command="${shell_command//%/\\%}"
+cron_schedule_line="* * * * * $cron_command"
+cron_max_line_bytes=1000
+cron_schedule_line_byte_count="$(ascii_byte_length "$cron_schedule_line")" || exit $?
+if [[ ! "$cron_schedule_line_byte_count" =~ ^[0-9]+$ ]] \
+    || (( cron_schedule_line_byte_count > cron_max_line_bytes )); then
+    echo "The managed cron entry is too long for portable cron implementations (${cron_schedule_line_byte_count:-unknown} bytes; maximum $cron_max_line_bytes). Move the account state directory or uv executable to a shorter path; no changes were made." >&2
+    exit 2
+fi
+
+new_crontab="$(
     printf '%s\n' "$filtered_crontab"
     printf '%s\n' "$marker_start"
-    printf '%s\n' 'CRON_TZ=America/New_York'
-    printf 'UV_BIN=%q\n' "$uv_bin"
-    printf '45 8 * * 1-5 %q >> %q 2>&1\n' "$runner" "$log_file"
-    printf '15 10 * * 1-5 %q --no-alpaca-submit-buy-orders >> %q 2>&1\n' "$runner" "$log_file"
+    # Force a noninteractive POSIX shell for cron's outer `-c` invocation.
+    # The command itself applies its PATH locally, and the prior effective
+    # shell-option environment is restored immediately after the job for future
+    # appended entries.
+    printf '%s\n' 'SHELL=/bin/sh'
+    printf '%s\n' 'SHELLOPTS='
+    printf '%s\n' 'BASHOPTS='
+    for environment_name in "${boundary_environment_names[@]}"; do
+        printf '%s=\n' "$environment_name"
+    done
+    printf '%s\n' "$cron_schedule_line"
+    for restored_assignment in "${restored_boundary_assignments[@]}"; do
+        printf '%s\n' "$restored_assignment"
+    done
+    printf '%s\n' "$restored_shell_assignment"
+    printf '%s\n' "$restored_shellopts_assignment"
+    printf '%s\n' "$restored_bashopts_assignment"
     printf '%s\n' "$marker_end"
-} | crontab -
+)"
 
-echo "Installed the leveraged-trader schedules:"
-echo "  Weekdays at 8:45 AM America/New_York: full workflow with buy submission"
-echo "  Weekdays at 10:15 AM America/New_York: reconciliation without buy submission"
-echo "  uv: $uv_bin"
-echo "  Log: $log_file"
+# Keep the final comparison adjacent to the write. Non-cooperating crontab
+# editors cannot participate in our lock, so this narrows their unavoidable
+# check/write race and prevents overwriting every change visible before it.
+read_current_crontab || exit $?
+if [[ "$current_crontab" != "$existing_crontab" ]]; then
+    echo "The crontab changed while the installer was preparing; no changes were made." >&2
+    exit 75
+fi
+
+# Make the process named in owner metadata perform the external side effect.
+# If it is killed, no untracked child can continue writing while a retry
+# recovers the apparently abandoned lock. A successful exec deliberately
+# leaves the dead-owner directory for the next installer to retire.
+trap - EXIT INT TERM
+exec 5<&-
+exec crontab - <<< "$new_crontab"

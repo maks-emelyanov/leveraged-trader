@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Test
+        run: uv run pytest -q
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Inspect source distribution
+        run: |
+          .venv/bin/python - <<'PY'
+          import glob
+          import stat
+          import tarfile
+
+          archives = glob.glob("dist/*.tar.gz")
+          if len(archives) != 1:
+              raise SystemExit(f"Expected one source distribution, found: {archives}")
+
+          required_files = {
+              ".env.example",
+              ".python-version",
+              "LICENSE",
+              "README.md",
+              "docs/architecture.md",
+              "main.py",
+              "pyproject.toml",
+              "scripts/cron/install-crontab",
+              "scripts/cron/run-leveraged-trader",
+              "scripts/cron/run-scheduled",
+              "scripts/cron/run-scheduled-clean-environment",
+              "scripts/cron/runtime-security",
+              "uv.lock",
+          }
+          executable_scripts = {
+              "scripts/cron/install-crontab",
+              "scripts/cron/run-leveraged-trader",
+              "scripts/cron/run-scheduled",
+              "scripts/cron/run-scheduled-clean-environment",
+          }
+          with tarfile.open(archives[0], "r:gz") as archive:
+              members = {}
+              for member in archive.getmembers():
+                  relative_name = member.name.split("/", 1)[1] if "/" in member.name else ""
+                  members[relative_name] = member
+
+          missing = sorted(required_files - members.keys())
+          if missing:
+              raise SystemExit(f"Source distribution is missing required files: {missing}")
+          for script in sorted(executable_scripts):
+              member = members[script]
+              if not member.isfile() or not member.mode & stat.S_IXUSR:
+                  raise SystemExit(f"Source distribution script is not executable: {script}")
+          PY
+
+      - name: Smoke-test installed distributions
+        shell: bash
+        run: |
+          wheel=(dist/*.whl)
+          sdist=(dist/*.tar.gz)
+          if (( ${#wheel[@]} != 1 || ${#sdist[@]} != 1 )); then
+            echo "Expected exactly one wheel and one source distribution." >&2
+            exit 1
+          fi
+          cd "$RUNNER_TEMP"
+          PYTHONTZPATH=/nonexistent uv run --isolated --with "$GITHUB_WORKSPACE/${wheel[0]}" leveraged-trader --help >/dev/null
+          PYTHONTZPATH=/nonexistent uv run --isolated --with "$GITHUB_WORKSPACE/${sdist[0]}" leveraged-trader --help >/dev/null
+
+      - name: Audit dependencies
+        run: >-
+          uvx --from pip-audit==2.10.0 pip-audit
+          --path .venv/lib/python3.12/site-packages
+          --skip-editable
+
+  compatibility:
+    name: Compatibility (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.14"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: macos-latest
+            python-version: "3.12"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Check shell syntax
+        run: |
+          for script in \
+            scripts/cron/install-crontab \
+            scripts/cron/run-leveraged-trader \
+            scripts/cron/run-scheduled \
+            scripts/cron/run-scheduled-clean-environment \
+            scripts/cron/runtime-security
+          do
+            bash -n "$script"
+          done
+
+      - name: Test
+        run: uv run pytest -q

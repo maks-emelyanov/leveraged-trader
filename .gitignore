@@ -46,15 +46,32 @@ htmlcov/
 # Generated strategy state and reports
 *.sqlite
 *.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
 # Runtime workflow locks for conventional SQLite database names and output directories.
 *.sqlite.lock
 *.sqlite3.lock
 *.db.lock
 .leveraged-trader.lock
+.leveraged-trader-output-*.lock
+# Private SQLite creation stages can survive an interrupted first publication.
+.leveraged-trader-sqlite-*.tmp
 best_equity_curves.csv
 buy_signals.csv
+eligible_buy_signals.csv
 sell_signals.csv
 optimization_summary.csv
+managed_positions.csv
+alpaca_realized_pnl.csv
+alpaca_reconciliation_results.csv
 alpaca_order_results.csv
 alpaca_sell_order_results.csv
+alpaca_snapshot_manifest.csv
+# Interrupted atomic report publications can retain complete broker/account CSV data.
+.*.csv.*.tmp
+.*.csv.*.tmp.anchor
+.*.csv.*.tmp.previous
+.leveraged-trader-report-cleanup-*.tmp
 outputs/

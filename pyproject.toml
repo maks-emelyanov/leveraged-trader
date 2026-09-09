@@ -1,21 +1,27 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "leveraged-trader"
 version = "0.1.0"
 description = "Research and paper-trading workflow for leveraged ETF RSI strategies."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.15"
 license = "MIT"
 license-files = ["LICENSE"]
 keywords = ["alpaca", "leveraged-etfs", "paper-trading", "rsi", "trading", "yfinance"]
 dependencies = [
+    "idna>=3.10",
     "lxml>=6.0.2",
-    "matplotlib>=3.10.8",
     "numba>=0.62.0",
     "numpy>=2.4.3",
     "pandas>=3.0.1",
     "requests>=2.32.5",
     "rich>=14.1.0",
-    "yfinance>=1.2.0",
+    "tzdata>=2025.3",
+    "urllib3>=2,<3",
+    "yfinance>=1.2.1",
 ]
 
 [project.scripts]
