@@ -658,7 +658,10 @@ cannot confirm the same transient truncation twice. A commit from another databa
 discards that run-local synchronization cache before the next asset is processed. If a newly
 published signal tail observation falls inside an already processed asset horizon, every strategy
 that depends on that signal is invalidated and replayed; appending the RSI row alone is not treated
-as a safe incremental resume.
+as a safe incremental resume. When trusted verification retains authenticated OHLC values across
+tiny coherent adjustment-factor drift, both compact strategy state and the retained winning equity
+curve continue from the exact post-synchronization SQLite history rather than mixing in ignored
+provider values.
 
 An update resumes a parameter grid only when its configuration fingerprint, authenticated
 strategy-state row, and authenticated complete non-null summary rollup exist for every requested
