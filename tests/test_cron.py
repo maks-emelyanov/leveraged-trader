@@ -576,6 +576,8 @@ printf '3 08:45'
         "--require-workflow-source-success",
         "--alpaca-submit-buy-orders",
         "--alpaca-submit-sell-orders",
+        "--workflow-deadline-epoch",
+        "1770217500",
     ]
 
 

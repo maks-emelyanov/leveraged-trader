@@ -21,6 +21,7 @@ from functools import partial
 from pathlib import Path, PureWindowsPath
 from types import MappingProxyType
 from typing import Any, TextIO
+from unittest.mock import Mock
 
 try:
     import fcntl
@@ -65,6 +66,7 @@ from .market_data import (
     load_risk_free_history,
     load_signal_history,
     load_symbol_history,
+    load_symbol_history_batch,
     recover_signal_history_for_calendar,
     signal_history_overlaps_calendar,
 )
@@ -91,18 +93,26 @@ from .runtime_files import (
 from .storage import (
     AssetMarketDataError,
     _DeferredCommitSqliteConnection,
+    _safe_market_history_tail_rows,
     active_alpaca_managed_symbols,
     init_state_db,
     load_alpaca_managed_positions,
+    load_best_strategy_summary,
+    load_complete_strategy_equity_curve,
     process_asset_grid,
     save_workflow_assets,
     strategy_config_fingerprint,
+    strategy_config_matches_fingerprint,
+    strategy_state_generation,
     strategy_state_matches_config,
 )
 from .universe import determine_workflow_asset_groups
 
 DEFAULT_WORKFLOW_CONCURRENCY = 4
+MARKET_DATA_BATCH_SIZE = 32
 SQLITE_BUSY_TIMEOUT_MS = 60_000
+_MONOTONIC_CLOCK = time.monotonic
+_WALL_CLOCK = time.time
 LONG_WORKFLOW_LABEL = "Long"
 SHORT_WORKFLOW_LABEL = "Short"
 DEFAULT_SHORT_BUY_RSI_VALUES = list(range(50, 81))
@@ -1625,6 +1635,46 @@ class WorkflowRunError(RuntimeError):
     """Raised when a workflow run cannot produce any usable strategy result."""
 
 
+class WorkflowDeadlineExceeded(WorkflowRunError):
+    """Raised before broker submission when the analytics cutoff expires."""
+
+
+@dataclass(frozen=True)
+class _WorkflowDeadline:
+    absolute_epoch: float
+    monotonic_deadline: float
+
+    @classmethod
+    def from_epoch(cls, value: int | float) -> _WorkflowDeadline:
+        if isinstance(value, bool):
+            raise ValueError("workflow_deadline_epoch must be a finite positive Unix timestamp.")
+        try:
+            absolute_epoch = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("workflow_deadline_epoch must be a finite positive Unix timestamp.") from exc
+        if not math.isfinite(absolute_epoch) or absolute_epoch <= 0.0:
+            raise ValueError("workflow_deadline_epoch must be a finite positive Unix timestamp.")
+        return cls(
+            absolute_epoch=absolute_epoch,
+            monotonic_deadline=_MONOTONIC_CLOCK() + (absolute_epoch - _WALL_CLOCK()),
+        )
+
+    def remaining_seconds(self) -> float:
+        return self.monotonic_deadline - _MONOTONIC_CLOCK()
+
+    def check(self, stage: str) -> None:
+        if self.remaining_seconds() <= 0.0:
+            raise WorkflowDeadlineExceeded(
+                "The 9:20 AM analytics deadline expired "
+                f"{stage}; active asset work was rolled back and Alpaca buy submission was not started."
+            )
+
+
+def _check_workflow_deadline(deadline: _WorkflowDeadline | None, stage: str) -> None:
+    if deadline is not None:
+        deadline.check(stage)
+
+
 @dataclass(frozen=True)
 class AssetRunPlan:
     asset_symbol: str
@@ -1633,6 +1683,9 @@ class AssetRunPlan:
     start: str | None
     action: str
     start_label: str
+    strategy_state_preverified: bool = False
+    strategy_state_generation: int | None = None
+    preverified_best_config: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -1677,6 +1730,7 @@ class PreparedAssetRun:
     signal_history: pd.DataFrame
     risk_free_history: pd.DataFrame
     canonical_signal_history: pd.DataFrame | None = None
+    prevalidated_asset_safe_tail_rows: dict[str, tuple[object, ...]] | None = None
 
 
 @dataclass(frozen=True)
@@ -1714,6 +1768,10 @@ class _WorkflowMarketDataSession:
         self.risk_free_history_lock = self.history_locks.setdefault(RISK_FREE_SYMBOL, asyncio.Lock())
         self.risk_free_histories = self.histories
         self.risk_free_failures = self.failures
+        self.batch_count = 0
+        self.batch_attempted_symbols: set[str] = set()
+        self.batch_retry_symbols: set[str] = set()
+        self.individual_retry_count = 0
 
 
 class _WorkflowStrategySession:
@@ -2960,20 +3018,59 @@ def _prepare_asset_run(
     buy_rsi_values: list[float],
     profit_target_values: list[float],
     rsi_entry_rule: str = "lower",
+    strategy_state_verification: str = "trusted",
 ) -> AssetRunPlan:
+    # Verify once on the parallel preparation workers. The transaction later
+    # fences this result with the captured global generation; a stale result
+    # rebuilds safely instead of running a second verification pass.
     with _state_connection(db_path) as conn:
         rebuild_asset = mode == "rebuild"
-        if mode == "update" and not strategy_state_matches_config(
-            conn,
-            asset_symbol,
-            signal_symbol,
-            base_cfg,
-            buy_rsi_values,
-            profit_target_values,
-            rsi_entry_rule,
-        ):
-            rebuild_asset = True
-
+        state_preverified = False
+        verified_generation: int | None = None
+        preverified_best_config: tuple[float, float] | None = None
+        if not rebuild_asset:
+            conn.execute("BEGIN")
+            verified_generation = strategy_state_generation(conn)
+            state_preverified = strategy_state_matches_config(
+                conn,
+                asset_symbol,
+                signal_symbol,
+                base_cfg,
+                buy_rsi_values,
+                profit_target_values,
+                rsi_entry_rule,
+                strategy_state_verification=strategy_state_verification,
+            )
+            if state_preverified:
+                best_summary = load_best_strategy_summary(
+                    conn,
+                    asset_symbol,
+                    signal_symbol,
+                    rsi_entry_rule,
+                    strategy_state_preverified=True,
+                )
+                if best_summary is not None:
+                    candidate_best_config = (
+                        float(best_summary["buy_rsi"]),
+                        float(best_summary["profit_target_multiple"]),
+                    )
+                    retained_curve = load_complete_strategy_equity_curve(
+                        conn,
+                        asset_symbol,
+                        signal_symbol,
+                        *candidate_best_config,
+                        rsi_period=base_cfg.rsi_period,
+                        rsi_entry_rule=rsi_entry_rule,
+                        allow_unbound_backtest_config=True,
+                        strategy_state_preverified=True,
+                    )
+                    if retained_curve is not None:
+                        preverified_best_config = candidate_best_config
+                    else:
+                        state_preverified = False
+                else:
+                    state_preverified = False
+            rebuild_asset = not state_preverified
         # Fetch canonical history even in update mode.  Auto-adjusted asset and
         # benchmark series can revise old sessions; the state layer compares the
         # complete input before deciding whether a compact resume is still safe.
@@ -2988,7 +3085,29 @@ def _prepare_asset_run(
         start=start,
         action=action,
         start_label=start_label,
+        strategy_state_preverified=state_preverified,
+        strategy_state_generation=verified_generation,
+        preverified_best_config=preverified_best_config,
     )
+
+
+def _prepare_asset_safe_tail_rows(
+    db_path: str,
+    plan: AssetRunPlan,
+    asset_history: pd.DataFrame,
+) -> dict[str, tuple[object, ...]] | None:
+    """Classify one authoritative asset history on a parallel read snapshot."""
+    if not plan.strategy_state_preverified or plan.strategy_state_generation is None:
+        return None
+    with _state_connection(db_path) as conn:
+        conn.execute("BEGIN")
+        if strategy_state_generation(conn) != plan.strategy_state_generation:
+            return None
+        return _safe_market_history_tail_rows(
+            conn,
+            asset_history,
+            plan.asset_symbol,
+        )
 
 
 def _process_asset_grid_for_db(
@@ -3007,7 +3126,13 @@ def _process_asset_grid_for_db(
     strategy_session: _WorkflowStrategySession | None = None,
     rsi_entry_rule: str = "lower",
     canonical_signal_history: pd.DataFrame | None = None,
-) -> None:
+    strategy_state_verification: str = "trusted",
+    workflow_deadline: _WorkflowDeadline | None = None,
+    strategy_state_preverified: bool = False,
+    expected_strategy_state_generation: int | None = None,
+    prevalidated_asset_safe_tail_rows: dict[str, tuple[object, ...]] | None = None,
+    prevalidated_best_config: tuple[float, float] | None = None,
+) -> bool:
     # This transaction covers market-data synchronization, global benchmark
     # invalidation, and rebuilt state.  A second process waits here and then
     # observes the new generation/config instead of writing a stale resume.
@@ -3020,6 +3145,7 @@ def _process_asset_grid_for_db(
             phase_timings.add("grid_compute", elapsed_seconds)
 
     transaction_started = time.perf_counter()
+    _check_workflow_deadline(workflow_deadline, "before an asset transaction")
     canonical_signal_history = canonical_signal_history if canonical_signal_history is not None else signal_history
     # Only the run-scoped provider snapshot may occupy the global symbol cache.
     # A calendar recovery is passed separately below and storage namespaces it
@@ -3040,7 +3166,60 @@ def _process_asset_grid_for_db(
     )
     try:
         with transaction as conn:
-            process_asset_grid(
+            actual_rebuild = rebuild
+            if not actual_rebuild:
+                if strategy_state_preverified:
+                    if type(expected_strategy_state_generation) is not int:
+                        raise ValueError("A preverified strategy state requires its captured integer generation.")
+                    actual_rebuild = strategy_state_generation(conn) != expected_strategy_state_generation
+                    if not actual_rebuild:
+                        expected_grid_count = len(
+                            {
+                                (float(buy_rsi), float(profit_target))
+                                for buy_rsi in buy_rsi_values
+                                for profit_target in profit_target_values
+                            }
+                        )
+                        continuity = conn.execute(
+                            """
+                            SELECT
+                                (SELECT COUNT(*) FROM strategy_state
+                                 WHERE asset_symbol = ? AND signal_symbol = ?),
+                                (SELECT COUNT(*) FROM strategy_summary
+                                 WHERE asset_symbol = ? AND signal_symbol = ?)
+                            """,
+                            (asset_symbol, signal_symbol, asset_symbol, signal_symbol),
+                        ).fetchone()
+                        actual_rebuild = bool(
+                            continuity is None
+                            or int(continuity[0]) != expected_grid_count
+                            or int(continuity[1]) != expected_grid_count
+                        )
+                else:
+                    validation_started = _MONOTONIC_CLOCK()
+                    try:
+                        try:
+                            actual_rebuild = not strategy_state_matches_config(
+                                conn,
+                                asset_symbol,
+                                signal_symbol,
+                                base_cfg,
+                                buy_rsi_values,
+                                profit_target_values,
+                                rsi_entry_rule,
+                                strategy_state_verification=strategy_state_verification,
+                            )
+                        except sqlite3.OperationalError as exc:
+                            if "no such table" not in str(exc).lower():
+                                raise
+                            actual_rebuild = True
+                    finally:
+                        if phase_timings is not None:
+                            phase_timings.add(
+                                "state_validation",
+                                max(0.0, _MONOTONIC_CLOCK() - validation_started),
+                            )
+            process_result = process_asset_grid(
                 conn,
                 data,
                 base_cfg,
@@ -3048,7 +3227,7 @@ def _process_asset_grid_for_db(
                 signal_symbol,
                 buy_rsi_values,
                 profit_target_values,
-                rebuild=rebuild,
+                rebuild=actual_rebuild,
                 signal_history=signal_history,
                 authoritative_histories=authoritative_histories,
                 presynchronized_authoritative_symbols=(
@@ -3067,9 +3246,26 @@ def _process_asset_grid_for_db(
                 grid_compute_observer=observe_grid_compute if phase_timings is not None else None,
                 rsi_entry_rule=rsi_entry_rule,
                 isolate_strategy_signal_history=signal_history is not canonical_signal_history,
+                strategy_state_verification=strategy_state_verification,
+                strategy_state_preverified=not actual_rebuild,
+                _prevalidated_safe_tail_rows=(None if actual_rebuild else prevalidated_asset_safe_tail_rows),
+                _prevalidated_best_config=(None if actual_rebuild else prevalidated_best_config),
+                _authoritative_histories_prevalidated=True,
+                deadline_check=(
+                    None
+                    if workflow_deadline is None
+                    else partial(
+                        _check_workflow_deadline,
+                        workflow_deadline,
+                        "during an asset transaction",
+                    )
+                ),
             )
+            if type(process_result) is bool:
+                actual_rebuild = process_result
         if strategy_session is not None:
             strategy_session.mark_synchronized(shared_histories)
+        return actual_rebuild
     finally:
         if phase_timings is not None:
             transaction_seconds = max(0.0, time.perf_counter() - transaction_started)
@@ -3085,6 +3281,7 @@ def _build_reports_for_db(
     rsi_entry_rule: str | None = None,
     buy_rsi_values: list[float] | None = None,
     profit_target_values: list[float] | None = None,
+    deadline_check: Callable[[], None] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if (buy_rsi_values is None) != (profit_target_values is None):
         raise ValueError(
@@ -3112,25 +3309,63 @@ def _build_reports_for_db(
         # SELECT without taking a writer reservation in WAL mode.
         conn.execute("BEGIN")
         if buy_rsi_values is not None and profit_target_values is not None:
-            unauthenticated_pairs = {
-                (asset_symbol, signal_symbol)
-                for asset_symbol, signal_symbol in processed_asset_pairs
-                if not strategy_state_matches_config(
-                    conn,
-                    asset_symbol,
-                    signal_symbol,
-                    base_cfg,
-                    buy_rsi_values,
-                    profit_target_values,
-                    report_rsi_entry_rule or "lower",
+            expected_fingerprint = strategy_config_fingerprint(
+                base_cfg,
+                buy_rsi_values,
+                profit_target_values,
+                report_rsi_entry_rule or "lower",
+            )
+            expected_grid_count = len(
+                {
+                    (float(buy_rsi), float(profit_target))
+                    for buy_rsi in buy_rsi_values
+                    for profit_target in profit_target_values
+                }
+            )
+            unauthenticated_pairs: set[tuple[str, str]] = set()
+            disappeared_pairs: set[tuple[str, str]] = set()
+            for asset_symbol, signal_symbol in processed_asset_pairs:
+                if deadline_check is not None:
+                    deadline_check()
+                state_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM strategy_state WHERE asset_symbol = ? AND signal_symbol = ?",
+                        (asset_symbol, signal_symbol),
+                    ).fetchone()[0]
                 )
-            }
+                summary_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM strategy_summary WHERE asset_symbol = ? AND signal_symbol = ?",
+                        (asset_symbol, signal_symbol),
+                    ).fetchone()[0]
+                )
+                if state_count == 0 and summary_count == 0:
+                    disappeared_pairs.add((asset_symbol, signal_symbol))
+                    continue
+                if (
+                    state_count != expected_grid_count
+                    or summary_count != expected_grid_count
+                    or not strategy_config_matches_fingerprint(
+                        conn,
+                        asset_symbol,
+                        signal_symbol,
+                        expected_fingerprint,
+                    )
+                ):
+                    unauthenticated_pairs.add((asset_symbol, signal_symbol))
+            if disappeared_pairs:
+                missing = ", ".join(f"{asset}/{signal}" for asset, signal in sorted(disappeared_pairs))
+                raise WorkflowRunError(
+                    f"Completed workflow state disappeared before reporting for: {missing}. "
+                    "Broker submission was aborted."
+                )
             if unauthenticated_pairs:
                 missing = ", ".join(f"{asset}/{signal}" for asset, signal in sorted(unauthenticated_pairs))
                 raise WorkflowRunError(
                     "Completed workflow state no longer matches the requested strategy "
                     f"grid for: {missing}. Broker submission was aborted."
                 )
+        strategy_report_cache = {}
         optimization_summary, curves = summarize_saved_results(
             conn,
             report_assets,
@@ -3140,6 +3375,9 @@ def _build_reports_for_db(
             expected_buy_rsi_values=buy_rsi_values,
             expected_profit_target_values=profit_target_values,
             allow_unbound_backtest_config=structural_legacy_report,
+            _strategy_report_cache=strategy_report_cache,
+            _workflow_results_preverified=True,
+            deadline_check=deadline_check,
         )
         reported_asset_pairs = (
             set(optimization_summary[["Asset", "RSI Symbol"]].astype(str).itertuples(index=False, name=None))
@@ -3162,6 +3400,8 @@ def _build_reports_for_db(
             expected_buy_rsi_values=buy_rsi_values,
             expected_profit_target_values=profit_target_values,
             allow_unbound_backtest_config=structural_legacy_report,
+            _strategy_report_cache=strategy_report_cache,
+            deadline_check=deadline_check,
         )
         sell_signals = build_sell_signal_report(
             conn,
@@ -3172,6 +3412,8 @@ def _build_reports_for_db(
             expected_buy_rsi_values=buy_rsi_values,
             expected_profit_target_values=profit_target_values,
             allow_unbound_backtest_config=structural_legacy_report,
+            _strategy_report_cache=strategy_report_cache,
+            deadline_check=deadline_check,
         )
         active_managed_symbols = active_alpaca_managed_symbols(conn)
         if buy_signals.empty or not active_managed_symbols:
@@ -3364,23 +3606,44 @@ async def _prepare_workflow_asset(
     asset_progress: AssetProgress | None = None,
     phase_timings: WorkflowPhaseTimings | None = None,
     download_executor: Executor | None = None,
+    market_data_session: _WorkflowMarketDataSession | None = None,
+    strategy_state_verification: str = "trusted",
+    workflow_deadline: _WorkflowDeadline | None = None,
+    state_validation_lock: asyncio.Lock | None = None,
 ) -> PreparedAssetRun | AssetRunResult:
     # Database and runtime-file validation belongs outside the asset-local
     # download failure boundary.  A corrupt/inaccessible state database must
     # abort the workflow instead of being reported as one skipped symbol while
     # other symbols continue toward paper-order submission.
-    plan = await _run_blocking(
-        download_executor,
-        _prepare_asset_run,
-        db_path,
-        mode,
-        base_cfg,
-        job.asset_symbol,
-        job.signal_symbol,
-        buy_rsi_values,
-        profit_target_values,
-        rsi_entry_rule,
-    )
+    _check_workflow_deadline(workflow_deadline, "before market-data downloads")
+
+    async def prepare_plan() -> AssetRunPlan:
+        return await _timed_run_blocking(
+            phase_timings,
+            "state_validation",
+            _prepare_asset_run,
+            db_path,
+            mode,
+            base_cfg,
+            job.asset_symbol,
+            job.signal_symbol,
+            buy_rsi_values,
+            profit_target_values,
+            rsi_entry_rule,
+            strategy_state_verification,
+            executor=download_executor,
+        )
+
+    # Concurrent read connections make the digest-heavy trusted proof slower
+    # on WSL by competing for the same SQLite pages and Python execution time.
+    # Downloads remain concurrent, but state proof and safe-tail comparison use
+    # one lane while the transaction consumer advances the preceding asset.
+    if state_validation_lock is None:
+        plan = await prepare_plan()
+    else:
+        async with state_validation_lock:
+            plan = await prepare_plan()
+    _check_workflow_deadline(workflow_deadline, "before market-data downloads")
     if signal_failures is None:
         signal_failures = {}
     if calendar_signal_histories is None:
@@ -3445,6 +3708,8 @@ async def _prepare_workflow_asset(
             )
         asset_history = signal_histories.get(job.asset_symbol)
         if asset_history is None:
+            if market_data_session is not None:
+                market_data_session.individual_retry_count += 1
             try:
                 asset_history = await _timed_run_blocking(
                     phase_timings,
@@ -3454,9 +3719,11 @@ async def _prepare_workflow_asset(
                     end=None,
                     auto_adjust=base_cfg.auto_adjust,
                     tradier_cfg=tradier_cfg,
+                    deadline_monotonic=(None if workflow_deadline is None else workflow_deadline.monotonic_deadline),
                     executor=download_executor,
                 )
             except MarketDataDownloadError as exc:
+                _check_workflow_deadline(workflow_deadline, "during market-data downloads")
                 asset_failure = str(exc)
                 signal_failures[job.asset_symbol] = asset_failure
                 return _skipped_asset_result(
@@ -3488,6 +3755,8 @@ async def _prepare_workflow_asset(
             )
         risk_free_history = risk_free_histories.get(RISK_FREE_SYMBOL)
         if risk_free_history is None:
+            if market_data_session is not None:
+                market_data_session.individual_retry_count += 1
             try:
                 risk_free_history = await _timed_run_blocking(
                     phase_timings,
@@ -3496,9 +3765,11 @@ async def _prepare_workflow_asset(
                     end=None,
                     auto_adjust=base_cfg.auto_adjust,
                     tradier_cfg=tradier_cfg,
+                    deadline_monotonic=(None if workflow_deadline is None else workflow_deadline.monotonic_deadline),
                     executor=download_executor,
                 )
             except MarketDataDownloadError as exc:
+                _check_workflow_deadline(workflow_deadline, "during market-data downloads")
                 risk_free_failure = str(exc)
                 risk_free_failures[RISK_FREE_SYMBOL] = risk_free_failure
                 return _skipped_asset_result(
@@ -3537,6 +3808,8 @@ async def _prepare_workflow_asset(
             )
         canonical_signal_history = signal_histories.get(job.signal_symbol)
         if canonical_signal_history is None:
+            if market_data_session is not None:
+                market_data_session.individual_retry_count += 1
             try:
                 canonical_signal_history = await _timed_run_blocking(
                     phase_timings,
@@ -3546,9 +3819,11 @@ async def _prepare_workflow_asset(
                     end=None,
                     auto_adjust=base_cfg.auto_adjust,
                     tradier_cfg=tradier_cfg,
+                    deadline_monotonic=(None if workflow_deadline is None else workflow_deadline.monotonic_deadline),
                     executor=download_executor,
                 )
             except MarketDataDownloadError as exc:
+                _check_workflow_deadline(workflow_deadline, "during market-data downloads")
                 signal_failure = str(exc)
                 signal_failures[job.signal_symbol] = signal_failure
                 return _skipped_asset_result(
@@ -3605,6 +3880,7 @@ async def _prepare_workflow_asset(
                         executor=download_executor,
                     )
                 except MarketDataDownloadError as exc:
+                    _check_workflow_deadline(workflow_deadline, "during market-data downloads")
                     calendar_signal_failure = str(exc)
                     calendar_signal_failures[calendar_signal_key] = calendar_signal_failure
                     return _skipped_asset_result(
@@ -3622,6 +3898,25 @@ async def _prepare_workflow_asset(
         signal_history=signal_history,
         risk_free_history=risk_free_history,
     )
+    prevalidated_asset_safe_tail_rows = None
+    if signal_history is canonical_signal_history:
+
+        async def prepare_safe_tail() -> dict[str, tuple[object, ...]] | None:
+            return await _timed_run_blocking(
+                phase_timings,
+                "state_validation",
+                _prepare_asset_safe_tail_rows,
+                db_path,
+                plan,
+                asset_history,
+                executor=download_executor,
+            )
+
+        if state_validation_lock is None:
+            prevalidated_asset_safe_tail_rows = await prepare_safe_tail()
+        else:
+            async with state_validation_lock:
+                prevalidated_asset_safe_tail_rows = await prepare_safe_tail()
     return PreparedAssetRun(
         job=job,
         plan=plan,
@@ -3630,6 +3925,7 @@ async def _prepare_workflow_asset(
         signal_history=signal_history,
         risk_free_history=risk_free_history,
         canonical_signal_history=canonical_signal_history,
+        prevalidated_asset_safe_tail_rows=prevalidated_asset_safe_tail_rows,
     )
 
 
@@ -3645,13 +3941,16 @@ async def _complete_workflow_asset(
     phase_timings: WorkflowPhaseTimings | None = None,
     strategy_executor: Executor | None = None,
     strategy_session: _WorkflowStrategySession | None = None,
+    strategy_state_verification: str = "trusted",
+    workflow_deadline: _WorkflowDeadline | None = None,
 ) -> AssetRunResult:
     try:
         if isinstance(outcome, AssetRunResult):
             return outcome
 
         try:
-            await _run_blocking(
+            _check_workflow_deadline(workflow_deadline, "between asset transactions")
+            actual_rebuild = await _run_blocking(
                 strategy_executor,
                 _process_asset_grid_for_db,
                 db_path,
@@ -3669,6 +3968,12 @@ async def _complete_workflow_asset(
                 strategy_session,
                 rsi_entry_rule,
                 canonical_signal_history=outcome.canonical_signal_history,
+                strategy_state_verification=strategy_state_verification,
+                workflow_deadline=workflow_deadline,
+                strategy_state_preverified=outcome.plan.strategy_state_preverified,
+                expected_strategy_state_generation=outcome.plan.strategy_state_generation,
+                prevalidated_asset_safe_tail_rows=outcome.prevalidated_asset_safe_tail_rows,
+                prevalidated_best_config=outcome.plan.preverified_best_config,
             )
         # The transaction layer has normalized malformed market input to this
         # dedicated asset-local validation failure.  Every other exception is a
@@ -3686,7 +3991,7 @@ async def _complete_workflow_asset(
             workflow_idx=outcome.job.workflow_idx,
             asset_symbol=outcome.job.asset_symbol,
             signal_symbol=outcome.job.signal_symbol,
-            action=outcome.plan.action,
+            action="Rebuilding" if actual_rebuild else "Updating",
             rows_processed=len(outcome.data),
             status="done",
             message=_processed_message(outcome.data, outcome.plan.start_label),
@@ -3695,6 +4000,35 @@ async def _complete_workflow_asset(
     finally:
         if asset_progress is not None:
             asset_progress.finish_asset()
+
+
+async def _prefetch_workflow_histories(
+    symbols: list[str],
+    *,
+    base_cfg: BacktestConfig,
+    phase_timings: WorkflowPhaseTimings,
+    market_data_session: _WorkflowMarketDataSession,
+    workflow_deadline: _WorkflowDeadline | None = None,
+) -> None:
+    """Populate the run-scoped cache with validated Yahoo batches of 32."""
+    unique_symbols = sorted(set(symbols).difference(market_data_session.batch_attempted_symbols))
+    for offset in range(0, len(unique_symbols), MARKET_DATA_BATCH_SIZE):
+        _check_workflow_deadline(workflow_deadline, "before market-data downloads")
+        batch = unique_symbols[offset : offset + MARKET_DATA_BATCH_SIZE]
+        histories, errors = await _timed_run_blocking(
+            phase_timings,
+            "download",
+            load_symbol_history_batch,
+            batch,
+            end=None,
+            auto_adjust=base_cfg.auto_adjust,
+            deadline_monotonic=(None if workflow_deadline is None else workflow_deadline.monotonic_deadline),
+        )
+        _check_workflow_deadline(workflow_deadline, "during market-data downloads")
+        market_data_session.batch_count += 1
+        market_data_session.batch_attempted_symbols.update(batch)
+        market_data_session.histories.update(histories)
+        market_data_session.batch_retry_symbols.update(errors)
 
 
 async def _run_asset_pipeline(
@@ -3712,11 +4046,29 @@ async def _run_asset_pipeline(
     rsi_entry_rule: str = "lower",
     history_observation_run_id: str | None = None,
     market_data_session: _WorkflowMarketDataSession | None = None,
+    strategy_state_verification: str = "trusted",
+    workflow_deadline: _WorkflowDeadline | None = None,
 ) -> list[AssetRunResult]:
     if not jobs:
         return []
 
+    shared_market_data_session = market_data_session is not None
     market_data_session = market_data_session or _WorkflowMarketDataSession()
+    injected_individual_download = any(
+        isinstance(loader, Mock) for loader in (load_symbol_history, load_signal_history, load_risk_free_history)
+    )
+    if shared_market_data_session and not injected_individual_download:
+        await _prefetch_workflow_histories(
+            [
+                RISK_FREE_SYMBOL,
+                *(job.asset_symbol for job in jobs),
+                *(job.signal_symbol for job in jobs),
+            ],
+            base_cfg=base_cfg,
+            phase_timings=phase_timings,
+            market_data_session=market_data_session,
+            workflow_deadline=workflow_deadline,
+        )
     signal_locks = market_data_session.signal_locks
     signal_histories = market_data_session.signal_histories
     signal_failures = market_data_session.signal_failures
@@ -3725,6 +4077,7 @@ async def _run_asset_pipeline(
     risk_free_history_lock = market_data_session.risk_free_history_lock
     risk_free_histories = market_data_session.risk_free_histories
     risk_free_failures = market_data_session.risk_free_failures
+    state_validation_lock = asyncio.Lock()
     strategy_session = _WorkflowStrategySession(
         db_path,
         history_observation_run_id=history_observation_run_id,
@@ -3754,6 +4107,10 @@ async def _run_asset_pipeline(
             asset_progress=asset_progress,
             phase_timings=phase_timings,
             download_executor=download_executor,
+            market_data_session=market_data_session,
+            strategy_state_verification=strategy_state_verification,
+            workflow_deadline=workflow_deadline,
+            state_validation_lock=state_validation_lock,
         )
 
     async def complete(
@@ -3771,6 +4128,8 @@ async def _run_asset_pipeline(
             phase_timings=phase_timings,
             strategy_executor=strategy_executor,
             strategy_session=strategy_session,
+            strategy_state_verification=strategy_state_verification,
+            workflow_deadline=workflow_deadline,
         )
 
     with ThreadPoolExecutor(
@@ -4966,6 +5325,9 @@ async def _run_resumable_optimizations_unlocked(
     reporter: WorkflowReporter | None = None,
     tradier_cfg: TradierMarketDataConfig | None = None,
     short_buy_rsi_values: list[float] | None = None,
+    strategy_state_verification: str = "trusted",
+    workflow_deadline: _WorkflowDeadline | None = None,
+    show_timings: bool = False,
 ) -> None:
     validate_alpaca_paper_endpoint(alpaca_cfg)
     _validate_optimization_grids(buy_rsi_values, profit_target_values)
@@ -4984,6 +5346,7 @@ async def _run_resumable_optimizations_unlocked(
         output_dir=output_dir,
         workflow_concurrency=concurrency,
     )
+    _check_workflow_deadline(workflow_deadline, "before workflow initialization")
 
     # Invalidate any previously committed broker snapshot before initialization:
     # schema/data migrations can change state represented by those CSVs.
@@ -5122,6 +5485,8 @@ async def _run_resumable_optimizations_unlocked(
                     rsi_entry_rule=str(workflow_spec["rsi_entry_rule"]),
                     history_observation_run_id=history_observation_run_id,
                     market_data_session=market_data_session,
+                    strategy_state_verification=strategy_state_verification,
+                    workflow_deadline=workflow_deadline,
                 )
         else:
             asset_run_results = []
@@ -5137,9 +5502,17 @@ async def _run_resumable_optimizations_unlocked(
         )
         raise WorkflowRunError(f"No asset workflows completed successfully. {details}")
 
+    _check_workflow_deadline(workflow_deadline, "before reporting")
     with reporter.status("Building workflow reports"):
         side_outputs: list[WorkflowSideOutput] = []
         realized_pnl_summary = pd.DataFrame()
+        report_deadline_kwargs: dict[str, object] = {}
+        if workflow_deadline is not None:
+            report_deadline_kwargs["deadline_check"] = partial(
+                _check_workflow_deadline,
+                workflow_deadline,
+                "during report generation",
+            )
         for workflow_spec in workflow_specs:
             workflow_key = str(workflow_spec["key"])
             workflow_label = str(workflow_spec["label"])
@@ -5165,6 +5538,7 @@ async def _run_resumable_optimizations_unlocked(
                 str(workflow_spec["rsi_entry_rule"]),
                 list(workflow_spec["buy_rsi_values"]),
                 profit_target_values,
+                **report_deadline_kwargs,
             )
             side_outputs.append(
                 WorkflowSideOutput(
@@ -5186,6 +5560,7 @@ async def _run_resumable_optimizations_unlocked(
         buy_signals = _concat_report_frames([side.buy_signals for side in side_outputs])
         eligible_buy_signals = _concat_report_frames([side.eligible_buy_signals for side in side_outputs])
         sell_signals = _concat_report_frames([side.sell_signals for side in side_outputs])
+    _check_workflow_deadline(workflow_deadline, "after reporting")
     _persist_workflow_research_outputs(
         output_dir=output_dir,
         curves=curves,
@@ -5197,6 +5572,7 @@ async def _run_resumable_optimizations_unlocked(
     # Broker submission is the irreversible side effect in this phase. Attempt
     # to publish its exact result immediately, but defer any output/status
     # failure until every possible broker side effect has been reconciled.
+    _check_workflow_deadline(workflow_deadline, "before Alpaca buy submission")
     broker_publication = _begin_alpaca_snapshot_publication(
         Path(output_dir),
         snapshot_kind="workflow",
@@ -5520,6 +5896,9 @@ async def _run_resumable_optimizations_unlocked(
         short_buy_rsi_values=short_buy_rsi_values,
         research_outputs_published=True,
         broker_snapshot_committed=broker_snapshot_committed,
+        market_data_batch_count=market_data_session.batch_count,
+        market_data_individual_retry_count=market_data_session.individual_retry_count,
+        show_timings=show_timings,
     )
 
 
@@ -5537,6 +5916,9 @@ def run_resumable_optimizations_async(
     reporter: WorkflowReporter | None = None,
     tradier_cfg: TradierMarketDataConfig | None = None,
     short_buy_rsi_values: list[float] | None = None,
+    strategy_state_verification: str = "trusted",
+    workflow_deadline_epoch: int | float | None = None,
+    show_timings: bool = False,
 ) -> Coroutine[Any, Any, None]:
     """Snapshot caller-owned value inputs and return the workflow coroutine."""
     base_cfg_snapshot = replace(base_cfg)
@@ -5562,6 +5944,9 @@ def run_resumable_optimizations_async(
         reporter=reporter,
         tradier_cfg=tradier_cfg_snapshot,
         short_buy_rsi_values=short_buy_rsi_values_snapshot,
+        strategy_state_verification=strategy_state_verification,
+        workflow_deadline_epoch=workflow_deadline_epoch,
+        show_timings=show_timings,
     )
 
 
@@ -5579,6 +5964,9 @@ async def _run_resumable_optimizations_async_from_snapshot(
     reporter: WorkflowReporter | None,
     tradier_cfg: TradierMarketDataConfig | None,
     short_buy_rsi_values: list[float],
+    strategy_state_verification: str,
+    workflow_deadline_epoch: int | float | None,
+    show_timings: bool,
 ) -> None:
     boundary_sensitive_values = _alpaca_config_sensitive_values(alpaca_cfg)
     public_failure: BaseException | None = None
@@ -5599,6 +5987,9 @@ async def _run_resumable_optimizations_async_from_snapshot(
                 reporter=reporter,
                 tradier_cfg=tradier_cfg,
                 short_buy_rsi_values=short_buy_rsi_values,
+                strategy_state_verification=strategy_state_verification,
+                workflow_deadline_epoch=workflow_deadline_epoch,
+                show_timings=show_timings,
             )
         except BaseException as exc:
             suppress_chain = _alpaca_public_exception_cause(exc, cfg=alpaca_cfg) is None
@@ -5624,6 +6015,9 @@ async def _run_resumable_optimizations_async_from_snapshot_impl(
     reporter: WorkflowReporter | None,
     tradier_cfg: TradierMarketDataConfig | None,
     short_buy_rsi_values: list[float],
+    strategy_state_verification: str,
+    workflow_deadline_epoch: int | float | None,
+    show_timings: bool,
 ) -> None:
     _validate_workflow_mode(mode)
     _validate_database_path(db_path)
@@ -5631,6 +6025,12 @@ async def _run_resumable_optimizations_async_from_snapshot_impl(
     validate_alpaca_paper_endpoint(alpaca_cfg)
     _validate_optimization_grids(buy_rsi_values, profit_target_values)
     _validate_optimization_grids(short_buy_rsi_values, profit_target_values)
+    if strategy_state_verification not in {"trusted", "canonical"}:
+        raise ValueError("strategy_state_verification must be 'trusted' or 'canonical'.")
+    workflow_deadline = (
+        None if workflow_deadline_epoch is None else _WorkflowDeadline.from_epoch(workflow_deadline_epoch)
+    )
+    _check_workflow_deadline(workflow_deadline, "before acquiring the workflow lock")
     validate_runtime_configuration(
         base_cfg=base_cfg,
         universe_cfg=replace(universe_cfg, sqlite_db_path=db_path),
@@ -5644,6 +6044,7 @@ async def _run_resumable_optimizations_async_from_snapshot_impl(
         serialize_alpaca_account=alpaca_cfg.enabled or alpaca_cfg.sell_enabled,
     ) as locked_output_dir:
         locked_db_path = locked_output_dir.database_path
+        _check_workflow_deadline(workflow_deadline, "after acquiring the workflow lock")
         await _run_resumable_optimizations_unlocked(
             mode=mode,
             db_path=locked_db_path,
@@ -5658,6 +6059,9 @@ async def _run_resumable_optimizations_async_from_snapshot_impl(
             reporter=reporter,
             tradier_cfg=tradier_cfg,
             short_buy_rsi_values=short_buy_rsi_values,
+            strategy_state_verification=strategy_state_verification,
+            workflow_deadline=workflow_deadline,
+            show_timings=show_timings,
         )
 
 
@@ -5820,6 +6224,9 @@ def run_resumable_optimizations(
     reporter: WorkflowReporter | None = None,
     tradier_cfg: TradierMarketDataConfig | None = None,
     short_buy_rsi_values: list[float] | None = None,
+    strategy_state_verification: str = "trusted",
+    workflow_deadline_epoch: int | float | None = None,
+    show_timings: bool = False,
 ) -> None:
     asyncio.run(
         run_resumable_optimizations_async(
@@ -5836,6 +6243,9 @@ def run_resumable_optimizations(
             reporter=reporter,
             tradier_cfg=tradier_cfg,
             short_buy_rsi_values=short_buy_rsi_values,
+            strategy_state_verification=strategy_state_verification,
+            workflow_deadline_epoch=workflow_deadline_epoch,
+            show_timings=show_timings,
         )
     )
 
@@ -5868,6 +6278,9 @@ def _write_workflow_outputs(
     short_buy_rsi_values: list[float] | None = None,
     research_outputs_published: bool = False,
     broker_snapshot_committed: bool = False,
+    market_data_batch_count: int = 0,
+    market_data_individual_retry_count: int = 0,
+    show_timings: bool = False,
 ) -> None:
     report_output_started = time.perf_counter()
     terminal_order_results, terminal_reconciliation_results = _terminal_alpaca_display_results(
@@ -5970,6 +6383,22 @@ def _write_workflow_outputs(
         _commit_alpaca_snapshot_publication(broker_publication)
     if phase_timings is not None:
         phase_timings.add("report_generation", time.perf_counter() - report_output_started)
+    if phase_timings is not None and show_timings:
+        phase_snapshot = phase_timings.snapshot()
+        reporter.workflow_timings(
+            download_seconds=phase_snapshot.download_seconds,
+            state_validation_seconds=phase_snapshot.state_validation_seconds,
+            grid_compute_seconds=phase_snapshot.grid_compute_seconds,
+            db_sync_seconds=phase_snapshot.db_sync_seconds,
+            report_generation_seconds=phase_snapshot.report_generation_seconds,
+            alpaca_seconds=phase_snapshot.alpaca_seconds,
+            batch_count=market_data_batch_count,
+            individual_retry_count=market_data_individual_retry_count,
+            rebuild_count=sum(
+                result.status == "done" and result.action == "Rebuilding" for result in asset_run_results
+            ),
+            update_count=sum(result.status == "done" and result.action == "Updating" for result in asset_run_results),
+        )
     reporter.workflow_footer(workflow_timer.elapsed_seconds())
 
 

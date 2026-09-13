@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
 import numpy as np
@@ -38,6 +38,10 @@ REALIZED_PNL_COLUMNS = [
     "Realized P/L %",
 ]
 REALIZED_PNL_WORKFLOW_COLUMNS = ["Workflow", *REALIZED_PNL_COLUMNS]
+
+_StrategyReportCacheKey = tuple[str, str, str]
+_StrategyReportCacheValue = tuple[dict[str, object], pd.DataFrame, dict[str, object], str]
+_StrategyReportCache = dict[_StrategyReportCacheKey, _StrategyReportCacheValue]
 
 
 def _close_after_snapshot_rollback_failure(
@@ -177,7 +181,12 @@ def summarize_saved_results(
     expected_profit_target_values: list[float] | None = None,
     expected_strategy_fingerprint: str | None = None,
     allow_unbound_backtest_config: bool = False,
+    _strategy_report_cache: _StrategyReportCache | None = None,
+    _workflow_results_preverified: bool = False,
+    deadline_check: Callable[[], None] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if type(_workflow_results_preverified) is not bool:
+        raise ValueError("_workflow_results_preverified must be a boolean.")
     _validate_report_strategy_provenance(
         base_cfg=base_cfg,
         expected_buy_rsi_values=expected_buy_rsi_values,
@@ -196,6 +205,9 @@ def summarize_saved_results(
             expected_buy_rsi_values=expected_buy_rsi_values,
             expected_profit_target_values=expected_profit_target_values,
             expected_strategy_fingerprint=expected_strategy_fingerprint,
+            strategy_report_cache=_strategy_report_cache,
+            workflow_results_preverified=_workflow_results_preverified,
+            deadline_check=deadline_check,
         )
 
 
@@ -209,38 +221,116 @@ def _summarize_saved_results_snapshot(
     expected_buy_rsi_values: list[float] | None,
     expected_profit_target_values: list[float] | None,
     expected_strategy_fingerprint: str | None,
+    strategy_report_cache: _StrategyReportCache | None,
+    workflow_results_preverified: bool,
+    deadline_check: Callable[[], None] | None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     summary_rows = []
     best_curves = []
     for workflow_asset in workflow_assets.itertuples(index=False):
+        if deadline_check is not None:
+            deadline_check()
         asset_symbol = workflow_asset.symbol
         signal_symbol = workflow_asset.rsi_symbol
         entry_rule = rsi_entry_rule if rsi_entry_rule is not None else _workflow_rsi_entry_rule(workflow_asset)
-        best_row = load_best_strategy_summary(
-            conn,
-            asset_symbol,
-            signal_symbol,
-            entry_rule,
-        )
+        if strategy_report_cache is None:
+            best_row = load_best_strategy_summary(
+                conn,
+                asset_symbol,
+                signal_symbol,
+                entry_rule,
+            )
+        else:
+            best_row = load_best_strategy_summary(
+                conn,
+                asset_symbol,
+                signal_symbol,
+                entry_rule,
+                strategy_state_preverified=True,
+            )
         if best_row is None:
             continue
 
-        equity_df = load_complete_strategy_equity_curve(
-            conn,
-            asset_symbol,
-            signal_symbol,
-            float(best_row["buy_rsi"]),
-            float(best_row["profit_target_multiple"]),
-            rsi_period=rsi_period,
-            rsi_entry_rule=entry_rule,
-            base_cfg=base_cfg,
-            expected_buy_rsi_values=expected_buy_rsi_values,
-            expected_profit_target_values=expected_profit_target_values,
-            expected_strategy_fingerprint=expected_strategy_fingerprint,
-            allow_unbound_backtest_config=base_cfg is None,
-        )
+        curve_kwargs: dict[str, object] = {}
+        if strategy_report_cache is not None:
+            curve_kwargs["strategy_state_preverified"] = True
+        if workflow_results_preverified:
+            equity_rows = conn.execute(
+                """
+                SELECT date, equity
+                FROM strategy_equity
+                WHERE asset_symbol = ?
+                  AND signal_symbol = ?
+                  AND buy_rsi = ?
+                  AND profit_target_multiple = ?
+                ORDER BY date
+                """,
+                (
+                    asset_symbol,
+                    signal_symbol,
+                    float(best_row["buy_rsi"]),
+                    float(best_row["profit_target_multiple"]),
+                ),
+            ).fetchall()
+            equity_df = pd.DataFrame(equity_rows, columns=["date", "equity"])
+            if not equity_df.empty:
+                equity_df["date"] = pd.to_datetime(
+                    equity_df["date"],
+                    format="%Y-%m-%d",
+                    errors="raise",
+                )
+        else:
+            equity_df = load_complete_strategy_equity_curve(
+                conn,
+                asset_symbol,
+                signal_symbol,
+                float(best_row["buy_rsi"]),
+                float(best_row["profit_target_multiple"]),
+                rsi_period=rsi_period,
+                rsi_entry_rule=entry_rule,
+                base_cfg=base_cfg,
+                expected_buy_rsi_values=expected_buy_rsi_values,
+                expected_profit_target_values=expected_profit_target_values,
+                expected_strategy_fingerprint=expected_strategy_fingerprint,
+                allow_unbound_backtest_config=base_cfg is None,
+                **curve_kwargs,
+            )
         if equity_df is None or equity_df.empty:
             continue
+
+        if strategy_report_cache is not None:
+            buy_rsi = float(best_row["buy_rsi"])
+            profit_target_multiple = float(best_row["profit_target_multiple"])
+            state = load_strategy_state(
+                conn,
+                asset_symbol,
+                signal_symbol,
+                buy_rsi,
+                profit_target_multiple,
+                rsi_period=rsi_period,
+                rsi_entry_rule=entry_rule,
+            )
+            latest_action_row = conn.execute(
+                """
+                SELECT action_executed
+                FROM strategy_equity
+                WHERE asset_symbol = ?
+                  AND signal_symbol = ?
+                  AND buy_rsi = ?
+                  AND profit_target_multiple = ?
+                ORDER BY date DESC
+                LIMIT 1
+                """,
+                (asset_symbol, signal_symbol, buy_rsi, profit_target_multiple),
+            ).fetchone()
+            if state is None or latest_action_row is None or latest_action_row[0] not in {"none", "buy", "sell"}:
+                continue
+            strategy_report_cache[(str(asset_symbol), str(signal_symbol), entry_rule)] = (
+                best_row,
+                equity_df,
+                state,
+                str(latest_action_row[0]),
+            )
 
         best_equity = equity_df.set_index("date")["equity"]
         summary_rows.append(
@@ -288,6 +378,8 @@ def build_buy_signal_report(
     expected_profit_target_values: list[float] | None = None,
     expected_strategy_fingerprint: str | None = None,
     allow_unbound_backtest_config: bool = False,
+    _strategy_report_cache: _StrategyReportCache | None = None,
+    deadline_check: Callable[[], None] | None = None,
 ) -> pd.DataFrame:
     return build_pending_action_report(
         conn,
@@ -302,6 +394,8 @@ def build_buy_signal_report(
         expected_profit_target_values=expected_profit_target_values,
         expected_strategy_fingerprint=expected_strategy_fingerprint,
         allow_unbound_backtest_config=allow_unbound_backtest_config,
+        _strategy_report_cache=_strategy_report_cache,
+        deadline_check=deadline_check,
     )
 
 
@@ -316,6 +410,8 @@ def build_sell_signal_report(
     expected_profit_target_values: list[float] | None = None,
     expected_strategy_fingerprint: str | None = None,
     allow_unbound_backtest_config: bool = False,
+    _strategy_report_cache: _StrategyReportCache | None = None,
+    deadline_check: Callable[[], None] | None = None,
 ) -> pd.DataFrame:
     return build_pending_action_report(
         conn,
@@ -330,6 +426,8 @@ def build_sell_signal_report(
         expected_profit_target_values=expected_profit_target_values,
         expected_strategy_fingerprint=expected_strategy_fingerprint,
         allow_unbound_backtest_config=allow_unbound_backtest_config,
+        _strategy_report_cache=_strategy_report_cache,
+        deadline_check=deadline_check,
     )
 
 
@@ -628,7 +726,7 @@ def _build_alpaca_realized_pnl_summary_snapshot(
     if positions.empty:
         row = _realized_pnl_summary_row(0, 0, 0.0, 0.0)
         if include_workflow:
-            row = {"Workflow": "All", **row}
+            row = {"Workflow": "Total", **row}
         return pd.DataFrame(
             [row],
             columns=REALIZED_PNL_WORKFLOW_COLUMNS if include_workflow else REALIZED_PNL_COLUMNS,
@@ -872,6 +970,15 @@ def _build_alpaca_realized_pnl_summary_snapshot(
                     ),
                 }
             )
+        rows.append(
+            {
+                "Workflow": "Total",
+                **_finite_realized_pnl_summary_row(
+                    closed_positions=len(positions),
+                    complete=complete,
+                ),
+            }
+        )
         return pd.DataFrame(rows, columns=REALIZED_PNL_WORKFLOW_COLUMNS)
 
     return pd.DataFrame(
@@ -944,6 +1051,8 @@ def build_pending_action_report(
     expected_profit_target_values: list[float] | None = None,
     expected_strategy_fingerprint: str | None = None,
     allow_unbound_backtest_config: bool = False,
+    _strategy_report_cache: _StrategyReportCache | None = None,
+    deadline_check: Callable[[], None] | None = None,
 ) -> pd.DataFrame:
     if type(rsi_period) is not int or not 2 <= rsi_period <= 10_000:
         raise ValueError("rsi_period must be an integer between 2 and 10000.")
@@ -973,6 +1082,8 @@ def build_pending_action_report(
             expected_buy_rsi_values,
             expected_profit_target_values,
             expected_strategy_fingerprint,
+            _strategy_report_cache,
+            deadline_check,
         )
 
 
@@ -988,6 +1099,8 @@ def _build_pending_action_report_snapshot(
     expected_buy_rsi_values: list[float] | None,
     expected_profit_target_values: list[float] | None,
     expected_strategy_fingerprint: str | None,
+    strategy_report_cache: _StrategyReportCache | None,
+    deadline_check: Callable[[], None] | None,
 ) -> pd.DataFrame:
     if pending_action_filter not in {"buy", "sell"}:
         raise ValueError(f"Unsupported pending action report: {pending_action_filter}")
@@ -1013,16 +1126,26 @@ def _build_pending_action_report_snapshot(
     rows = []
     processed_strategies: set[tuple[str, str, float, float]] = set()
     for _, summary_row in optimization_summary.iterrows():
+        if deadline_check is not None:
+            deadline_check()
         asset_symbol = str(summary_row["Asset"])
         signal_symbol = str(summary_row["RSI Symbol"])
-        persisted_summary = load_best_strategy_summary(
-            conn,
-            asset_symbol,
-            signal_symbol,
-            rsi_entry_rule,
+        cached_report = (
+            None
+            if strategy_report_cache is None
+            else strategy_report_cache.get((asset_symbol, signal_symbol, rsi_entry_rule))
         )
-        if persisted_summary is None:
-            continue
+        if cached_report is None:
+            persisted_summary = load_best_strategy_summary(
+                conn,
+                asset_symbol,
+                signal_symbol,
+                rsi_entry_rule,
+            )
+            if persisted_summary is None:
+                continue
+        else:
+            persisted_summary = cached_report[0]
         try:
             requested_buy_rsi = float(summary_row["Buy RSI"])
             requested_profit_target = float(summary_row["Sell Return Multiple"])
@@ -1054,19 +1177,23 @@ def _build_pending_action_report_snapshot(
         # those independent digests do not prove that they describe the same
         # run. Authenticate their shared chronology, fills, endpoint, and the
         # retained curve before any summary-derived eligibility gate is used.
-        complete_curve = load_complete_strategy_equity_curve(
-            conn,
-            asset_symbol,
-            signal_symbol,
-            buy_rsi,
-            profit_target_multiple,
-            rsi_period=rsi_period,
-            rsi_entry_rule=rsi_entry_rule,
-            base_cfg=base_cfg,
-            expected_buy_rsi_values=expected_buy_rsi_values,
-            expected_profit_target_values=expected_profit_target_values,
-            expected_strategy_fingerprint=expected_strategy_fingerprint,
-            allow_unbound_backtest_config=base_cfg is None,
+        complete_curve = (
+            cached_report[1]
+            if cached_report is not None
+            else load_complete_strategy_equity_curve(
+                conn,
+                asset_symbol,
+                signal_symbol,
+                buy_rsi,
+                profit_target_multiple,
+                rsi_period=rsi_period,
+                rsi_entry_rule=rsi_entry_rule,
+                base_cfg=base_cfg,
+                expected_buy_rsi_values=expected_buy_rsi_values,
+                expected_profit_target_values=expected_profit_target_values,
+                expected_strategy_fingerprint=expected_strategy_fingerprint,
+                allow_unbound_backtest_config=base_cfg is None,
+            )
         )
         if complete_curve is None:
             continue
@@ -1080,14 +1207,18 @@ def _build_pending_action_report_snapshot(
         if min_sharpe is not None and (pd.isna(sharpe) or sharpe < min_sharpe):
             continue
 
-        state = load_strategy_state(
-            conn,
-            asset_symbol,
-            signal_symbol,
-            buy_rsi,
-            profit_target_multiple,
-            rsi_period=rsi_period,
-            rsi_entry_rule=rsi_entry_rule,
+        state = (
+            cached_report[2]
+            if cached_report is not None
+            else load_strategy_state(
+                conn,
+                asset_symbol,
+                signal_symbol,
+                buy_rsi,
+                profit_target_multiple,
+                rsi_period=rsi_period,
+                rsi_entry_rule=rsi_entry_rule,
+            )
         )
         if state is None or state["last_date"] is None:
             continue
@@ -1095,8 +1226,10 @@ def _build_pending_action_report_snapshot(
         pending_action_matches = state["pending_action"] == pending_action_filter
         latest_sell_executed = False
         if pending_action_filter == "sell" and not pending_action_matches:
-            latest_sell_executed = (
-                load_complete_strategy_latest_action(
+            latest_action = (
+                cached_report[3]
+                if cached_report is not None
+                else load_complete_strategy_latest_action(
                     conn,
                     asset_symbol,
                     signal_symbol,
@@ -1110,8 +1243,8 @@ def _build_pending_action_report_snapshot(
                     expected_strategy_fingerprint=expected_strategy_fingerprint,
                     allow_unbound_backtest_config=base_cfg is None,
                 )
-                == "sell"
             )
+            latest_sell_executed = latest_action == "sell"
 
         if not pending_action_matches and not latest_sell_executed:
             continue

@@ -81,6 +81,15 @@ def _workflow_concurrency(value: str | int) -> int:
     return _bounded_int(value, name="workflow concurrency", minimum=1, maximum=64)
 
 
+def _workflow_deadline_epoch(value: str | int) -> int:
+    return _bounded_int(
+        value,
+        name="workflow deadline epoch",
+        minimum=1,
+        maximum=9_223_372_036_854_775_807,
+    )
+
+
 def _buy_limit_buffer_bps(value: str | float) -> float:
     return _bounded_float(value, name="buy limit buffer bps", minimum=0.0, maximum=10_000.0)
 
@@ -373,13 +382,28 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--strategy-state-verification",
+        choices=["trusted", "canonical"],
+        default="trusted",
+        help=(
+            "Verify authenticated local state and chronology before resuming (trusted, default), "
+            "or additionally replay full canonical history for an explicit audit (canonical)."
+        ),
+    )
+    parser.add_argument(
+        "--workflow-deadline-epoch",
+        type=_workflow_deadline_epoch,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--require-workflow-source-success",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
         help=(
             "Abort before running strategies if an enabled universe discovery or active listing "
-            "source fails. Disabled by default; source failures are otherwise recorded as a "
-            "degraded universe."
+            "source fails. Enabled by default with Alpaca buy submission and disabled otherwise; "
+            "source failures are otherwise recorded as a degraded universe."
         ),
     )
     parser.add_argument(
@@ -387,8 +411,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable colored terminal output.",
     )
+    parser.add_argument(
+        "--show-timings",
+        action="store_true",
+        help="Show overlap-aware workflow phase timings and market-data work counts.",
+    )
     args = parser.parse_args()
     _resolve_env_backed_defaults(parser, args)
+    if args.require_workflow_source_success is None:
+        args.require_workflow_source_success = bool(args.alpaca_submit_buy_orders)
     if not args.reconcile_only:
         for name, message in REMOVED_ENV_VARS.items():
             if name in os.environ:
@@ -470,4 +501,7 @@ def main() -> None:
         no_color=args.no_color,
         tradier_cfg=tradier_cfg,
         short_buy_rsi_values=short_buy_rsi_values,
+        strategy_state_verification=args.strategy_state_verification,
+        workflow_deadline_epoch=args.workflow_deadline_epoch,
+        show_timings=args.show_timings,
     )

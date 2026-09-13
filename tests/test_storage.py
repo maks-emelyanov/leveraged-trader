@@ -35,6 +35,7 @@ from leveraged_trader.storage import (
     adopt_alpaca_managed_position_asset_if_current,
     align_signal_values_to_asset_sessions,
     alpaca_managed_buy_fill_observation_authorizes_mutation,
+    alpaca_managed_position_asset_ids,
     apply_alpaca_closed_position_broker_correction,
     attach_alpaca_managed_sell_order_if_current,
     claim_alpaca_managed_sell_replacement,
@@ -50,6 +51,7 @@ from leveraged_trader.storage import (
     process_asset_grid,
     record_alpaca_managed_sell_generation,
     record_alpaca_managed_sell_order,
+    rekey_alpaca_managed_position_asset_if_current,
     save_alpaca_managed_buy_order,
     save_equity_records,
     save_market_data,
@@ -400,7 +402,13 @@ class StorageOptimizationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.conn.close()
 
-    def process_grid(self, data: pd.DataFrame, *, rebuild: bool) -> None:
+    def process_grid(
+        self,
+        data: pd.DataFrame,
+        *,
+        rebuild: bool,
+        strategy_state_verification: str = "trusted",
+    ) -> None:
         process_asset_grid(
             self.conn,
             data,
@@ -410,6 +418,7 @@ class StorageOptimizationTests(unittest.TestCase):
             buy_rsi_values=[30.0, 70.0],
             profit_target_values=[1.05, 1.50],
             rebuild=rebuild,
+            strategy_state_verification=strategy_state_verification,
         )
 
     def persisted_strategy_fingerprint(self) -> str:
@@ -418,6 +427,134 @@ class StorageOptimizationTests(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(row)
         return str(row[0])
+
+    def test_strategy_fingerprint_is_independent_from_database_migration_version(self) -> None:
+        expected = strategy_config_fingerprint(self.cfg, [30.0], [1.5])
+        with patch.object(
+            storage_module,
+            "STRATEGY_STATE_SCHEMA_VERSION",
+            storage_module.STRATEGY_STATE_SCHEMA_VERSION + 1,
+        ):
+            self.assertEqual(strategy_config_fingerprint(self.cfg, [30.0], [1.5]), expected)
+        with patch.object(
+            storage_module,
+            "STRATEGY_SEMANTICS_VERSION",
+            storage_module.STRATEGY_SEMANTICS_VERSION + 1,
+        ):
+            self.assertNotEqual(strategy_config_fingerprint(self.cfg, [30.0], [1.5]), expected)
+
+    def test_trusted_and_canonical_updates_produce_identical_persisted_and_reported_results(self) -> None:
+        canonical_conn = sqlite3.connect(":memory:")
+        init_state_db(canonical_conn)
+        initial = sample_strategy_data(periods=24)
+        appended = initial.iloc[[-1]].copy()
+        appended.index = pd.DatetimeIndex([initial.index[-1] + pd.offsets.BDay()])
+        appended.loc[:, "TQQQ_Open"] += 1.0
+        appended.loc[:, "TQQQ_High"] += 1.0
+        appended.loc[:, "TQQQ_Low"] += 1.0
+        appended.loc[:, "TQQQ_Close"] += 1.0
+        extended = pd.concat([initial, appended])
+        buy_rsi_values = [30.0, 70.0]
+        profit_target_values = [1.05, 1.50]
+
+        def process(conn: sqlite3.Connection, data: pd.DataFrame, *, rebuild: bool, verification: str) -> None:
+            process_asset_grid(
+                conn,
+                data,
+                self.cfg,
+                "TQQQ",
+                "QQQ",
+                buy_rsi_values,
+                profit_target_values,
+                rebuild=rebuild,
+                strategy_state_verification=verification,
+            )
+
+        try:
+            process(self.conn, initial, rebuild=True, verification="trusted")
+            process(canonical_conn, initial, rebuild=True, verification="canonical")
+            process(self.conn, extended, rebuild=False, verification="trusted")
+            process(canonical_conn, extended, rebuild=False, verification="canonical")
+
+            for table, ordering in (
+                ("strategy_state", "asset_symbol, signal_symbol, buy_rsi, profit_target_multiple"),
+                ("strategy_summary", "asset_symbol, signal_symbol, buy_rsi, profit_target_multiple"),
+                ("strategy_equity", "asset_symbol, signal_symbol, buy_rsi, profit_target_multiple, date"),
+                ("strategy_config", "asset_symbol, signal_symbol"),
+            ):
+                with self.subTest(table=table):
+                    trusted_rows = self.conn.execute(f"SELECT * FROM {table} ORDER BY {ordering}").fetchall()
+                    canonical_rows = canonical_conn.execute(f"SELECT * FROM {table} ORDER BY {ordering}").fetchall()
+                    self.assertEqual(trusted_rows, canonical_rows)
+
+            workflow_assets = pd.DataFrame([{"symbol": "TQQQ", "rsi_symbol": "QQQ"}])
+            report_kwargs = {
+                "rsi_period": self.cfg.rsi_period,
+                "base_cfg": self.cfg,
+                "expected_buy_rsi_values": buy_rsi_values,
+                "expected_profit_target_values": profit_target_values,
+            }
+            trusted_summary, trusted_curves = summarize_saved_results(
+                self.conn,
+                workflow_assets,
+                **report_kwargs,
+            )
+            canonical_summary, canonical_curves = summarize_saved_results(
+                canonical_conn,
+                workflow_assets,
+                **report_kwargs,
+            )
+            pd.testing.assert_frame_equal(trusted_summary, canonical_summary, check_exact=True)
+            pd.testing.assert_frame_equal(trusted_curves, canonical_curves, check_exact=True)
+            for report_builder in (
+                reports_module.build_buy_signal_report,
+                reports_module.build_sell_signal_report,
+            ):
+                trusted_report = report_builder(
+                    self.conn,
+                    trusted_summary,
+                    self.cfg.rsi_period,
+                    base_cfg=self.cfg,
+                    expected_buy_rsi_values=buy_rsi_values,
+                    expected_profit_target_values=profit_target_values,
+                )
+                canonical_report = report_builder(
+                    canonical_conn,
+                    canonical_summary,
+                    self.cfg.rsi_period,
+                    base_cfg=self.cfg,
+                    expected_buy_rsi_values=buy_rsi_values,
+                    expected_profit_target_values=profit_target_values,
+                )
+                pd.testing.assert_frame_equal(trusted_report, canonical_report, check_exact=True)
+        finally:
+            canonical_conn.close()
+
+    def test_deadline_after_grid_compute_rolls_back_active_asset(self) -> None:
+        checks = 0
+
+        def deadline_check() -> None:
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                raise RuntimeError("deadline expired")
+
+        with self.assertRaisesRegex(RuntimeError, "deadline expired"):
+            process_asset_grid(
+                self.conn,
+                sample_strategy_data(),
+                self.cfg,
+                "TQQQ",
+                "QQQ",
+                [30.0],
+                [1.5],
+                rebuild=True,
+                deadline_check=deadline_check,
+            )
+
+        for table in ("market_data", "rsi_values", "strategy_state", "strategy_summary", "strategy_equity"):
+            with self.subTest(table=table):
+                self.assertEqual(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0)
 
     def test_direct_strategy_boundaries_reject_boolean_numeric_inputs_before_writes(self) -> None:
         data = sample_strategy_data(periods=4)
@@ -997,7 +1134,7 @@ class StorageOptimizationTests(unittest.TestCase):
                 rebuild=False,
                 **grid_kwargs,
             )
-        self.assertEqual(resumed_grid.call_args.args[7].tolist(), [1])
+        resumed_grid.assert_not_called()
         self.assertTrue(
             strategy_state_matches_config(
                 self.conn,
@@ -1601,6 +1738,7 @@ class StorageOptimizationTests(unittest.TestCase):
                 cfg,
                 [30.0],
                 [1.5, 2.0],
+                strategy_state_verification="canonical",
             )
         )
 
@@ -1722,6 +1860,7 @@ class StorageOptimizationTests(unittest.TestCase):
                             [buy_rsi],
                             [2.0],
                             rsi_entry_rule=entry_rule,
+                            strategy_state_verification="canonical",
                         )
                     )
                     summary, curves = summarize_saved_results(
@@ -1931,6 +2070,7 @@ class StorageOptimizationTests(unittest.TestCase):
                         [buy_rsi],
                         [1.05],
                         rsi_entry_rule=entry_rule,
+                        strategy_state_verification="canonical",
                     )
                 )
                 self.assertIsNone(
@@ -4123,10 +4263,16 @@ class StorageOptimizationTests(unittest.TestCase):
             authoritative_histories=self.canonical_histories(initial),
         )
 
-        with patch(
-            "leveraged_trader.storage.run_grid_summary",
-            wraps=run_grid_summary,
-        ) as grid_summary:
+        with (
+            patch(
+                "leveraged_trader.storage.run_grid_summary",
+                wraps=run_grid_summary,
+            ) as grid_summary,
+            patch(
+                "leveraged_trader.storage._synchronize_market_data_history",
+                wraps=_synchronize_market_data_history,
+            ) as synchronize_history,
+        ):
             process_asset_grid(
                 self.conn,
                 extended,
@@ -4139,7 +4285,9 @@ class StorageOptimizationTests(unittest.TestCase):
                 authoritative_histories=self.canonical_histories(extended),
             )
 
-        self.assertEqual(grid_summary.call_args.args[7].tolist(), [len(initial)])
+        self.assertEqual(len(grid_summary.call_args.args[0]), 1)
+        self.assertEqual(grid_summary.call_args.args[7].tolist(), [0])
+        synchronize_history.assert_not_called()
         self.assertEqual(
             self.conn.execute("SELECT COUNT(*) FROM strategy_equity").fetchone()[0],
             len(extended),
@@ -4199,7 +4347,8 @@ class StorageOptimizationTests(unittest.TestCase):
                 rebuild=True,
             )
 
-            self.assertEqual(grid_summary.call_args.args[7].tolist(), [3, 3])
+            self.assertEqual(len(grid_summary.call_args.args[0]), 3)
+            self.assertEqual(grid_summary.call_args.args[7].tolist(), [0, 0])
             self.assertTrue(
                 strategy_state_matches_config(
                     self.conn,
@@ -4286,7 +4435,8 @@ class StorageOptimizationTests(unittest.TestCase):
                 presynchronized_authoritative_symbols={"QQQ", RISK_FREE_SYMBOL},
             )
 
-        self.assertEqual(grid_summary.call_args.args[7].tolist(), [len(dates)])
+        self.assertEqual(len(grid_summary.call_args.args[0]), 1)
+        self.assertEqual(grid_summary.call_args.args[7].tolist(), [0])
         self.assertEqual(
             self.conn.execute(
                 "SELECT asset_symbol FROM strategy_state WHERE signal_symbol = 'QQQ' ORDER BY asset_symbol"
@@ -4513,7 +4663,8 @@ class StorageOptimizationTests(unittest.TestCase):
                 signal_history=self.canonical_histories(extended)["QQQ"],
             )
 
-        self.assertEqual(grid_summary.call_args.args[7].tolist(), [len(initial)])
+        self.assertEqual(len(grid_summary.call_args.args[0]), 1)
+        self.assertEqual(grid_summary.call_args.args[7].tolist(), [0])
 
     def test_non_authoritative_late_signal_tail_rebuilds_processed_state(self) -> None:
         dates = pd.date_range("2026-01-05", periods=5, freq="B")
@@ -4697,6 +4848,181 @@ class StorageOptimizationTests(unittest.TestCase):
         self.assertFalse(revised)
         self.assertEqual(self.conn.total_changes - changes_before, 1)
 
+    def test_preverified_authoritative_tail_runs_one_resumed_grid(self) -> None:
+        initial = sample_strategy_data(periods=8)
+        initial_histories = self.canonical_histories(initial)
+        process_asset_grid(
+            self.conn,
+            initial,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            [30.0],
+            [1.5],
+            rebuild=True,
+            authoritative_histories=initial_histories,
+        )
+        extended_histories: dict[str, pd.DataFrame] = {}
+        for symbol, history in initial_histories.items():
+            appended = history.iloc[[-1]].copy()
+            appended.index = pd.DatetimeIndex([history.index[-1] + pd.offsets.BDay()])
+            extended_histories[symbol] = pd.concat([history, appended])
+        extended = pd.concat(list(extended_histories.values()), axis=1)
+
+        with (
+            patch(
+                "leveraged_trader.storage.run_grid_summary",
+                wraps=run_grid_summary,
+            ) as grid_summary,
+            patch(
+                "leveraged_trader.storage.save_equity_records",
+                wraps=save_equity_records,
+            ) as save_equity,
+            patch(
+                "leveraged_trader.storage.clear_equity_records",
+                wraps=storage_module.clear_equity_records,
+            ) as clear_equity,
+        ):
+            rebuilt = process_asset_grid(
+                self.conn,
+                extended,
+                self.cfg,
+                "TQQQ",
+                "QQQ",
+                [30.0],
+                [1.5],
+                rebuild=False,
+                authoritative_histories=extended_histories,
+                strategy_state_preverified=True,
+                _prevalidated_best_config=(30.0, 1.5),
+            )
+
+        self.assertFalse(rebuilt)
+        grid_summary.assert_called_once()
+        self.assertEqual(len(grid_summary.call_args.args[0]), 1)
+        self.assertEqual(grid_summary.call_args.args[7].tolist(), [0])
+        self.assertTrue(grid_summary.call_args.kwargs["_prevalidated_resume_state"])
+        save_equity.assert_called_once()
+        self.assertEqual(len(save_equity.call_args.args[1]), 1)
+        clear_equity.assert_not_called()
+
+        expected_conn = sqlite3.connect(":memory:")
+        init_state_db(expected_conn)
+        try:
+            process_asset_grid(
+                expected_conn,
+                extended,
+                self.cfg,
+                "TQQQ",
+                "QQQ",
+                [30.0],
+                [1.5],
+                rebuild=True,
+                authoritative_histories=extended_histories,
+            )
+            for table, ordering in (
+                ("strategy_state", "asset_symbol, signal_symbol, buy_rsi, profit_target_multiple"),
+                ("strategy_summary", "asset_symbol, signal_symbol, buy_rsi, profit_target_multiple"),
+                (
+                    "strategy_equity",
+                    "asset_symbol, signal_symbol, buy_rsi, profit_target_multiple, date",
+                ),
+                ("strategy_config", "asset_symbol, signal_symbol"),
+            ):
+                with self.subTest(table=table):
+                    actual_rows = self.conn.execute(f"SELECT * FROM {table} ORDER BY {ordering}").fetchall()
+                    expected_rows = expected_conn.execute(f"SELECT * FROM {table} ORDER BY {ordering}").fetchall()
+                    self.assertEqual(actual_rows, expected_rows)
+        finally:
+            expected_conn.close()
+
+    def test_preverified_tail_curve_uses_retained_candles_after_adjustment_noise(self) -> None:
+        initial = sample_strategy_data(periods=30)
+        initial_histories = self.canonical_histories(initial)
+        buy_rsi_values = [20.0, 30.0, 40.0]
+        profit_target_values = [1.25, 1.5]
+        process_asset_grid(
+            self.conn,
+            initial,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            buy_rsi_values,
+            profit_target_values,
+            rebuild=True,
+            authoritative_histories=initial_histories,
+        )
+        best_config = self.conn.execute(
+            """
+            SELECT buy_rsi, profit_target_multiple
+            FROM strategy_summary
+            ORDER BY sharpe DESC NULLS LAST,
+                     total_return DESC NULLS LAST,
+                     cagr DESC NULLS LAST,
+                     buy_rsi,
+                     profit_target_multiple
+            LIMIT 1
+            """
+        ).fetchone()
+        self.assertIsNotNone(best_config)
+
+        canonical_extended_histories: dict[str, pd.DataFrame] = {}
+        noisy_extended_histories: dict[str, pd.DataFrame] = {}
+        for symbol, history in initial_histories.items():
+            appended = history.iloc[[-1]].copy()
+            appended.index = pd.DatetimeIndex([history.index[-1] + pd.offsets.BDay()])
+            canonical_extended = pd.concat([history, appended])
+            noisy_extended = canonical_extended.copy()
+            price_columns = [f"{symbol}_{field}" for field in ("Open", "High", "Low", "Close")]
+            noisy_extended.loc[history.index, price_columns] *= 1.0000025
+            canonical_extended_histories[symbol] = canonical_extended
+            noisy_extended_histories[symbol] = noisy_extended
+        noisy_extended = pd.concat(list(noisy_extended_histories.values()), axis=1)
+
+        process_asset_grid(
+            self.conn,
+            noisy_extended,
+            self.cfg,
+            "TQQQ",
+            "QQQ",
+            buy_rsi_values,
+            profit_target_values,
+            rebuild=False,
+            authoritative_histories=noisy_extended_histories,
+            strategy_state_preverified=True,
+            _prevalidated_best_config=best_config,
+        )
+
+        expected_conn = sqlite3.connect(":memory:")
+        init_state_db(expected_conn)
+        try:
+            canonical_extended = pd.concat(list(canonical_extended_histories.values()), axis=1)
+            process_asset_grid(
+                expected_conn,
+                canonical_extended,
+                self.cfg,
+                "TQQQ",
+                "QQQ",
+                buy_rsi_values,
+                profit_target_values,
+                rebuild=True,
+                authoritative_histories=canonical_extended_histories,
+            )
+            for table, ordering in (
+                ("strategy_state", "asset_symbol, signal_symbol, buy_rsi, profit_target_multiple"),
+                ("strategy_summary", "asset_symbol, signal_symbol, buy_rsi, profit_target_multiple"),
+                (
+                    "strategy_equity",
+                    "asset_symbol, signal_symbol, buy_rsi, profit_target_multiple, date",
+                ),
+            ):
+                with self.subTest(table=table):
+                    actual_rows = self.conn.execute(f"SELECT * FROM {table} ORDER BY {ordering}").fetchall()
+                    expected_rows = expected_conn.execute(f"SELECT * FROM {table} ORDER BY {ordering}").fetchall()
+                    self.assertEqual(actual_rows, expected_rows)
+        finally:
+            expected_conn.close()
+
     def test_late_risk_free_tail_bar_replays_forward_filled_strategy_state(self) -> None:
         data = sample_strategy_data()
         data.loc[
@@ -4860,6 +5186,40 @@ class StorageOptimizationTests(unittest.TestCase):
                 material_revision = history.copy()
                 material_revision.loc[date, f"{symbol}_Close"] = first_close + 0.01
                 self.assertTrue(_synchronize_market_data_history(self.conn, material_revision, symbol))
+
+    def test_authoritative_history_ignores_tiny_coherent_adjustment_factor_noise(self) -> None:
+        date = pd.Timestamp("2026-01-02")
+        history = pd.DataFrame(
+            {
+                "AAPL_Open": [240.0],
+                "AAPL_High": [245.0],
+                "AAPL_Low": [238.0],
+                "AAPL_Close": [243.0],
+                "AAPL_Volume": [1_000.0],
+            },
+            index=[date],
+        )
+        history.attrs["market_data_providers"] = {"AAPL": "yahoo_finance"}
+        self.assertFalse(_synchronize_market_data_history(self.conn, history, "AAPL"))
+        stored_before = self.conn.execute(
+            "SELECT open, high, low, close, volume FROM market_data WHERE symbol = 'AAPL'"
+        ).fetchone()
+        changes_before = self.conn.total_changes
+
+        observed_again = history.copy()
+        observed_again.loc[date, ["AAPL_Open", "AAPL_High", "AAPL_Low", "AAPL_Close"]] *= 1.0000025
+        self.assertFalse(_synchronize_market_data_history(self.conn, observed_again, "AAPL"))
+        self.assertEqual(self.conn.total_changes, changes_before)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT open, high, low, close, volume FROM market_data WHERE symbol = 'AAPL'"
+            ).fetchone(),
+            stored_before,
+        )
+
+        material_revision = history.copy()
+        material_revision.loc[date, ["AAPL_Open", "AAPL_High", "AAPL_Low", "AAPL_Close"]] *= 1.00001
+        self.assertTrue(_synchronize_market_data_history(self.conn, material_revision, "AAPL"))
 
     def test_yahoo_float32_correction_rebuilds_completed_strategy_state(self) -> None:
         data = sample_strategy_data()
@@ -5672,7 +6032,10 @@ class StorageOptimizationTests(unittest.TestCase):
             )
 
         retained_target = self.conn.execute("SELECT DISTINCT profit_target_multiple FROM strategy_equity").fetchone()[0]
-        self.assertEqual(replaced_targets, [5.0, 6.0])
+        # Fresh grids rank validated in-memory summaries and write only the
+        # selected curve, so the legacy post-write reconstruction loop is not
+        # entered even for a one-ULP tie case.
+        self.assertEqual(replaced_targets, [])
         self.assertEqual(retained_target, 5.0)
 
     def test_unchanged_update_rebuilds_semantically_corrupted_best_equity_curve(self) -> None:
@@ -5904,6 +6267,38 @@ class StorageOptimizationTests(unittest.TestCase):
 
         self.assertEqual(float(incremental.dropna().iloc[-1]), 50.0)
         pd.testing.assert_series_equal(incremental, expected, check_names=False)
+
+    def test_trusted_rsi_cache_appends_without_canonical_recurrence_replay(self) -> None:
+        close = pd.Series(
+            np.linspace(100.0, 112.0, 12),
+            index=pd.date_range("2026-01-02", periods=12, freq="B"),
+        )
+        ensure_rsi_values(
+            self.conn,
+            "QQQ",
+            self.cfg.rsi_period,
+            close.iloc[:-1],
+            rebuild=True,
+        )
+
+        with patch(
+            "leveraged_trader.storage._rsi_cache_rows_are_valid",
+            side_effect=AssertionError("trusted verification must not replay the recurrence"),
+        ):
+            incremental = ensure_rsi_values(
+                self.conn,
+                "QQQ",
+                self.cfg.rsi_period,
+                close,
+                rebuild=False,
+                trusted_cache=True,
+            )
+
+        pd.testing.assert_series_equal(
+            incremental,
+            compute_rsi(close, self.cfg.rsi_period),
+            check_names=False,
+        )
 
     def test_materially_different_tiny_cached_close_path_forces_rsi_rebuild(self) -> None:
         dates = pd.date_range("2026-01-02", periods=10, freq="B")
@@ -9088,6 +9483,7 @@ class StorageOptimizationTests(unittest.TestCase):
                 self.cfg,
                 buy_rsi_values,
                 profit_target_values,
+                strategy_state_verification="canonical",
             )
         )
         self.assertFalse(
@@ -9148,6 +9544,7 @@ class StorageOptimizationTests(unittest.TestCase):
                 self.cfg,
                 buy_rsi_values,
                 profit_target_values,
+                strategy_state_verification="canonical",
             )
         )
 
@@ -9175,6 +9572,7 @@ class StorageOptimizationTests(unittest.TestCase):
                 self.cfg,
                 buy_rsi_values,
                 profit_target_values,
+                strategy_state_verification="canonical",
             )
         )
         self.assertTrue(
@@ -9190,7 +9588,11 @@ class StorageOptimizationTests(unittest.TestCase):
             )[0].empty
         )
 
-        self.process_grid(data.iloc[-1:], rebuild=False)
+        self.process_grid(
+            data.iloc[-1:],
+            rebuild=False,
+            strategy_state_verification="canonical",
+        )
 
         self.assertTrue(
             strategy_state_matches_config(
@@ -9200,6 +9602,7 @@ class StorageOptimizationTests(unittest.TestCase):
                 self.cfg,
                 buy_rsi_values,
                 profit_target_values,
+                strategy_state_verification="canonical",
             )
         )
         self.assertEqual(
@@ -9236,6 +9639,7 @@ class StorageOptimizationTests(unittest.TestCase):
                 self.cfg,
                 buy_rsi_values,
                 profit_target_values,
+                strategy_state_verification="canonical",
             )
         )
         self.assertIsNone(
@@ -9630,6 +10034,7 @@ class StorageOptimizationTests(unittest.TestCase):
                 canonical_cfg,
                 buy_rsi_values,
                 profit_target_values,
+                strategy_state_verification="canonical",
             )
         )
         self.assertTrue(
@@ -10406,6 +10811,106 @@ class AlpacaManagedStorageTests(unittest.TestCase):
             (position_id,),
         )
         self.conn.commit()
+
+    def test_managed_asset_rekey_preserves_prior_broker_id_under_revision_fence(self) -> None:
+        position_id = self.save_position(
+            symbol="TQQQ",
+            client_order_id="buy-asset-rekey",
+            alpaca_asset_id="asset-old",
+        )
+        before = load_alpaca_managed_positions(self.conn).iloc[0]
+
+        rekeyed_revision = rekey_alpaca_managed_position_asset_if_current(
+            self.conn,
+            position_id,
+            expected_state_revision=int(before["state_revision"]),
+            expected_symbol="TQQQ",
+            expected_alpaca_asset_id="asset-old",
+            successor_alpaca_asset_id="asset-new",
+        )
+        after = load_alpaca_managed_positions(self.conn).iloc[0]
+
+        self.assertEqual(rekeyed_revision, int(before["state_revision"]) + 1)
+        self.assertEqual(after["alpaca_asset_id"], "asset-new")
+        self.assertEqual(alpaca_managed_position_asset_ids(after.to_dict()), ("asset-new", "asset-old"))
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT alpaca_asset_id FROM alpaca_symbol_aliases WHERE symbol = 'TQQQ' ORDER BY alpaca_asset_id"
+            ).fetchall(),
+            [("asset-new",), ("asset-old",)],
+        )
+        self.assertIsNone(
+            rekey_alpaca_managed_position_asset_if_current(
+                self.conn,
+                position_id,
+                expected_state_revision=int(before["state_revision"]),
+                expected_symbol="TQQQ",
+                expected_alpaca_asset_id="asset-old",
+                successor_alpaca_asset_id="asset-stale",
+            )
+        )
+
+    def test_loaded_managed_asset_history_rejects_current_id_reuse(self) -> None:
+        position_id = self.save_position(
+            symbol="TQQQ",
+            client_order_id="buy-invalid-asset-history",
+            alpaca_asset_id="asset-current",
+        )
+        self.conn.execute(
+            "UPDATE alpaca_managed_positions SET prior_alpaca_asset_ids = ? WHERE id = ?",
+            ('["asset-current"]', position_id),
+        )
+        self.conn.commit()
+
+        with self.assertRaisesRegex(ValueError, "invalid durable asset-ID history"):
+            load_alpaca_managed_positions(self.conn)
+
+    def test_closed_correction_accepts_broker_rekeyed_prior_asset_id(self) -> None:
+        position_id = self.save_position(
+            symbol="TQQQ",
+            client_order_id="buy-rekeyed-closed-correction",
+            alpaca_asset_id="asset-old",
+        )
+        before = load_alpaca_managed_positions(self.conn).iloc[0]
+        self.assertIsNotNone(
+            rekey_alpaca_managed_position_asset_if_current(
+                self.conn,
+                position_id,
+                expected_state_revision=int(before["state_revision"]),
+                expected_symbol="TQQQ",
+                expected_alpaca_asset_id="asset-old",
+                successor_alpaca_asset_id="asset-new",
+            )
+        )
+        self.close_position(position_id)
+        snapshot = load_alpaca_managed_positions(self.conn).iloc[0]
+
+        applied, reopened, conflict, remaining = apply_alpaca_closed_position_broker_correction(
+            self.conn,
+            position_id,
+            expected_closed_at=str(snapshot["closed_at"]),
+            expected_state_revision=int(snapshot["state_revision"]),
+            alpaca_asset_id="asset-old",
+            buy_order_qty=2,
+            buy_order_limit_price=105,
+            buy_status="filled",
+            filled_qty=2,
+            filled_avg_price=100,
+            filled_at="2026-01-02T14:31:00Z",
+            target_sell_price=150,
+            sell_status="filled",
+            sell_fills=[("sell-old", 2, 300)],
+            sell_filled_at="2026-01-02T14:33:00Z",
+            notes="broker correction from prior asset generation",
+        )
+        corrected = load_alpaca_managed_positions(self.conn).iloc[0]
+
+        self.assertTrue(applied)
+        self.assertFalse(reopened)
+        self.assertFalse(conflict)
+        self.assertEqual(remaining, 0)
+        self.assertEqual(corrected["alpaca_asset_id"], "asset-new")
+        self.assertEqual(alpaca_managed_position_asset_ids(corrected.to_dict()), ("asset-new", "asset-old"))
 
     def test_neutral_sell_submission_release_rebases_current_parent_intent(self) -> None:
         position_id = save_alpaca_managed_buy_order(
@@ -14506,6 +15011,43 @@ class AlpacaManagedStorageTests(unittest.TestCase):
         self.assertEqual(
             row,
             ("Long", "TQQQ", "QQQ", 30, 1.5, "submission_pending", None),
+        )
+
+    def test_initialization_backfills_null_legacy_managed_workflow_as_long(self) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO alpaca_managed_positions
+            (workflow, symbol, signal_symbol, buy_rsi, profit_target_multiple,
+             buy_signal_date, buy_client_order_id, buy_status)
+            VALUES (NULL, 'TQQQ', 'QQQ', 30, 1.5, '2026-01-02',
+                    'rsi-buy-TQQQ-legacy-workflow', 'rejected')
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO alpaca_managed_positions
+            (workflow, symbol, signal_symbol, buy_rsi, profit_target_multiple,
+             buy_signal_date, buy_client_order_id, buy_status)
+            VALUES ('Short', 'SQQQ', 'QQQ', 70, 1.5, '2026-01-02',
+                    'rsi-buy-SQQQ-explicit-workflow', 'rejected')
+            """
+        )
+
+        init_state_db(self.conn)
+
+        workflows = self.conn.execute(
+            """
+            SELECT buy_client_order_id, workflow
+            FROM alpaca_managed_positions
+            ORDER BY buy_client_order_id
+            """
+        ).fetchall()
+        self.assertEqual(
+            workflows,
+            [
+                ("rsi-buy-SQQQ-explicit-workflow", "Short"),
+                ("rsi-buy-TQQQ-legacy-workflow", "Long"),
+            ],
         )
 
     def test_active_buy_observation_cannot_erase_pending_cancel_ownership(self) -> None:
@@ -18892,6 +19434,14 @@ class AlpacaManagedStorageTests(unittest.TestCase):
             buy_fill_broker_oldest_updated_at="2026-07-20T12:10:00Z",
         )
         after_bust = load_alpaca_managed_positions(self.conn).iloc[0]
+        zero_fill_accounting = self.conn.execute(
+            "SELECT filled_qty, filled_avg_price, sell_filled_qty, "
+            "sell_filled_avg_price, sold_qty, sold_value, remaining_qty, "
+            "realized_pl, realized_pl_pct "
+            "FROM alpaca_managed_positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+        init_state_db(self.conn)
         replayed = apply_alpaca_closed_position_broker_correction(
             self.conn,
             position_id,
@@ -18919,6 +19469,10 @@ class AlpacaManagedStorageTests(unittest.TestCase):
         ).fetchone()
 
         self.assertEqual(busted[:2], (True, False))
+        self.assertEqual(
+            zero_fill_accounting,
+            (None, None, None, None, 0, 0, None, None, None),
+        )
         self.assertEqual(replayed, (False, False, False, 0.0))
         self.assertEqual(row[:3], ("canceled", None, "2026-07-20T12:10:00.000000Z"))
         self.assertIsNotNone(row[3])

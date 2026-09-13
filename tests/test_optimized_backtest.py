@@ -22,6 +22,7 @@ from leveraged_trader.optimized_backtest import (
     _target_limit_price,
     _target_price_overrides,
     _target_price_with_override,
+    run_fresh_grid_summary,
     run_grid_summary,
     run_single_equity_curve,
 )
@@ -29,6 +30,121 @@ from leveraged_trader.pricing import buffered_buy_limit_price
 
 
 class OptimizedBacktestTests(unittest.TestCase):
+    def test_fresh_grid_path_is_bitwise_identical_to_pristine_resumable_path(self) -> None:
+        open_prices = np.array([100.0, 101.0, 104.01, 103.0, 99.99, 102.0])
+        high_prices = np.array([100.0, 104.01, 104.01, 105.0, 102.0, 106.0])
+        close_prices = np.array([100.0, 102.0, 103.0, 104.0, 101.0, 105.0])
+        rsi_values = np.array([np.nan, 20.0, 80.0, 30.0, 70.0, 50.0])
+        risk_free_returns = np.array([np.nan, 0.0001, np.nan, 0.0002, 0.0, np.nan])
+        buy_rsi_values = np.array([30.0, 70.0])
+        profit_targets = np.array([1.03, 1.04])
+
+        for entry_rule in (0, RSI_ENTRY_UPPER):
+            with self.subTest(entry_rule=entry_rule):
+                regular = self._run_minimal_grid(
+                    buy_rsi_values,
+                    rsi_entry_rule=entry_rule,
+                    open_prices=open_prices,
+                    high_prices=high_prices,
+                    close_prices=close_prices,
+                    rsi_values=rsi_values,
+                    risk_free_returns=risk_free_returns,
+                    profit_target_values=profit_targets,
+                    trading_cost_rate=0.0003,
+                )
+                fresh = run_fresh_grid_summary(
+                    open_prices,
+                    high_prices,
+                    close_prices,
+                    rsi_values,
+                    risk_free_returns,
+                    buy_rsi_values,
+                    profit_targets,
+                    100_000.0,
+                    0.0003,
+                    entry_rule,
+                )
+                self.assertEqual(len(fresh), len(regular))
+                for fresh_values, regular_values in zip(fresh, regular, strict=True):
+                    np.testing.assert_array_equal(fresh_values, regular_values)
+
+    def test_prevalidated_resume_path_is_bitwise_identical_to_validated_resume_path(self) -> None:
+        open_prices = np.array([100.0, 101.0, 103.0, 102.0, 99.0, 100.0, 104.0, 103.0])
+        high_prices = np.array([100.0, 103.0, 104.0, 105.0, 101.0, 104.01, 106.0, 107.0])
+        close_prices = np.array([100.0, 102.0, 103.5, 104.0, 100.0, 103.0, 105.0, 106.0])
+        rsi_values = np.array([np.nan, 20.0, 80.0, 30.0, 70.0, 25.0, 75.0, 50.0])
+        risk_free_returns = np.array([np.nan, 0.0001, np.nan, 0.0002, 0.0, np.nan, 0.0001, 0.0])
+        buy_rsi_values = np.array([30.0, 70.0])
+        profit_targets = np.array([1.03, 1.04])
+        prefix_length = 5
+
+        for entry_rule in (0, RSI_ENTRY_UPPER):
+            with self.subTest(entry_rule=entry_rule):
+                prefix = self._run_minimal_grid(
+                    buy_rsi_values,
+                    rsi_entry_rule=entry_rule,
+                    open_prices=open_prices[:prefix_length],
+                    high_prices=high_prices[:prefix_length],
+                    close_prices=close_prices[:prefix_length],
+                    rsi_values=rsi_values[:prefix_length],
+                    risk_free_returns=risk_free_returns[:prefix_length],
+                    profit_target_values=profit_targets,
+                    trading_cost_rate=0.0003,
+                )
+                resume_state = {
+                    "start_indices": np.full(len(buy_rsi_values), prefix_length, dtype=np.int64),
+                    "cash_values": prefix[1],
+                    "share_values": prefix[2],
+                    "in_position_values": prefix[3],
+                    "entry_price_values": prefix[4],
+                    "pending_action_values": prefix[5],
+                    "prev_equity_values": prefix[6],
+                    "trades_executed_values": prefix[7],
+                    "first_equity_values": prefix[8],
+                    "last_equity_values": prefix[9],
+                    "running_max_equity_values": prefix[10],
+                    "return_count_values": prefix[11],
+                    "return_sum_values": prefix[12],
+                    "return_sum_squares_values": prefix[13],
+                    "excess_return_count_values": prefix[14],
+                    "excess_return_sum_values": prefix[15],
+                    "excess_return_sum_squares_values": prefix[16],
+                    "positive_return_count_values": prefix[17],
+                    "max_drawdown_values": prefix[18],
+                    "return_mean_values": prefix[19],
+                    "return_m2_values": prefix[20],
+                    "excess_return_mean_values": prefix[21],
+                    "excess_return_m2_values": prefix[22],
+                    "resume_close_values": np.full(len(buy_rsi_values), close_prices[prefix_length - 1]),
+                }
+                validated = self._run_minimal_grid(
+                    buy_rsi_values,
+                    rsi_entry_rule=entry_rule,
+                    open_prices=open_prices,
+                    high_prices=high_prices,
+                    close_prices=close_prices,
+                    rsi_values=rsi_values,
+                    risk_free_returns=risk_free_returns,
+                    profit_target_values=profit_targets,
+                    trading_cost_rate=0.0003,
+                    state_overrides=resume_state,
+                )
+                prevalidated = self._run_minimal_grid(
+                    buy_rsi_values,
+                    rsi_entry_rule=entry_rule,
+                    open_prices=open_prices,
+                    high_prices=high_prices,
+                    close_prices=close_prices,
+                    rsi_values=rsi_values,
+                    risk_free_returns=risk_free_returns,
+                    profit_target_values=profit_targets,
+                    trading_cost_rate=0.0003,
+                    state_overrides={**resume_state, "_prevalidated_resume_state": True},
+                )
+                self.assertEqual(len(prevalidated), len(validated))
+                for prevalidated_values, validated_values in zip(prevalidated, validated, strict=True):
+                    np.testing.assert_array_equal(prevalidated_values, validated_values)
+
     @staticmethod
     def _run_minimal_grid(
         buy_rsi_values: np.ndarray | list[float | bool],

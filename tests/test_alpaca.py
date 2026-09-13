@@ -127,6 +127,7 @@ from leveraged_trader.storage import (
     quarantine_alpaca_managed_sell_stale_submission,
     record_alpaca_managed_sell_generation,
     record_alpaca_managed_sell_order,
+    rekey_alpaca_managed_position_asset_if_current,
     update_alpaca_managed_buy_status_if_current,
     update_alpaca_managed_sell_status,
     update_alpaca_managed_sell_status_if_current,
@@ -3799,6 +3800,76 @@ class AlpacaTests(unittest.TestCase):
         self.assertEqual(managed.loc[0, "symbol"], "SATG")
         self.assertTrue(pd.isna(managed.loc[0, "alpaca_asset_id"]))
         self.assertEqual(aliases, 0)
+        self.assertEqual(mock_get.call_count, 3)
+
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_ticker_migration_accepts_attached_orders_across_asset_rekey(self, mock_get: Mock) -> None:
+        with closing(sqlite3.connect(":memory:")) as conn, conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="SATG",
+                alpaca_asset_id="asset-old",
+                signal_symbol="SATS",
+                buy_rsi=30,
+                profit_target_multiple=1.1,
+                buy_signal_date="2026-06-18",
+                buy_client_order_id="rsi-buy-SATG-20260618",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-06-22T13:30:00Z",
+                buy_status="filled",
+            )
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-SATG-1",
+                sell_alpaca_order_id="sell-1",
+                sell_submitted_at="2026-06-22T17:30:44Z",
+                sell_status="new",
+            )
+            before = load_alpaca_managed_positions(conn).iloc[0]
+            self.assertIsNotNone(
+                rekey_alpaca_managed_position_asset_if_current(
+                    conn,
+                    1,
+                    expected_state_revision=int(before["state_revision"]),
+                    expected_symbol="SATG",
+                    expected_alpaca_asset_id="asset-old",
+                    successor_alpaca_asset_id="asset-new",
+                )
+            )
+            mock_get.side_effect = [
+                response(200, [{"asset_id": "asset-new", "symbol": "ECHX", "qty": "2"}]),
+                response(
+                    200,
+                    {
+                        "id": "sell-1",
+                        "client_order_id": "rsi-exit-SATG-1",
+                        "asset_id": "asset-new",
+                        "symbol": "SATG",
+                    },
+                ),
+                response(
+                    200,
+                    {
+                        "id": "buy-1",
+                        "client_order_id": "rsi-buy-SATG-20260618",
+                        "asset_id": "asset-old",
+                        "symbol": "SATG",
+                    },
+                ),
+            ]
+
+            migrations = migrate_alpaca_managed_position_symbols(
+                conn,
+                self.cfg(buy=True, sell=True),
+                include_closed=False,
+            )
+            managed = load_alpaca_managed_positions(conn).iloc[0]
+
+        self.assertEqual(migrations, {"SATG": "ECHX"})
+        self.assertEqual(managed["symbol"], "ECHX")
+        self.assertEqual(managed["alpaca_asset_id"], "asset-new")
         self.assertEqual(mock_get.call_count, 3)
 
     @patch("leveraged_trader.alpaca.AlpacaClient")
@@ -30019,6 +30090,68 @@ class AlpacaTests(unittest.TestCase):
         self.assertEqual(len(intent_issues), 1)
         self.assertIn("limit price", intent_issues[0])
 
+    def test_historical_sell_audit_accepts_broker_rekeyed_prior_asset_id(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as conn, conn:
+            init_state_db(conn)
+            position_id = save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                alpaca_asset_id="asset-old",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="buy-asset-rekey-history",
+                buy_alpaca_order_id="buy-asset-rekey-history",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+            )
+            record_alpaca_managed_sell_generation(
+                conn,
+                position_id,
+                "sell-old-asset-generation",
+                submitted_qty=2,
+                submitted_limit_price=150,
+            )
+            before = load_alpaca_managed_positions(conn).iloc[0]
+            self.assertIsNotNone(
+                rekey_alpaca_managed_position_asset_if_current(
+                    conn,
+                    position_id,
+                    expected_state_revision=int(before["state_revision"]),
+                    expected_symbol="TQQQ",
+                    expected_alpaca_asset_id="asset-old",
+                    successor_alpaca_asset_id="asset-new",
+                )
+            )
+            position = load_alpaca_managed_positions(conn).iloc[0].to_dict()
+            historical_order = _complete_order_fixture(
+                {
+                    "id": "sell-old-asset-generation",
+                    "client_order_id": f"rsi-exit-TQQQ-{position_id}",
+                    "asset_id": "asset-old",
+                    "symbol": "TQQQ",
+                    "status": "canceled",
+                    "qty": "2",
+                    "limit_price": "150",
+                    "filled_qty": "0",
+                }
+            )
+            client = Mock()
+            client.get_order.return_value = response(200, historical_order)
+
+            observed_orders, historical_leaves, intent_issues = _historical_managed_sell_lineages(
+                conn=conn,
+                client=client,
+                position=position,
+                current_orders={},
+                expected_alpaca_asset_id="asset-new",
+            )
+
+        self.assertIn("sell-old-asset-generation", observed_orders)
+        self.assertIn("sell-old-asset-generation", historical_leaves)
+        self.assertEqual(intent_issues, [])
+
     def test_closed_audit_cancels_every_attributed_active_historical_sell_leaf(self) -> None:
         with closing(sqlite3.connect(":memory:")) as conn, conn:
             init_state_db(conn)
@@ -34399,6 +34532,123 @@ class AlpacaTests(unittest.TestCase):
 
         self.assertEqual(observed_statuses, ["position_quantity_mismatch", "position_quantity_mismatch"])
         self.assertEqual(mock_get.call_count, 6)
+        mock_post.assert_not_called()
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_failed_sell_for_exact_inactive_paper_holding_is_durably_quarantined(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+    ) -> None:
+        inactive_snapshot = [
+            error_response(404, {}),
+            response(
+                200,
+                [{"asset_id": "asset-tqqq", "symbol": "TQQQ", "qty": "2"}],
+                complete_orders=False,
+            ),
+            response(200, [], complete_orders=False),
+            asset_response("TQQQ", status="inactive", tradable=False),
+        ]
+        mock_get.side_effect = [*inactive_snapshot, *inactive_snapshot]
+        observed_statuses: list[str] = []
+        with closing(sqlite3.connect(":memory:")) as conn, conn:
+            init_state_db(conn)
+            self.seed_missing_managed_sell_retry(conn)
+            update_alpaca_managed_sell_status(
+                conn,
+                1,
+                sell_status="submission_failed",
+                notes="Alpaca rejected the inactive asset",
+            )
+
+            for _ in range(2):
+                result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+                observed_statuses.append(str(result.loc[0, "Status"]))
+            managed = load_alpaca_managed_positions(conn).iloc[0]
+
+        self.assertEqual(observed_statuses, ["broker_inactive", "broker_inactive"])
+        self.assertEqual(managed["sell_status"], "broker_inactive")
+        self.assertTrue(pd.isna(managed["sell_alpaca_order_id"]))
+        self.assertTrue(pd.isna(managed["sell_submission_retry_claimed_at"]))
+        self.assertTrue(pd.isna(managed["closed_at"]))
+        self.assertIn("blocks new buys", result.loc[0, "Message"])
+        mock_post.assert_not_called()
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_broker_inactive_sell_retries_when_exact_asset_becomes_active(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+    ) -> None:
+        mock_get.side_effect = [
+            error_response(404, {}),
+            response(
+                200,
+                [{"asset_id": "asset-tqqq", "symbol": "TQQQ", "qty": "2"}],
+                complete_orders=False,
+            ),
+            response(200, [], complete_orders=False),
+            asset_response("TQQQ", status="active", tradable=True),
+            *final_managed_sell_pre_submit_responses(),
+        ]
+        mock_post.return_value = response(
+            200,
+            {
+                "id": "sell-recovered",
+                "client_order_id": "rsi-exit-TQQQ-1",
+                "asset_id": "asset-tqqq",
+                "symbol": "TQQQ",
+                "side": "sell",
+                "status": "accepted",
+                "qty": "2",
+                "limit_price": "150",
+            },
+        )
+        with closing(sqlite3.connect(":memory:")) as conn, conn:
+            init_state_db(conn)
+            self.seed_missing_managed_sell_retry(conn)
+            update_alpaca_managed_sell_status(conn, 1, sell_status="broker_inactive")
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn).iloc[0]
+
+        self.assertEqual(result.loc[0, "Status"], "renewed")
+        self.assertEqual(managed["sell_status"], "accepted")
+        self.assertEqual(managed["sell_alpaca_order_id"], "sell-recovered")
+        mock_post.assert_called_once()
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_generic_failed_sell_is_not_retried_when_asset_is_active(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+    ) -> None:
+        mock_get.side_effect = [
+            error_response(404, {}),
+            response(
+                200,
+                [{"asset_id": "asset-tqqq", "symbol": "TQQQ", "qty": "2"}],
+                complete_orders=False,
+            ),
+            response(200, [], complete_orders=False),
+            asset_response("TQQQ", status="active", tradable=True),
+        ]
+        with closing(sqlite3.connect(":memory:")) as conn, conn:
+            init_state_db(conn)
+            self.seed_missing_managed_sell_retry(conn)
+            update_alpaca_managed_sell_status(conn, 1, sell_status="submission_failed")
+
+            with self.assertRaises(AlpacaReconciliationError) as raised:
+                reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn).iloc[0]
+
+        self.assertEqual(raised.exception.results.loc[0, "Status"], "submission_failed")
+        self.assertEqual(managed["sell_status"], "submission_failed")
+        self.assertTrue(pd.isna(managed["sell_submission_retry_claimed_at"]))
         mock_post.assert_not_called()
 
     @patch("leveraged_trader.alpaca.requests.post")

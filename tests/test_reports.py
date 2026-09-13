@@ -537,6 +537,87 @@ class ReportTests(unittest.TestCase):
                 pd.to_datetime(["2026-01-01", "2026-01-03"]).tolist(),
             )
 
+    def test_workflow_report_cache_reuses_one_authenticated_curve_exactly(self) -> None:
+        self.save_complete_executed_sell_curve("2026-01-02")
+        workflow_assets = pd.DataFrame([{"symbol": "TQQQ", "rsi_symbol": "QQQ"}])
+
+        strict_summary, strict_curves = summarize_saved_results(self.conn, workflow_assets)
+        strict_buy = build_buy_signal_report(self.conn, strict_summary, 14)
+        strict_sell = build_sell_signal_report(self.conn, strict_summary, 14)
+
+        strategy_report_cache: dict[tuple[str, str, str], tuple] = {}
+        with (
+            patch.object(
+                reports_module,
+                "load_best_strategy_summary",
+                wraps=reports_module.load_best_strategy_summary,
+            ) as best_loader,
+            patch.object(
+                reports_module,
+                "load_complete_strategy_equity_curve",
+                wraps=reports_module.load_complete_strategy_equity_curve,
+            ) as curve_loader,
+        ):
+            cached_summary, cached_curves = summarize_saved_results(
+                self.conn,
+                workflow_assets,
+                _strategy_report_cache=strategy_report_cache,
+            )
+            cached_buy = build_buy_signal_report(
+                self.conn,
+                cached_summary,
+                14,
+                _strategy_report_cache=strategy_report_cache,
+            )
+            cached_sell = build_sell_signal_report(
+                self.conn,
+                cached_summary,
+                14,
+                _strategy_report_cache=strategy_report_cache,
+            )
+
+        self.assertEqual(best_loader.call_count, 1)
+        self.assertEqual(curve_loader.call_count, 1)
+        for strict, cached in (
+            (strict_summary, cached_summary),
+            (strict_curves, cached_curves),
+            (strict_buy, cached_buy),
+            (strict_sell, cached_sell),
+        ):
+            pd.testing.assert_frame_equal(strict, cached, check_exact=True)
+
+    def test_preverified_workflow_report_does_not_reverify_the_curve(self) -> None:
+        self.save_complete_executed_sell_curve("2026-01-02")
+        workflow_assets = pd.DataFrame([{"symbol": "TQQQ", "rsi_symbol": "QQQ"}])
+        strict_summary, strict_curves = summarize_saved_results(self.conn, workflow_assets)
+
+        with patch.object(
+            reports_module,
+            "load_complete_strategy_equity_curve",
+            side_effect=AssertionError("curve verification repeated"),
+        ):
+            trusted_summary, trusted_curves = summarize_saved_results(
+                self.conn,
+                workflow_assets,
+                _strategy_report_cache={},
+                _workflow_results_preverified=True,
+            )
+
+        pd.testing.assert_frame_equal(strict_summary, trusted_summary, check_exact=True)
+        pd.testing.assert_frame_equal(strict_curves, trusted_curves, check_exact=True)
+
+    def test_saved_results_checks_deadline_between_assets(self) -> None:
+        def expired() -> None:
+            raise TimeoutError("report deadline expired")
+
+        with self.assertRaisesRegex(TimeoutError, "report deadline expired"):
+            summarize_saved_results(
+                self.conn,
+                pd.DataFrame([{"symbol": "TQQQ", "rsi_symbol": "QQQ"}]),
+                _strategy_report_cache={},
+                deadline_check=expired,
+            )
+
     def test_tied_best_strategy_uses_shared_workflow_specific_policy_and_retained_curve(self) -> None:
         def insert_tied_summaries(asset: str, signal: str, retained_buy_rsi: float) -> None:
             for buy_rsi in (30.0, 70.0):
@@ -2189,6 +2270,90 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(summary.loc[0, "Total Sell Value"], 250.0)
         self.assertEqual(summary.loc[0, "Realized P/L"], 50.0)
         self.assertEqual(summary.loc[0, "Realized P/L %"], 25.0)
+
+    def test_realized_pnl_summary_classifies_legacy_null_workflow_as_long_after_initialization(self) -> None:
+        cursor = self.conn.execute(
+            """
+            INSERT INTO alpaca_managed_positions
+            (workflow, symbol, signal_symbol, buy_rsi, profit_target_multiple,
+             buy_signal_date, buy_client_order_id, buy_status, filled_qty,
+             filled_avg_price, sell_filled_qty, sell_filled_avg_price,
+             realized_pl, realized_pl_pct, sold_qty, sold_value, remaining_qty,
+             closed_at)
+            VALUES (NULL, 'TQQQ', 'QQQ', 30, 1.5, '2026-01-02',
+                    'rsi-buy-TQQQ-legacy-workflow-report', 'filled', 2, 100,
+                    2, 125, 50, 25, 2, 250, 0,
+                    '2026-01-03T15:00:00Z')
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO alpaca_managed_sell_fills
+            (managed_position_id, alpaca_order_id, filled_qty, filled_value)
+            VALUES (?, 'sell-legacy-workflow-report', 2, 250)
+            """,
+            (int(cursor.lastrowid),),
+        )
+
+        init_state_db(self.conn)
+        summary = build_alpaca_realized_pnl_summary(self.conn, include_workflow=True)
+
+        self.assertEqual(summary["Workflow"].tolist(), ["Long", "Total"])
+        self.assertEqual(summary["Closed Positions"].tolist(), [1, 1])
+        self.assertEqual(summary["Realized P/L"].tolist(), [50.0, 50.0])
+
+    def test_realized_pnl_summary_adds_total_for_long_and_short_workflows(self) -> None:
+        position_ids = []
+        for workflow, symbol, quantity, buy_price, sell_price in (
+            ("Long", "TQQQ", 1.0, 100.0, 120.0),
+            ("Short", "SQQQ", 2.0, 100.0, 130.0),
+        ):
+            cursor = self.conn.execute(
+                """
+                INSERT INTO alpaca_managed_positions
+                (workflow, symbol, signal_symbol, buy_rsi, profit_target_multiple,
+                 buy_signal_date, buy_client_order_id, buy_status, filled_qty,
+                 filled_avg_price, sell_filled_qty, sell_filled_avg_price,
+                 sold_qty, sold_value, remaining_qty, closed_at)
+                VALUES (?, ?, 'QQQ', 30, 1.5, '2026-01-02', ?, 'filled', ?, ?,
+                        ?, ?, ?, ?, 0, '2026-01-03T15:00:00Z')
+                """,
+                (
+                    workflow,
+                    symbol,
+                    f"rsi-buy-{symbol}-total-row",
+                    quantity,
+                    buy_price,
+                    quantity,
+                    sell_price,
+                    quantity,
+                    quantity * sell_price,
+                ),
+            )
+            position_ids.append((int(cursor.lastrowid), symbol, quantity, sell_price))
+        self.conn.executemany(
+            """
+            INSERT INTO alpaca_managed_sell_fills
+            (managed_position_id, alpaca_order_id, filled_qty, filled_value)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (position_id, f"sell-{symbol}-total-row", quantity, quantity * sell_price)
+                for position_id, symbol, quantity, sell_price in position_ids
+            ],
+        )
+
+        summary = build_alpaca_realized_pnl_summary(self.conn, include_workflow=True)
+
+        self.assertEqual(summary["Workflow"].tolist(), ["Long", "Short", "Total"])
+        total = summary.iloc[-1]
+        self.assertEqual(total["Closed Positions"], 2)
+        self.assertEqual(total["Complete Closed Positions"], 2)
+        self.assertEqual(total["Incomplete Closed Positions"], 0)
+        self.assertEqual(total["Total Buy Cost"], 300.0)
+        self.assertEqual(total["Total Sell Value"], 380.0)
+        self.assertEqual(total["Realized P/L"], 80.0)
+        self.assertAlmostEqual(total["Realized P/L %"], 80.0 / 300.0 * 100.0)
 
     def test_realized_pnl_summary_does_not_hide_closed_fill_when_status_is_stale(self) -> None:
         self.conn.execute(

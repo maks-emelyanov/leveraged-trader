@@ -122,6 +122,21 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(default_args.workflow_concurrency, 4)
         self.assertEqual(overridden_args.workflow_concurrency, 8)
 
+    def test_workflow_timings_are_explicit_opt_in(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sys, "argv", ["leveraged-trader"]),
+        ):
+            default_args = parse_args()
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sys, "argv", ["leveraged-trader", "--show-timings"]),
+        ):
+            timing_args = parse_args()
+
+        self.assertFalse(default_args.show_timings)
+        self.assertTrue(timing_args.show_timings)
+
     def test_paper_order_submission_is_explicit_opt_in(self) -> None:
         with (
             patch.dict(os.environ, {}, clear=True),
@@ -132,6 +147,34 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(args.alpaca_submit_buy_orders)
         self.assertFalse(args.alpaca_submit_sell_orders)
         self.assertTrue(args.auto_adjust)
+        self.assertFalse(args.require_workflow_source_success)
+
+    def test_paper_buy_submission_requires_healthy_workflow_sources_by_default(self) -> None:
+        environment = {
+            "ALPACA_API_KEY_ID": "paper-key",
+            "ALPACA_API_SECRET_KEY": "paper-secret",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(sys, "argv", ["leveraged-trader", "--alpaca-submit-buy-orders"]),
+        ):
+            default_args = parse_args()
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "leveraged-trader",
+                    "--alpaca-submit-buy-orders",
+                    "--no-require-workflow-source-success",
+                ],
+            ),
+        ):
+            explicitly_degraded_args = parse_args()
+
+        self.assertTrue(default_args.require_workflow_source_success)
+        self.assertFalse(explicitly_degraded_args.require_workflow_source_success)
 
     def test_cli_rejects_nonpersistent_or_control_bearing_runtime_paths(self) -> None:
         cases = (
@@ -226,6 +269,21 @@ class ConfigTests(unittest.TestCase):
             main()
 
         self.assertFalse(mock_run.call_args.kwargs["base_cfg"].auto_adjust)
+
+    @patch("leveraged_trader.cli.run_resumable_optimizations")
+    @patch("leveraged_trader.cli.load_dotenv")
+    def test_main_passes_show_timings_to_workflow(
+        self,
+        _mock_load_dotenv: object,
+        mock_run: object,
+    ) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sys, "argv", ["leveraged-trader", "--show-timings"]),
+        ):
+            main()
+
+        self.assertTrue(mock_run.call_args.kwargs["show_timings"])
 
     def test_invalid_environment_values_are_rejected_instead_of_defaulted(self) -> None:
         invalid_values = {

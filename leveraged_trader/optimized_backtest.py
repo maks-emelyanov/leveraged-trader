@@ -3639,8 +3639,14 @@ def run_grid_summary(
     excess_return_m2_values: np.ndarray | None = None,
     resume_close_values: np.ndarray | None = None,
     history_prefix_observation_counts: np.ndarray | None = None,
+    _pristine_state: bool = False,
+    _prevalidated_resume_state: bool = False,
 ) -> tuple:
     """Run grid backtests after validating every array passed to Numba."""
+    if type(_pristine_state) is not bool or type(_prevalidated_resume_state) is not bool:
+        raise ValueError("Internal state-validation controls must be booleans.")
+    if _pristine_state and _prevalidated_resume_state:
+        raise ValueError("Pristine and prevalidated resume state modes are mutually exclusive.")
     open_prices = _float_array("open_prices", open_prices)
     row_count = len(open_prices)
     high_prices = _float_array("high_prices", high_prices, length=row_count)
@@ -3810,34 +3816,64 @@ def run_grid_summary(
         if np.any(values < 0):
             raise ValueError(f"{name} must be non-negative.")
 
-    _validate_resumable_state(
-        start_indices=start_indices,
-        history_prefix_observation_counts=history_prefix_observation_counts,
-        cash_values=cash_values,
-        share_values=share_values,
-        in_position_values=in_position_values,
-        entry_price_values=entry_price_values,
-        pending_action_values=pending_action_values,
-        prev_equity_values=prev_equity_values,
-        trades_executed_values=trades_executed_values,
-        first_equity_values=first_equity_values,
-        last_equity_values=last_equity_values,
-        running_max_equity_values=running_max_equity_values,
-        return_count_values=return_count_values,
-        return_sum_values=return_sum_values,
-        return_sum_squares_values=return_sum_squares_values,
-        excess_return_count_values=excess_return_count_values,
-        excess_return_sum_values=excess_return_sum_values,
-        excess_return_sum_squares_values=excess_return_sum_squares_values,
-        positive_return_count_values=positive_return_count_values,
-        max_drawdown_values=max_drawdown_values,
-        return_mean_values=return_mean_values,
-        return_m2_values=return_m2_values,
-        excess_return_mean_values=excess_return_mean_values,
-        excess_return_m2_values=excess_return_m2_values,
-        resume_close_values=resume_close_values,
-        native_centered_moments_available=native_centered_moments_available,
-    )
+    if _pristine_state:
+        pristine = bool(
+            np.all(start_indices == 0)
+            and np.all(history_prefix_observation_counts == 0)
+            and np.all(cash_values == prev_equity_values)
+            and np.all(share_values == 0.0)
+            and not np.any(in_position_values)
+            and np.isnan(entry_price_values).all()
+            and np.all(pending_action_values == ACTION_NONE)
+            and np.all(trades_executed_values == 0)
+            and np.isnan(first_equity_values).all()
+            and np.isnan(last_equity_values).all()
+            and np.isnan(running_max_equity_values).all()
+            and np.all(return_count_values == 0)
+            and np.all(return_sum_values == 0.0)
+            and np.all(return_sum_squares_values == 0.0)
+            and np.all(excess_return_count_values == 0)
+            and np.all(excess_return_sum_values == 0.0)
+            and np.all(excess_return_sum_squares_values == 0.0)
+            and np.all(positive_return_count_values == 0)
+            and np.isnan(max_drawdown_values).all()
+            and np.all(return_mean_values == 0.0)
+            and np.all(return_m2_values == 0.0)
+            and np.all(excess_return_mean_values == 0.0)
+            and np.all(excess_return_m2_values == 0.0)
+            and np.isnan(resume_close_values).all()
+        )
+        if not pristine:
+            raise ValueError("_pristine_state requires exact internally initialized strategy state.")
+    elif not _prevalidated_resume_state:
+        _validate_resumable_state(
+            start_indices=start_indices,
+            history_prefix_observation_counts=history_prefix_observation_counts,
+            cash_values=cash_values,
+            share_values=share_values,
+            in_position_values=in_position_values,
+            entry_price_values=entry_price_values,
+            pending_action_values=pending_action_values,
+            prev_equity_values=prev_equity_values,
+            trades_executed_values=trades_executed_values,
+            first_equity_values=first_equity_values,
+            last_equity_values=last_equity_values,
+            running_max_equity_values=running_max_equity_values,
+            return_count_values=return_count_values,
+            return_sum_values=return_sum_values,
+            return_sum_squares_values=return_sum_squares_values,
+            excess_return_count_values=excess_return_count_values,
+            excess_return_sum_values=excess_return_sum_values,
+            excess_return_sum_squares_values=excess_return_sum_squares_values,
+            positive_return_count_values=positive_return_count_values,
+            max_drawdown_values=max_drawdown_values,
+            return_mean_values=return_mean_values,
+            return_m2_values=return_m2_values,
+            excess_return_mean_values=excess_return_mean_values,
+            excess_return_m2_values=excess_return_m2_values,
+            resume_close_values=resume_close_values,
+            native_centered_moments_available=native_centered_moments_available,
+        )
 
     trading_cost_rate = _finite_scalar("trading_cost_rate", trading_cost_rate)
     if not 0.0 <= trading_cost_rate < 1.0:
@@ -3944,35 +3980,97 @@ def run_grid_summary(
     result_resume_close_values = resume_close_values.copy()
     if row_count:
         result_resume_close_values[results[0]] = close_prices[-1]
-    _validate_resumable_state(
-        start_indices=np.full(config_count, row_count, dtype=np.int64),
-        history_prefix_observation_counts=history_prefix_observation_counts,
-        cash_values=results[1],
-        share_values=results[2],
-        in_position_values=results[3],
-        entry_price_values=results[4],
-        pending_action_values=results[5],
-        prev_equity_values=results[6],
-        trades_executed_values=results[7],
-        first_equity_values=results[8],
-        last_equity_values=results[9],
-        running_max_equity_values=results[10],
-        return_count_values=results[11],
-        return_sum_values=results[12],
-        return_sum_squares_values=results[13],
-        excess_return_count_values=results[14],
-        excess_return_sum_values=results[15],
-        excess_return_sum_squares_values=results[16],
-        positive_return_count_values=results[17],
-        max_drawdown_values=results[18],
-        return_mean_values=results[19],
-        return_m2_values=results[20],
-        excess_return_mean_values=results[21],
-        excess_return_m2_values=results[22],
-        resume_close_values=result_resume_close_values,
-        native_centered_moments_available=(native_centered_moments_available | results[0]),
-    )
+    if not (_prevalidated_resume_state or _pristine_state):
+        _validate_resumable_state(
+            start_indices=np.full(config_count, row_count, dtype=np.int64),
+            history_prefix_observation_counts=history_prefix_observation_counts,
+            cash_values=results[1],
+            share_values=results[2],
+            in_position_values=results[3],
+            entry_price_values=results[4],
+            pending_action_values=results[5],
+            prev_equity_values=results[6],
+            trades_executed_values=results[7],
+            first_equity_values=results[8],
+            last_equity_values=results[9],
+            running_max_equity_values=results[10],
+            return_count_values=results[11],
+            return_sum_values=results[12],
+            return_sum_squares_values=results[13],
+            excess_return_count_values=results[14],
+            excess_return_sum_values=results[15],
+            excess_return_sum_squares_values=results[16],
+            positive_return_count_values=results[17],
+            max_drawdown_values=results[18],
+            return_mean_values=results[19],
+            return_m2_values=results[20],
+            excess_return_mean_values=results[21],
+            excess_return_m2_values=results[22],
+            resume_close_values=result_resume_close_values,
+            native_centered_moments_available=(native_centered_moments_available | results[0]),
+        )
     return results
+
+
+def run_fresh_grid_summary(
+    open_prices: np.ndarray,
+    high_prices: np.ndarray,
+    close_prices: np.ndarray,
+    rsi_values: np.ndarray,
+    risk_free_returns: np.ndarray,
+    buy_rsi_values: np.ndarray,
+    profit_target_values: np.ndarray,
+    initial_capital: float,
+    trading_cost_rate: float,
+    rsi_entry_rule: int = RSI_ENTRY_LOWER,
+) -> tuple:
+    """Run a pristine grid without re-proving internally generated state.
+
+    Market arrays, grids, trading costs, kernel outputs, exact target prices,
+    and final resumable state still pass the same validators as the public
+    resumable path.  Only the expensive semantic proof of the known pristine
+    arrays constructed here is skipped.
+    """
+    initial_capital = _finite_scalar("initial_capital", initial_capital)
+    if initial_capital <= 0.0:
+        raise ValueError("initial_capital must be positive.")
+    raw_buy_rsi = np.asarray(buy_rsi_values)
+    config_count = int(raw_buy_rsi.size)
+    return run_grid_summary(
+        open_prices,
+        high_prices,
+        close_prices,
+        rsi_values,
+        risk_free_returns,
+        buy_rsi_values,
+        profit_target_values,
+        np.zeros(config_count, dtype=np.int64),
+        np.full(config_count, initial_capital, dtype=np.float64),
+        np.zeros(config_count, dtype=np.float64),
+        np.zeros(config_count, dtype=np.bool_),
+        np.full(config_count, np.nan, dtype=np.float64),
+        np.full(config_count, ACTION_NONE, dtype=np.int64),
+        np.full(config_count, initial_capital, dtype=np.float64),
+        np.zeros(config_count, dtype=np.int64),
+        np.full(config_count, np.nan, dtype=np.float64),
+        np.full(config_count, np.nan, dtype=np.float64),
+        np.full(config_count, np.nan, dtype=np.float64),
+        np.zeros(config_count, dtype=np.int64),
+        np.zeros(config_count, dtype=np.float64),
+        np.zeros(config_count, dtype=np.float64),
+        np.zeros(config_count, dtype=np.int64),
+        np.zeros(config_count, dtype=np.float64),
+        np.zeros(config_count, dtype=np.float64),
+        np.zeros(config_count, dtype=np.int64),
+        np.full(config_count, np.nan, dtype=np.float64),
+        trading_cost_rate,
+        rsi_entry_rule,
+        return_mean_values=np.zeros(config_count, dtype=np.float64),
+        return_m2_values=np.zeros(config_count, dtype=np.float64),
+        excess_return_mean_values=np.zeros(config_count, dtype=np.float64),
+        excess_return_m2_values=np.zeros(config_count, dtype=np.float64),
+        _pristine_state=True,
+    )
 
 
 def run_single_equity_curve(

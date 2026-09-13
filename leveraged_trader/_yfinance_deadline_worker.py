@@ -4,6 +4,7 @@ import ctypes
 import math
 import os
 import sys
+import threading
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
@@ -37,6 +38,7 @@ _YFINANCE_WORKER_FRAME_MAX_CELLS = 8 * 1024 * 1024
 _YFINANCE_WORKER_METADATA_MAX_ENTRIES = 10_000
 _YFINANCE_WORKER_METADATA_MAX_BYTES = 4 * 1024 * 1024
 _YFINANCE_WORKER_ADDRESS_SPACE_HEADROOM_BYTES = 768 * 1024 * 1024
+_YFINANCE_WORKER_THREAD_STACK_BYTES = 1024 * 1024
 _DARWIN_PROC_PIDTASKINFO = 4
 _WINDOWS_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _WINDOWS_JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
@@ -442,6 +444,14 @@ def execute_yfinance_download(
     request_timeout_seconds: float,
 ) -> tuple[pd.DataFrame | None, dict[str, str], dict[str, str]]:
     """Execute one yfinance call and retain its per-call errors and aliases."""
+    # yfinance creates one Python thread per ticker even though its semaphore
+    # limits the number concurrently doing network work.  The platform default
+    # stack (8 MiB on this WSL host) plus glibc arenas can exhaust the worker's
+    # deliberately bounded address space before a 32-symbol batch starts.  A
+    # 1 MiB stack is ample for these shallow Python/HTTP call stacks and keeps
+    # the complete deterministic batch inside the existing memory boundary.
+    if len(symbols) > 1:
+        threading.stack_size(_YFINANCE_WORKER_THREAD_STACK_BYTES)
     download_kwargs = {
         "tickers": symbols,
         "start": start,
@@ -598,6 +608,12 @@ def run_yfinance_download_with_deadline(
         result_max_bytes=YFINANCE_WORKER_RESULT_MAX_BYTES,
         timeout_message="Yahoo Finance response exceeded its overall deadline.",
         connection_error_message="Yahoo Finance worker exited without a complete response.",
+        # glibc otherwise reserves a separate large malloc arena for each of
+        # yfinance's per-ticker threads.  The fixed arena count keeps a
+        # 32-symbol batch inside the worker's address-space limit without
+        # increasing WSL's memory allocation.  Non-glibc platforms ignore the
+        # variable, so it is safe to pass to the isolated worker everywhere.
+        environment_overrides={"MALLOC_ARENA_MAX": "2"},
     )
 
 

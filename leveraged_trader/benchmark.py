@@ -8,6 +8,7 @@ from typing import Literal
 
 WorkflowPhase = Literal[
     "download",
+    "state_validation",
     "db_sync",
     "grid_compute",
     "report_generation",
@@ -18,6 +19,7 @@ WorkflowPhase = Literal[
 @dataclass(frozen=True)
 class WorkflowPhaseSnapshot:
     download_seconds: float
+    state_validation_seconds: float
     db_sync_seconds: float
     grid_compute_seconds: float
     report_generation_seconds: float
@@ -27,6 +29,7 @@ class WorkflowPhaseSnapshot:
 @dataclass
 class WorkflowPhaseTimings:
     download_seconds: float = 0.0
+    state_validation_seconds: float = 0.0
     db_sync_seconds: float = 0.0
     grid_compute_seconds: float = 0.0
     report_generation_seconds: float = 0.0
@@ -73,6 +76,7 @@ class WorkflowPhaseTimings:
         with self._lock:
             return WorkflowPhaseSnapshot(
                 download_seconds=self.download_seconds,
+                state_validation_seconds=self.state_validation_seconds,
                 db_sync_seconds=self.db_sync_seconds,
                 grid_compute_seconds=self.grid_compute_seconds,
                 report_generation_seconds=self.report_generation_seconds,

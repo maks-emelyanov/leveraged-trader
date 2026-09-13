@@ -1216,6 +1216,8 @@ RSI_SYMBOL_OVERRIDES = {
     "SZK": ("XLP", "Consumer Staples Select Sector SPDR Fund proxy"),
     "TPEI": ("EWT", "iShares MSCI Taiwan ETF reference asset"),
     "WTID": ("XLE", "Energy Select Sector SPDR Fund proxy"),
+    "XLCD": ("XLC", "Communication Services Select Sector SPDR Fund reference asset"),
+    "XLPD": ("XLP", "Consumer Staples Select Sector SPDR Fund reference asset"),
     "YCS": ("FXY", "Invesco CurrencyShares Japanese Yen Trust proxy"),
     "MST": ("MSTR", "MicroStrategy Inc."),
     "MSOX": ("MSOS", "AdvisorShares Pure US Cannabis ETF proxy"),
@@ -1294,6 +1296,8 @@ RSI_SYMBOL_OVERRIDES = {
     "UPAL": ("PALL", "abrdn Physical Palladium Shares ETF proxy"),
     "UPLT": ("PPLT", "abrdn Physical Platinum Shares ETF proxy"),
     "WTIU": ("XLE", "Energy Select Sector SPDR Fund proxy"),
+    "XLCU": ("XLC", "Communication Services Select Sector SPDR Fund reference asset"),
+    "XLPU": ("XLP", "Consumer Staples Select Sector SPDR Fund reference asset"),
     "YCL": ("FXY", "Invesco CurrencyShares Japanese Yen Trust proxy"),
     "BITX": ("BTC-USD", "Bitcoin spot price proxy"),
     "BITU": ("BTC-USD", "Bitcoin spot price proxy"),
@@ -1316,6 +1320,101 @@ RSI_SYMBOL_OVERRIDES = {
     "TXXH": ("HYPE32196-USD", "Hyperliquid spot price proxy"),
 }
 
+# Exact ticker overrides are only safe while the listed product still represents
+# the curated exposure. Exchange tickers can be recycled, so bind every proxy to
+# a stable fingerprint expected in the current product name as well as its ticker.
+# Patterns are keyed by the RSI proxy so products sharing an exposure also share
+# the same identity rule.
+RSI_PROXY_IDENTITY_PATTERNS = {
+    "AIQ": r"\b(?:AIQ|ARTIFICIAL\s+INTELLIGENCE)\b",
+    "AAPL": r"\b(?:AAPL|APPLE)\b",
+    "ETN": r"\b(?:EATON|LONG\s+ETN)\b",
+    "GOOG": r"\b(?:GOOGL?|ALPHABET)\b",
+    "MSFT": r"\b(?:MSFT|MICROSOFT)\b",
+    "NVDA": r"\b(?:NVDA|NVIDIA)\b",
+    "TSLA": r"\b(?:TSLA|TESLA)\b",
+    "BULL": r"\b(?:BULL|WEBULL)\b",
+    "FNGS": r"\bFANG\+?\b",
+    "IBB": r"\bBIOTECH(?:NOLOGY)?\b",
+    "KBWB": r"\b(?:BIG\s+)?BANKS?\b",
+    "EWZ": r"\bBRAZIL\b",
+    "XLE": r"\b(?:ENERGY|BIG\s+OIL)\b",
+    "EEM": r"\bEMERGING\s+MARKETS?\b",
+    "EFA": r"\bEAFE\b",
+    "VGK": r"\bEUROPE\b",
+    "FXE": r"\bEURO\b",
+    "EWJ": r"\bJAPAN\b",
+    "PEJ": r"\b(?:TRAVEL|LEISURE|ENTERTAINMENT)\b",
+    "FXI": r"\bCHINA\b",
+    "HYG": r"\bHIGH\s+YIELD\b",
+    "UNG": r"\bNATURAL\s+GAS\b",
+    "LQD": r"\bINVESTMENT\s+GRADE(?:\s+CORPORATE\s+BONDS?)?\b",
+    "MDY": r"\bMID[ -]?CAP\s*400\b",
+    "XOP": r"\bOIL\s*(?:&|AND)?\s*GAS\s+EXPLORATION\b",
+    "QQQ": r"\b(?:QQQ|INNOVATION\s+100)\b",
+    "XLK": r"\bTECHNOLOGY\b",
+    "XLV": r"\bHEALTH\s+CARE\b",
+    "XLY": r"\bCONSUMER\s+DISCRETIONARY\b",
+    "USO": r"\bCRUDE\s+OIL\b",
+    "IJR": r"\bSMALL[ -]?CAP\s*600\b",
+    "XLU": r"\bUTILITIES\b",
+    "XLI": r"\bINDUSTRIALS?\b",
+    "XLF": r"\bFINANCIALS?\b",
+    "KRE": r"\bREGIONAL\s+BANKS?\b",
+    "SMH": r"\bSEMICONDUCTORS?\b",
+    "XLB": r"\b(?:BASIC\s+)?MATERIALS\b",
+    "IYR": r"\bREAL\s+ESTATE\b",
+    "SOXX": r"\bSEMICONDUCTORS?\b",
+    "XLP": r"\bCONSUMER\s+STAPLES\b",
+    "EWT": r"\bTAIWAN\b",
+    "FXY": r"\bYEN\b",
+    "MSTR": r"\b(?:MSTR|MICROSTRATEGY)\b",
+    "MSOS": r"\b(?:MSOS|CANNABIS)\b",
+    "SATS": r"\b(?:SATS|ECHOSTAR)\b",
+    "VT": r"\bWORLD\b",
+    "BIZD": r"\bBDC\b",
+    "CEFS": r"\bCLOSED[ -]END\b",
+    "DRNZ": r"\b(?:DRONE|AERIAL\s+AUTOMATION)\b",
+    "FDRS": r"\bFOUNDER[ -]LED\b",
+    "SPHD": r"\bHIGH\s+DIVIDEND\s+LOW\s+VOLATILITY\b",
+    "IWD": r"\bVALUE\s+FACTOR\b",
+    "IWF": r"\bGROWTH\s+FACTOR\b",
+    "SIZE": r"\bSIZE\s+FACTOR\b",
+    "XLC": r"\bCOMMUNICATION(?:S|\s+SERVICES)\b",
+    "MAGS": r"\bMAGNIFICENT\s+SEVEN\b",
+    "AMLP": r"\bMLP\b",
+    "MTUM": r"\bMOMENTUM\s+FACTOR\b",
+    "REM": r"\bMORTGAGE\s+REIT\b",
+    "PFF": r"\bPREFERRED(?:\s+STOCK)?\b",
+    "QTUM": r"\bQUANTUM\b",
+    "QUAL": r"\bQUALITY\s+FACTOR\b",
+    "DRAM": r"\bMEMORY\b",
+    "SCHD": r"\bDIVIDEND\s+FACTOR\b",
+    "SKYY": r"\bCLOUD\s+COMPUTING\b",
+    "DES": r"\bSMALL\s+CAP\s+HIGH\s+DIVIDEND\b",
+    "UFO": r"\bSPACE\b(?!\s*X\b)",
+    "ARKK": r"\bINNOVATION\b",
+    "CIBR": r"\bCYBERSECURITY\b",
+    "USMV": r"\bMINIMUM\s+VOLATILITY\b",
+    "VIXY": r"\bVIX\b",
+    "XRP-USD": r"\bXRP\b",
+    "COPX": r"\bCOPPER\s+MINERS?\b",
+    "CPER": r"\bCOPPER\b(?!\s+MINERS?\b)",
+    "PALL": r"\bPALLADIUM\b",
+    "PPLT": r"\bPLATINUM\b",
+    "BTC-USD": r"\bBITCOIN\b",
+    "AVAX-USD": r"\bAVALANCHE\b",
+    "LINK-USD": r"\bCHAINLINK\b",
+    "ADA-USD": r"\bCARDANO\b",
+    "ETH-USD": r"\bETHER(?:EUM)?\b",
+    "SOL-USD": r"\bSOLANA\b",
+    "XLM-USD": r"\bSTELLAR\b",
+    "SUI20947-USD": r"\bSUI\b",
+    "SKHY": r"\b(?:SK\s+HYNIX|SKHY)\b",
+    "DOGE-USD": r"\bDOGECOIN\b",
+    "HYPE32196-USD": r"\b(?:HYPE|HYPERLIQUID)\b",
+}
+
 RSI_SELF_FALLBACK_SYMBOL_OVERRIDES = {
     "BEGS": ("BEGS", "Rareview 2X Bull Cryptocurrency & Precious Metals ETF self-RSI fallback"),
 }
@@ -1328,7 +1427,11 @@ RSI_NAME_PROXY_PATTERNS = [
     (r"\bSK\s+HYNIX\b", "SKHY", "SK hynix Inc. American depositary shares"),
     (r"\bSPACE\s*X\b|\bSPACEX\b", "SPCX", "Space Exploration Technologies Corp. Class A"),
     (r"\bS\s*&\s*P\s*500\s+EQUAL\s+WEIGHT\b", "RSP", "Invesco S&P 500 Equal Weight ETF proxy"),
-    (r"\bS\s*&\s*P\s*500\b|\bS&P500\b", "SPY", "SPDR S&P 500 ETF Trust proxy"),
+    (
+        r"\bS\s*&\s*P\s*500\b(?!\s+EQUAL\s+WEIGHT)|\bS&P500\b(?!\s+EQUAL\s+WEIGHT)",
+        "SPY",
+        "SPDR S&P 500 ETF Trust proxy",
+    ),
     (r"\bNASDAQ[-\s]*100\b", "QQQ", "Invesco QQQ Trust proxy"),
     (r"\bDOW\s*30\b", "DIA", "SPDR Dow Jones Industrial Average ETF Trust proxy"),
     (r"\bRUSSELL\s*2000\b", "IWM", "iShares Russell 2000 ETF proxy"),
@@ -1589,11 +1692,23 @@ def _normalized_fund_name(fund_name: object) -> str:
     return re.sub(r"\s+", " ", str(fund_name).upper()).strip()
 
 
-def _mapping_from_curated_symbol(asset_symbol: str) -> RsiSymbolMapping | None:
+def _mapping_from_curated_symbol(asset_symbol: str, normalized_name: str) -> RsiSymbolMapping | None:
     override = RSI_SYMBOL_OVERRIDES.get(asset_symbol)
     if override is None:
         return None
     rsi_symbol, underlying_name = override
+    identity_pattern = RSI_PROXY_IDENTITY_PATTERNS.get(rsi_symbol)
+    if identity_pattern is None or re.search(identity_pattern, normalized_name) is None:
+        expected_identity = identity_pattern or f"a configured identity pattern for {rsi_symbol}"
+        return RsiSymbolMapping(
+            rsi_symbol=asset_symbol,
+            underlying_name=asset_symbol,
+            mapping_source="symbol_override_identity_mismatch",
+            confidence="needs_review",
+            mapping_reason=(
+                f"exact symbol override for {rsi_symbol} did not match expected product identity {expected_identity}"
+            ),
+        )
     return RsiSymbolMapping(
         rsi_symbol=rsi_symbol,
         underlying_name=underlying_name,
@@ -1617,17 +1732,32 @@ def _mapping_from_self_fallback_symbol(asset_symbol: str) -> RsiSymbolMapping | 
     )
 
 
-def _mapping_from_curated_name(normalized_name: str) -> RsiSymbolMapping | None:
+def _mapping_from_curated_name(asset_symbol: str, normalized_name: str) -> RsiSymbolMapping | None:
+    matches: dict[str, tuple[str, list[str]]] = {}
     for pattern, rsi_symbol, underlying_name in RSI_NAME_PROXY_PATTERNS:
         if re.search(pattern, normalized_name):
-            return RsiSymbolMapping(
-                rsi_symbol=rsi_symbol,
-                underlying_name=underlying_name,
-                mapping_source="name_proxy",
-                confidence="curated",
-                mapping_reason=f"matched curated name proxy pattern {pattern}",
-            )
-    return None
+            matched_underlying_name, matched_patterns = matches.setdefault(rsi_symbol, (underlying_name, []))
+            matched_patterns.append(pattern)
+            matches[rsi_symbol] = matched_underlying_name, matched_patterns
+    if not matches:
+        return None
+    if len(matches) > 1:
+        matched_symbols = ", ".join(sorted(matches))
+        return RsiSymbolMapping(
+            rsi_symbol=asset_symbol,
+            underlying_name=asset_symbol,
+            mapping_source="ambiguous_name_proxy",
+            confidence="needs_review",
+            mapping_reason=f"product name matched multiple curated RSI proxies: {matched_symbols}",
+        )
+    rsi_symbol, (underlying_name, patterns) = next(iter(matches.items()))
+    return RsiSymbolMapping(
+        rsi_symbol=rsi_symbol,
+        underlying_name=underlying_name,
+        mapping_source="name_proxy",
+        confidence="curated",
+        mapping_reason=f"matched curated name proxy pattern {patterns[0]}",
+    )
 
 
 def _mapping_from_review_symbol(asset_symbol: str) -> RsiSymbolMapping | None:
@@ -1689,10 +1819,28 @@ def infer_rsi_mapping(
     asset_symbol = asset_symbol.upper()
     normalized_name = _normalized_fund_name(fund_name)
 
+    curated_symbol_mapping = _mapping_from_curated_symbol(asset_symbol, normalized_name)
+    self_fallback_mapping = _mapping_from_self_fallback_symbol(asset_symbol)
+    curated_name_mapping = _mapping_from_curated_name(asset_symbol, normalized_name)
+    if curated_symbol_mapping is not None:
+        if curated_symbol_mapping.confidence == "needs_review":
+            return curated_symbol_mapping
+        if curated_name_mapping is not None and (
+            curated_name_mapping.confidence == "needs_review"
+            or curated_name_mapping.rsi_symbol != curated_symbol_mapping.rsi_symbol
+        ):
+            return RsiSymbolMapping(
+                rsi_symbol=asset_symbol,
+                underlying_name=asset_symbol,
+                mapping_source="symbol_override_identity_mismatch",
+                confidence="needs_review",
+                mapping_reason="exact symbol override conflicted with curated product-name proxy metadata",
+            )
+        return curated_symbol_mapping
+
     for curated_mapping in [
-        _mapping_from_curated_symbol(asset_symbol),
-        _mapping_from_self_fallback_symbol(asset_symbol),
-        _mapping_from_curated_name(normalized_name),
+        self_fallback_mapping,
+        curated_name_mapping,
         _mapping_from_review_symbol(asset_symbol),
         _mapping_from_review_name(asset_symbol, normalized_name),
     ]:
@@ -7115,6 +7263,8 @@ def _tradr_reference_contradicts_name(
     # case the issuer's explicit reference is the only authoritative mapping.
     if mapping.mapping_source in {
         "asset_symbol",
+        "ambiguous_name_proxy",
+        "symbol_override_identity_mismatch",
         "unresolved_basket",
         "unresolved_single_stock",
     }:
@@ -7751,7 +7901,13 @@ def _issuer_mapping_signatures(symbol: str, rows: pd.DataFrame) -> set[tuple[str
     # so two different references or a reference which disagrees with a
     # concrete primary mapping remain conflicts.
     has_validated_reference = any(mapping.mapping_source == "issuer_reference" for mapping in mappings)
-    unresolved_mapping_sources = {"asset_symbol", "unresolved_basket", "unresolved_single_stock"}
+    unresolved_mapping_sources = {
+        "ambiguous_name_proxy",
+        "asset_symbol",
+        "symbol_override_identity_mismatch",
+        "unresolved_basket",
+        "unresolved_single_stock",
+    }
     return {
         (
             mapping.rsi_symbol,
@@ -8757,7 +8913,14 @@ def _product_row_rsi_mapping(
             mapping_reason="issuer Reference Security pointed back to the leveraged product itself",
         )
     if reference_identity is None or (
-        mapping.mapping_source not in {"asset_symbol", "unresolved_basket", "unresolved_single_stock"}
+        mapping.mapping_source
+        not in {
+            "ambiguous_name_proxy",
+            "asset_symbol",
+            "symbol_override_identity_mismatch",
+            "unresolved_basket",
+            "unresolved_single_stock",
+        }
         and mapping.rsi_symbol != reference_identity
     ):
         return RsiSymbolMapping(

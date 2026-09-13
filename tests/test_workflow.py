@@ -57,6 +57,7 @@ from leveraged_trader.workflow import (
     AssetRunPlan,
     AssetRunResult,
     PreparedAssetRun,
+    WorkflowDeadlineExceeded,
     WorkflowRunError,
     WorkflowStateCleanupError,
     _atomic_to_csv,
@@ -65,7 +66,9 @@ from leveraged_trader.workflow import (
     _concat_report_frames,
     _initialize_state_db,
     _persist_workflow_research_outputs,
+    _prefetch_workflow_histories,
     _prepare_asset_run,
+    _prepare_asset_safe_tail_rows,
     _prepare_workflow_asset,
     _process_asset_grid_for_db,
     _reconcile_alpaca_managed_positions_for_db,
@@ -93,6 +96,165 @@ from leveraged_trader.workflow import (
 
 
 class WorkflowAsyncTests(unittest.TestCase):
+    def test_prefetch_uses_deterministic_batches_of_32(self) -> None:
+        session = _WorkflowMarketDataSession()
+        symbols = [f"S{index:03d}" for index in range(65)]
+
+        def batch_loader(batch: list[str], **_kwargs: object) -> tuple[dict, dict]:
+            return {}, {symbol: "retry" for symbol in batch}
+
+        with patch(
+            "leveraged_trader.workflow.load_symbol_history_batch",
+            side_effect=batch_loader,
+        ) as batch_download:
+            asyncio.run(
+                _prefetch_workflow_histories(
+                    list(reversed(symbols)),
+                    base_cfg=BacktestConfig(),
+                    phase_timings=WorkflowPhaseTimings(),
+                    market_data_session=session,
+                )
+            )
+
+        self.assertEqual([len(call.args[0]) for call in batch_download.call_args_list], [32, 32, 1])
+        self.assertEqual(batch_download.call_args_list[0].args[0], sorted(symbols)[:32])
+        self.assertEqual(session.batch_count, 3)
+        self.assertEqual(session.batch_retry_symbols, set(symbols))
+
+    def test_expired_workflow_deadline_never_acquires_lock_or_submits_buys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "state.sqlite")
+            with (
+                patch("leveraged_trader.workflow._workflow_run_lock") as workflow_lock,
+                patch("leveraged_trader.workflow.submit_alpaca_paper_buy_orders") as submit_buys,
+                self.assertRaisesRegex(WorkflowDeadlineExceeded, "buy submission was not started"),
+            ):
+                asyncio.run(
+                    run_resumable_optimizations_async(
+                        mode="update",
+                        db_path=db_path,
+                        base_cfg=BacktestConfig(),
+                        universe_cfg=UniverseConfig(sqlite_db_path=db_path),
+                        buy_rsi_values=[30.0],
+                        profit_target_values=[1.5],
+                        alpaca_cfg=AlpacaOrderConfig(),
+                        output_dir=tmp,
+                        workflow_deadline_epoch=time.time() - 1.0,
+                    )
+                )
+
+        workflow_lock.assert_not_called()
+        submit_buys.assert_not_called()
+
+    def test_asset_transaction_verifies_resumable_state_exactly_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "state.sqlite")
+            with closing(sqlite3.connect(db_path)) as conn, conn:
+                init_state_db(conn)
+            with (
+                patch(
+                    "leveraged_trader.workflow.strategy_state_matches_config",
+                    return_value=True,
+                ) as verify_state,
+                patch(
+                    "leveraged_trader.workflow.process_asset_grid",
+                    return_value=False,
+                ) as process_grid,
+            ):
+                rebuilt = _process_asset_grid_for_db(
+                    db_path,
+                    pd.DataFrame(),
+                    pd.DataFrame(),
+                    pd.DataFrame(),
+                    pd.DataFrame(),
+                    BacktestConfig(),
+                    "TQQQ",
+                    "QQQ",
+                    [30.0],
+                    [1.5],
+                    False,
+                )
+
+        self.assertFalse(rebuilt)
+        verify_state.assert_called_once()
+        self.assertTrue(process_grid.call_args.kwargs["strategy_state_preverified"])
+
+    def test_preparation_proof_avoids_duplicate_transaction_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "state.sqlite")
+            with closing(sqlite3.connect(db_path)) as conn, conn:
+                init_state_db(conn)
+            asset_history = self._symbol_history("TQQQ")
+            signal_history = self._symbol_history("QQQ")
+            risk_free_history = self._symbol_history("^IRX", -95.0)
+            strategy_data = _strategy_data_from_authoritative_histories(
+                asset_symbol="TQQQ",
+                signal_symbol="QQQ",
+                asset_history=asset_history,
+                signal_history=signal_history,
+                risk_free_history=risk_free_history,
+            )
+            _process_asset_grid_for_db(
+                db_path,
+                strategy_data,
+                asset_history,
+                signal_history,
+                risk_free_history,
+                BacktestConfig(),
+                "TQQQ",
+                "QQQ",
+                [30.0],
+                [1.5],
+                True,
+            )
+            with (
+                patch(
+                    "leveraged_trader.workflow.strategy_state_matches_config",
+                    return_value=True,
+                ) as verify_state,
+                patch(
+                    "leveraged_trader.workflow.process_asset_grid",
+                    return_value=False,
+                ) as process_grid,
+            ):
+                plan = _prepare_asset_run(
+                    db_path,
+                    "update",
+                    BacktestConfig(),
+                    "TQQQ",
+                    "QQQ",
+                    [30.0],
+                    [1.5],
+                )
+                safe_tail_rows = _prepare_asset_safe_tail_rows(
+                    db_path,
+                    plan,
+                    asset_history,
+                )
+                rebuilt = _process_asset_grid_for_db(
+                    db_path,
+                    pd.DataFrame(),
+                    pd.DataFrame(),
+                    pd.DataFrame(),
+                    pd.DataFrame(),
+                    BacktestConfig(),
+                    "TQQQ",
+                    "QQQ",
+                    [30.0],
+                    [1.5],
+                    plan.rebuild,
+                    strategy_state_preverified=plan.strategy_state_preverified,
+                    expected_strategy_state_generation=plan.strategy_state_generation,
+                    prevalidated_asset_safe_tail_rows=safe_tail_rows,
+                )
+
+        self.assertFalse(rebuilt)
+        self.assertEqual(safe_tail_rows, {})
+        verify_state.assert_called_once()
+        self.assertTrue(process_grid.call_args.kwargs["strategy_state_preverified"])
+        self.assertEqual(process_grid.call_args.kwargs["_prevalidated_safe_tail_rows"], {})
+        self.assertTrue(process_grid.call_args.kwargs["_authoritative_histories_prevalidated"])
+
     def test_columnwise_report_concat_sorts_the_outer_date_index(self) -> None:
         long_curve = pd.DataFrame(
             {"Long_TQQQ_RSI_Strategy": [101_000.0, 102_000.0]},
@@ -1105,7 +1267,7 @@ publish("new")
         self.assertEqual(len(observed_snapshot_connections), 1)
         self.assertIsNotNone(observed_snapshot_connections[0])
         self.assertTrue(managed["closed_at"].isna().all())
-        self.assertEqual(realized_pnl["Workflow"].tolist(), ["All"])
+        self.assertEqual(realized_pnl["Workflow"].tolist(), ["Total"])
         self.assertEqual(realized_pnl["Closed Positions"].tolist(), [0])
         self.assertEqual(persisted_closed_at, "2026-01-03T15:00:00Z")
 
@@ -6195,6 +6357,10 @@ publish("new")
     def test_download_executor_is_isolated_and_state_processing_is_serialized(self) -> None:
         state_active = 0
         max_state_active = 0
+        validation_active = 0
+        max_validation_active = 0
+        validation_calls = 0
+        validation_counter_lock = threading.Lock()
         phase_timings = WorkflowPhaseTimings()
         download_threads: set[str] = set()
         state_threads: set[str] = set()
@@ -6213,7 +6379,15 @@ publish("new")
             )
 
         def fake_prepare_asset_run(*args: object, **_kwargs: object) -> AssetRunPlan:
+            nonlocal validation_active, max_validation_active, validation_calls
             download_threads.add(threading.current_thread().name)
+            with validation_counter_lock:
+                validation_calls += 1
+                validation_active += 1
+                max_validation_active = max(max_validation_active, validation_active)
+            time.sleep(0.01)
+            with validation_counter_lock:
+                validation_active -= 1
             return AssetRunPlan(
                 asset_symbol=str(args[3]),
                 signal_symbol=str(args[4]),
@@ -6269,6 +6443,8 @@ publish("new")
             results = asyncio.run(run())
 
         self.assertEqual(max_state_active, 1)
+        self.assertEqual(max_validation_active, 1)
+        self.assertEqual(validation_calls, 2)
         self.assertTrue(download_threads)
         self.assertTrue(all(name.startswith("workflow-download") for name in download_threads))
         self.assertTrue(state_threads)
@@ -6576,7 +6752,17 @@ publish("new")
             db_path = str(Path(tmp) / "state.sqlite")
             with closing(sqlite3.connect(db_path)) as conn, conn:
                 init_state_db(conn)
-            with patch("leveraged_trader.workflow.strategy_state_matches_config", return_value=True):
+            with (
+                patch("leveraged_trader.workflow.strategy_state_matches_config", return_value=True),
+                patch(
+                    "leveraged_trader.workflow.load_best_strategy_summary",
+                    return_value={"buy_rsi": 30.0, "profit_target_multiple": 1.5},
+                ),
+                patch(
+                    "leveraged_trader.workflow.load_complete_strategy_equity_curve",
+                    return_value=pd.DataFrame({"equity": [100_000.0]}),
+                ),
+            ):
                 plan = _prepare_asset_run(
                     db_path,
                     "update",
@@ -6589,6 +6775,7 @@ publish("new")
 
         self.assertFalse(plan.rebuild)
         self.assertIsNone(plan.start)
+        self.assertEqual(plan.preverified_best_config, (30.0, 1.5))
 
     def test_report_build_excludes_assets_not_processed_in_current_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -9068,9 +9255,10 @@ publish("new")
                 persisted_canonical_close = conn.execute(
                     "SELECT close FROM market_data WHERE symbol = 'QQQ' ORDER BY date DESC LIMIT 1"
                 ).fetchone()[0]
-            # Authentication performs one full canonical replay; the actual
-            # update must retain its checkpoint instead of starting at zero.
-            self.assertEqual(start_indices, [[0], [len(asset_history)]])
+            # Trusted authentication avoids both a duplicate canonical replay
+            # and a no-work grid invocation when this pair's private inputs are
+            # unchanged.
+            self.assertEqual(start_indices, [])
             self.assertEqual(resumed_state_digest, initial_state_digest)
             self.assertEqual(resumed_private_rsi_rows, private_rsi_rows)
             self.assertEqual(persisted_canonical_close, corrected_close)
@@ -10110,9 +10298,77 @@ publish("new")
         self.assertFalse(benchmark_csv_exists)
         self.assertEqual(phase_timings.snapshot().report_generation_seconds, 2.0)
         self.assertNotIn("Phase time:", output)
+        self.assertNotIn("Timing (overlap-aware):", output)
+        self.assertNotIn("Market-data batches:", output)
         self.assertIn("Workflow finished in", output)
         self.assertNotIn("Workflow Benchmark", output)
         self.assertEqual(output.rstrip().splitlines()[-1], "\u2500" * 100)
+
+    def test_write_workflow_outputs_prints_detailed_timings_when_enabled(self) -> None:
+        phase_timings = WorkflowPhaseTimings()
+        phase_timings.add("download", 266.6)
+        phase_timings.add("state_validation", 147.92)
+        phase_timings.add("db_sync", 52.6)
+        phase_timings.add("report_generation", 39.85)
+        phase_timings.add("alpaca", 0.02)
+        asset_run_results = [
+            AssetRunResult(
+                workflow_idx=1,
+                asset_symbol="TQQQ",
+                signal_symbol="QQQ",
+                action="Updating",
+                rows_processed=12,
+                status="done",
+                message="Processed 12 rows",
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp, patch("leveraged_trader.workflow.time") as mock_time:
+            mock_time.perf_counter.side_effect = [10.0, 10.0]
+            output_buffer = io.StringIO()
+            reporter = WorkflowReporter(
+                console=Console(file=output_buffer, width=240, color_system=None, no_color=True)
+            )
+            _write_workflow_outputs(
+                mode="update",
+                db_path=str(Path(tmp) / "state.sqlite"),
+                base_cfg=BacktestConfig(),
+                buy_rsi_values=[30.0],
+                profit_target_values=[1.5],
+                alpaca_cfg=AlpacaOrderConfig(),
+                output_dir=str(Path(tmp) / "outputs"),
+                workflow_concurrency=3,
+                reporter=reporter,
+                asset_run_results=asset_run_results,
+                optimization_summary=pd.DataFrame(),
+                curves=pd.DataFrame(),
+                buy_signals=pd.DataFrame(),
+                eligible_buy_signals=pd.DataFrame(),
+                sell_signals=pd.DataFrame(),
+                realized_pnl_summary=pd.DataFrame(),
+                managed_positions=pd.DataFrame(),
+                reconciliation_results=pd.DataFrame(columns=["Action"]),
+                sell_reconciliation_results=pd.DataFrame(),
+                order_results=pd.DataFrame(),
+                workflow_timer=WorkflowTimer.start(),
+                phase_timings=phase_timings,
+                research_outputs_published=True,
+                broker_snapshot_committed=True,
+                market_data_batch_count=29,
+                market_data_individual_retry_count=1,
+                show_timings=True,
+            )
+            output = output_buffer.getvalue()
+
+        self.assertIn(
+            "Timing (overlap-aware): downloads 4m 26.60s, state verification 2m 27.92s, "
+            "grid 0.00s, database 52.60s, reports 39.85s, Alpaca 0.02s.",
+            output,
+        )
+        self.assertIn(
+            "Market-data batches: 29; individual retries: 1; rebuilt assets: 0; updated assets: 1.",
+            output,
+        )
 
     def test_write_workflow_outputs_preserves_workflow_columns_and_side_prefixed_curves(self) -> None:
         optimization_summary = pd.DataFrame(

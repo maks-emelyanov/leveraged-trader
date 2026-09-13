@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import ipaddress
 import math
+import os
 import pickle
 import queue
 import re
@@ -568,6 +569,7 @@ def run_deadline_subprocess(
     result_max_bytes: int,
     timeout_message: str,
     connection_error_message: str,
+    environment_overrides: Mapping[str, str] | None = None,
 ) -> object:
     """Run a one-shot worker with stdin/stdout transfer under one deadline."""
     request_bytes = _serialize_envelope(
@@ -579,6 +581,15 @@ def run_deadline_subprocess(
 
     if type(result_max_bytes) is not int or result_max_bytes < 1:
         raise ValueError("Worker result byte limit must be a positive integer.")
+    worker_environment: dict[str, str] | None = None
+    if environment_overrides is not None:
+        if not isinstance(environment_overrides, Mapping) or any(
+            type(key) is not str or not key or "=" in key or "\x00" in key or type(value) is not str or "\x00" in value
+            for key, value in environment_overrides.items()
+        ):
+            raise ValueError("Worker environment overrides must contain valid string names and values.")
+        worker_environment = dict(os.environ)
+        worker_environment.update(environment_overrides)
 
     process: subprocess.Popen[bytes] | None = None
     try:
@@ -588,6 +599,7 @@ def run_deadline_subprocess(
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             close_fds=True,
+            env=worker_environment,
         )
         remaining_seconds = deadline - time.monotonic()
         if remaining_seconds <= 0:

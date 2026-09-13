@@ -211,7 +211,9 @@ environment fails visibly before a due command can run. Sampling first means an 
 due even when validation finishes during 8:46. The gate runs:
 
 - 8:45 a.m. Monday-Friday: require successful executable-universe sources, then run the full
-  workflow with Alpaca paper buy and managed sell submission.
+  workflow with Alpaca paper buy and managed sell submission. The authenticated clock snapshot also
+  supplies an absolute 9:20 a.m. Eastern analytics deadline; expiry rolls back the active asset and
+  prevents buy submission.
 - Every minute from 9:30 a.m. through 4:00 p.m. Monday-Friday: run the lightweight managed-position
   reconciliation path with sell submission enabled and buy submission disabled.
 
@@ -362,6 +364,11 @@ scheduled operation never modifies the environment:
 Common options:
 
 - `--mode {update,rebuild}`: resume from SQLite state (`update`) or recompute from scratch (`rebuild`).
+- `--strategy-state-verification {trusted,canonical}`: authenticate protected local state, the
+  strategy fingerprint, full grid, row digests, chronology, and generation before resume (`trusted`,
+  the default), or additionally replay canonical history for an explicit audit (`canonical`). Trusted
+  verification preserves already authenticated OHLC values across tiny coherent Yahoo adjustment-factor
+  drift when volume and the trading calendar are unchanged; real candle corrections still rebuild.
 - `--reconcile-only`: reconcile existing managed Alpaca positions without universe downloads or
   strategy work; requires `--alpaca-submit-sell-orders` and cannot be combined with buy submission.
 - `--db PATH`: persistent SQLite state file path (default: `strategy_state.sqlite`); empty paths,
@@ -386,8 +393,9 @@ Common options:
 - `--tradier-timeout-seconds INT`: Tradier request timeout in seconds (default: `30`).
 - `--workflow-concurrency INT`: maximum concurrent asset download workers; SQLite strategy updates
   remain serialized (default: `4`; use `1` for fully serial behavior).
-- `--require-workflow-source-success / --no-require-workflow-source-success`: fail a universe run after recording source health if the primary Nasdaq feed, an issuer/ETN source, or an active-listing source failed; a successfully parsed issuer zero-match page remains healthy (default: disabled).
+- `--require-workflow-source-success / --no-require-workflow-source-success`: fail a universe run after recording source health if the primary Nasdaq feed, an issuer/ETN source, or an active-listing source failed; a successfully parsed issuer zero-match page remains healthy (default: enabled with Alpaca buy submission and disabled otherwise). Use the negative form explicitly to allow paper buys from a degraded universe.
 - `--no-color`: disable colored terminal output.
+- `--show-timings`: show overlap-aware workflow phase timings and market-data work counts.
 
 ## Outputs
 
@@ -471,7 +479,9 @@ Symbol-only Cboe and SEC mutual-fund
 feeds are recorded as inventory-only and are not counted as product-name leverage coverage. Leveraged workflow rows whose RSI
 symbol cannot be mapped confidently are excluded from the executable workflow and saved to
 `universe_rsi_mapping_review`; curated proxy mappings and long-product self-RSI fallbacks remain
-executable and are annotated in `nasdaq_etf_universe`. Inverse-product self-RSI fallbacks are instead
+executable and are annotated in `nasdaq_etf_universe`. Exact-ticker overrides must also match the
+expected exposure in the current product name, and names matching multiple distinct curated proxies
+are sent to review. Inverse-product self-RSI fallbacks are instead
 marked for review and excluded because the high-RSI inverse entry rule requires an underlying proxy.
 Curated inverse mappings use an unlevered ETF or spot-market proxy for the product's benchmark rather
 than the inverse product's own RSI. Products are excluded when leveraged-looking wording is not actual
@@ -485,7 +495,9 @@ An enabled audit directory that produces no parseable product rows is treated as
 because an empty exchange or registry directory is not a credible successful snapshot. Audit sources
 remain coverage checks and do not contribute executable rows. Use
 `--require-workflow-source-success` when a partial executable universe caused by a workflow discovery or
-active-listing failure is not acceptable; the option does not make audit-only source failures fatal.
+active-listing failure is not acceptable; Alpaca buy submission enables it automatically unless
+`--no-require-workflow-source-success` is explicitly supplied. The option does not make audit-only
+source failures fatal.
 
 Terminal output is intentionally compact: concurrent asset work is shown as aggregate progress, with
 long and short ETF/ETN workflow results reported separately before combined buy and Alpaca sections.
@@ -500,6 +512,8 @@ tables show chronological display IDs that preserve closed-position gaps, plus t
 with wrapped messages. A final workflow footer reports total elapsed time followed by a divider for
 appended logs. Redirected or cron-driven non-terminal output defaults to a 156-column layout so log
 tables stay readable, while interactive terminal output uses the terminal's current width.
+Detailed phase timings and market-data work counts are hidden by default; pass `--show-timings` to
+include them immediately before the final workflow footer.
 
 To tune download concurrency locally, compare equivalent update runs against copies of the same
 SQLite state with `--workflow-concurrency 1`, `2`, `4`, and `8`; disable Alpaca submissions during
@@ -595,6 +609,10 @@ Managed sell orders:
 - Resubmit expired GTC sells when renewal is enabled and the managed position is still open.
 - Require recurring runs with managed sell submission enabled for renewal and resubmission to occur; persisted state alone does not schedule broker requests.
 - Are not resubmitted automatically after a sell order is rejected or manually canceled.
+- Quarantine an exact-quantity Alpaca paper position when both its deterministic sell is absent and
+  Alpaca identifies the held asset as inactive and non-tradable. The active managed row continues to
+  block new buys and is rechecked on recurring runs; this broker-only paper-account condition is
+  reported as `broker_inactive` instead of failing every otherwise healthy workflow run.
 - Skip GTC sell submission for legacy fractional managed quantities and keep the managed position active for review.
 - Keep the managed position active, blocking new buys, until cumulative managed sell fills close the full buy quantity.
 - Block automatic renewal and require manual review if Alpaca reports a partial fill without a valid average fill price, if observed fills regress, or if cumulative sells exceed the managed buy quantity.
@@ -603,7 +621,8 @@ Managed sell orders:
 - Fail the command whenever any current active managed position cannot confirm required protection
   or safe fill accounting—including broker errors, malformed or rejected protective responses,
   live-quantity drift, and identity or order-metadata mismatches—after preserving reconciliation and
-  sell diagnostics in CSV.
+  sell diagnostics in CSV. The narrowly verified inactive/non-tradable paper-position quarantine above
+  is the only exception because Alpaca cannot accept an executable order for it.
 
 The raw `sell_signals.csv` report includes latest-session simulated target exits for strategy review.
 Those rows describe exits the daily-bar simulation already executed; they are not actionable live

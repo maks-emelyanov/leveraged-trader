@@ -1037,21 +1037,26 @@ def _download_yfinance(
     start: str | None,
     end: str | None,
     auto_adjust: bool,
+    deadline_monotonic: float | None = None,
 ) -> tuple[pd.DataFrame | None, dict[str, str]]:
-    deadline = time.monotonic() + _YFINANCE_REQUEST_TIMEOUT_SECONDS
+    request_deadline = time.monotonic() + _YFINANCE_REQUEST_TIMEOUT_SECONDS
+    deadline = request_deadline if deadline_monotonic is None else min(request_deadline, float(deadline_monotonic))
     injected_download = isinstance(yf.download, Mock) or isinstance(getattr(yf_multi, "_download_impl", None), Mock)
     symbol_aliases: Mapping[str, str] = {}
     try:
         if injected_download:
             # Keep deterministic in-process test doubles observable. Ordinary
             # production callables never bypass the killable worker boundary.
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                raise requests.exceptions.Timeout("Yahoo Finance response exceeded its overall deadline.")
             with _YFINANCE_DOWNLOAD_LOCK, _suppress_yfinance_logger():
                 raw, download_errors, symbol_aliases = execute_yfinance_download(
                     symbols,
                     start,
                     end,
                     auto_adjust,
-                    request_timeout_seconds=float(_YFINANCE_REQUEST_TIMEOUT_SECONDS),
+                    request_timeout_seconds=remaining_seconds,
                 )
         else:
             remaining_seconds = deadline - time.monotonic()
@@ -1243,7 +1248,11 @@ def _yfinance_symbol_frames(
     raw: pd.DataFrame | None,
     symbols: list[str],
     download_errors: Mapping[str, str],
+    *,
+    exclude_current_session: bool = False,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
+    if type(exclude_current_session) is not bool:
+        raise ValueError("exclude_current_session must be a boolean")
     frames: dict[str, pd.DataFrame] = {}
     errors = _yfinance_errors_for_requested_symbols(symbols, download_errors)
 
@@ -1289,8 +1298,17 @@ def _yfinance_symbol_frames(
         # a wholly nonnumeric candle cannot masquerade as an empty calendar row.
         if len(symbols) > 1:
             df = df.loc[~df.loc[:, _OHLCV_FIELDS].isna().all(axis=1)]
+        if exclude_current_session:
+            # Yahoo can expose a partially formed daily candle before the US
+            # session opens. It is outside the settled-history contract and
+            # therefore must be removed before OHLC consistency validation.
+            df = exclude_current_trading_session(df)
         if df.empty:
-            errors[symbol] = "Yahoo Finance response had no OHLCV daily rows"
+            errors[symbol] = (
+                "No finalized daily market data is available yet"
+                if exclude_current_session
+                else "Yahoo Finance response had no OHLCV daily rows"
+            )
             continue
         df.columns = [f"{symbol}_{column}" for column in _OHLCV_FIELDS]
         df = _repair_yahoo_adjusted_ohlc_jitter(df, symbol)
@@ -1563,6 +1581,8 @@ def load_market_data(
     symbols: list[str] | None = None,
     tradier_cfg: TradierMarketDataConfig | None = None,
     calendar_symbol: str | None = None,
+    deadline_monotonic: float | None = None,
+    _settled_history_only: bool = False,
 ) -> pd.DataFrame:
     """
     Downloads daily data and returns a merged DataFrame with SYMBOL_Field
@@ -1573,6 +1593,8 @@ def load_market_data(
     """
     if type(auto_adjust) is not bool:
         raise ValueError("auto_adjust must be a boolean")
+    if type(_settled_history_only) is not bool:
+        raise ValueError("_settled_history_only must be a boolean")
     if tradier_cfg is not None and type(tradier_cfg) is not TradierMarketDataConfig:
         raise ValueError("tradier_cfg must be a TradierMarketDataConfig instance or null")
     if symbols is None:
@@ -1645,8 +1667,22 @@ def load_market_data(
     if start_boundary is not None and end_boundary is not None and end_boundary <= start_boundary:
         raise ValueError("Market-data end must be strictly after start.")
 
-    raw, download_errors = _download_yfinance(symbols, start, end, auto_adjust)
-    frames_by_symbol, yahoo_errors = _yfinance_symbol_frames(raw, symbols, download_errors)
+    raw, download_errors = _download_yfinance(
+        symbols,
+        start,
+        end,
+        auto_adjust,
+        deadline_monotonic=deadline_monotonic,
+    )
+    if _settled_history_only:
+        frames_by_symbol, yahoo_errors = _yfinance_symbol_frames(
+            raw,
+            symbols,
+            download_errors,
+            exclude_current_session=True,
+        )
+    else:
+        frames_by_symbol, yahoo_errors = _yfinance_symbol_frames(raw, symbols, download_errors)
     for symbol, frame in list(frames_by_symbol.items()):
         clipped = _clip_history_frame_to_requested_bounds(frame, start=start, end=end)
         if clipped.empty:
@@ -1835,6 +1871,7 @@ def load_signal_history(
     end: str | None = None,
     auto_adjust: bool = True,
     tradier_cfg: TradierMarketDataConfig | None = None,
+    deadline_monotonic: float | None = None,
 ) -> pd.DataFrame:
     """Load the canonical, settled daily history for one RSI signal symbol."""
     return load_symbol_history(
@@ -1842,7 +1879,82 @@ def load_signal_history(
         end=end,
         auto_adjust=auto_adjust,
         tradier_cfg=tradier_cfg,
+        deadline_monotonic=deadline_monotonic,
     )
+
+
+def load_symbol_history_batch(
+    symbols: list[str],
+    *,
+    end: str | None = None,
+    auto_adjust: bool = True,
+    deadline_monotonic: float | None = None,
+) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
+    """Load validated Yahoo histories in one deterministic workflow batch.
+
+    Partial provider failures are returned per symbol so the workflow can
+    retry each affected ticker through the ordinary single-symbol path, which
+    retains configured Tradier fallback behavior.
+    """
+    if isinstance(symbols, (str, bytes)):
+        raise ValueError("symbols must be a sequence of trimmed, nonempty strings")
+    requested_symbols = list(symbols)
+    invalid_symbols = [
+        (index, symbol) for index, symbol in enumerate(requested_symbols) if not _is_safe_requested_symbol(symbol)
+    ]
+    if invalid_symbols:
+        index, symbol = invalid_symbols[0]
+        raise ValueError(
+            "Each requested market-data symbol must be a trimmed, nonempty string that is "
+            "printable and contains no whitespace or control characters; "
+            f"symbols[{index}] was {symbol!r}."
+        )
+    unique_symbols = list(dict.fromkeys(requested_symbols))
+    if not unique_symbols:
+        raise ValueError("symbols must not be empty")
+    yahoo_identities: dict[str, str] = {}
+    for symbol in unique_symbols:
+        identity = symbol.upper()
+        prior = yahoo_identities.get(identity)
+        if prior is not None and prior != symbol:
+            reason = f"Requested market-data symbols collide under Yahoo Finance identity: {prior!r} and {symbol!r}."
+            return {}, {requested: reason for requested in unique_symbols}
+        yahoo_identities[identity] = symbol
+
+    try:
+        raw, download_errors = _download_yfinance(
+            unique_symbols,
+            None,
+            end,
+            auto_adjust,
+            deadline_monotonic=deadline_monotonic,
+        )
+        frames, errors = _yfinance_symbol_frames(
+            raw,
+            unique_symbols,
+            download_errors,
+            exclude_current_session=True,
+        )
+    except ValueError as exc:
+        reason = safe_diagnostic_text(exc, max_chars=DEFAULT_DIAGNOSTIC_MAX_CHARS)
+        return {}, {symbol: reason for symbol in unique_symbols}
+
+    settled: dict[str, pd.DataFrame] = {}
+    for symbol, frame in frames.items():
+        clipped = _clip_history_frame_to_requested_bounds(frame, start=None, end=end)
+        if clipped.empty:
+            errors[symbol] = "Yahoo Finance response had no daily rows inside the requested date range"
+            continue
+        finalized = exclude_current_trading_session(clipped)
+        if finalized.empty:
+            errors[symbol] = "No finalized daily market data is available yet"
+            continue
+        finalized.attrs[MARKET_DATA_PROVIDERS_ATTR] = {symbol: "yahoo_finance"}
+        settled[symbol] = finalized
+    for symbol in unique_symbols:
+        if symbol not in settled:
+            errors.setdefault(symbol, "No data returned")
+    return settled, errors
 
 
 def load_symbol_history(
@@ -1851,6 +1963,7 @@ def load_symbol_history(
     end: str | None = None,
     auto_adjust: bool = True,
     tradier_cfg: TradierMarketDataConfig | None = None,
+    deadline_monotonic: float | None = None,
 ) -> pd.DataFrame:
     """Load complete, settled daily history for one persisted market symbol."""
     data = load_market_data(
@@ -1859,6 +1972,8 @@ def load_symbol_history(
         auto_adjust=auto_adjust,
         symbols=[symbol],
         tradier_cfg=tradier_cfg,
+        deadline_monotonic=deadline_monotonic,
+        _settled_history_only=True,
     )
     return exclude_current_trading_session(data)
 
@@ -1868,6 +1983,7 @@ def load_risk_free_history(
     end: str | None = None,
     auto_adjust: bool = True,
     tradier_cfg: TradierMarketDataConfig | None = None,
+    deadline_monotonic: float | None = None,
 ) -> pd.DataFrame:
     """Load the complete canonical benchmark history shared by all strategies."""
     return load_symbol_history(
@@ -1875,4 +1991,5 @@ def load_risk_free_history(
         end=end,
         auto_adjust=auto_adjust,
         tradier_cfg=tradier_cfg,
+        deadline_monotonic=deadline_monotonic,
     )

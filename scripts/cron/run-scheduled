@@ -1696,6 +1696,7 @@ run_scheduled_command() {
 }
 
 schedule_preflight_not_due="not_due"
+schedule_epoch=""
 if [[ -n "${LEVERAGED_TRADER_SCHEDULE_NOW+x}" ]]; then
     schedule_now="$LEVERAGED_TRADER_SCHEDULE_NOW"
 else
@@ -1900,9 +1901,9 @@ sys.stdout.write(datetime.fromtimestamp(int(sys.argv[1]), eastern).strftime("%u 
         fi
 
         # ASCII file-separator cannot occur in either validated executable path
-        # or the fixed-format clock output, so return both values without an
+        # or the fixed-format clock output, so return all values without an
         # extra temporary file.
-        printf '%s\034%s' "$schedule_uv_bin" "$resolved_schedule_now"
+        printf '%s\034%s\034%s' "$schedule_uv_bin" "$resolved_schedule_now" "$schedule_epoch"
     }
 
     schedule_preflight_status=0
@@ -1922,7 +1923,21 @@ sys.stdout.write(datetime.fromtimestamp(int(sys.argv[1]), eastern).strftime("%u 
         exit 2
     fi
     schedule_uv_bin="${schedule_preflight_output%%"$schedule_preflight_delimiter"*}"
-    schedule_now="${schedule_preflight_output#*"$schedule_preflight_delimiter"}"
+    schedule_preflight_remainder="${schedule_preflight_output#*"$schedule_preflight_delimiter"}"
+    if [[ "$schedule_preflight_remainder" != *"$schedule_preflight_delimiter"* ]]; then
+        report_scheduler_preflight_failure \
+            "Scheduler preflight returned malformed deadline metadata." \
+            2
+        exit 2
+    fi
+    schedule_now="${schedule_preflight_remainder%%"$schedule_preflight_delimiter"*}"
+    schedule_epoch="${schedule_preflight_remainder#*"$schedule_preflight_delimiter"}"
+    if [[ ! "$schedule_epoch" =~ ^[0-9]+$ ]]; then
+        report_scheduler_preflight_failure \
+            "Scheduler preflight returned an invalid clock epoch." \
+            2
+        exit 2
+    fi
     # Reuse the exact checked uv executable if this minute proceeds to the
     # production runner, rather than resolving PATH a second time.
     export UV_BIN="$schedule_uv_bin"
@@ -1952,6 +1967,12 @@ if [[ "$hhmm" == "0845" ]]; then
         --alpaca-submit-buy-orders
         --alpaca-submit-sell-orders
     )
+    if [[ -n "$schedule_epoch" ]]; then
+        # Anchor 09:20:00 ET to the authenticated 08:45 clock snapshot,
+        # discarding the snapshot's seconds before adding 35 minutes.
+        workflow_deadline_epoch=$((schedule_epoch - schedule_epoch % 60 + 35 * 60))
+        scheduled_arguments+=(--workflow-deadline-epoch "$workflow_deadline_epoch")
+    fi
 elif [[ "$hhmm" > "0929" && "$hhmm" < "1601" ]]; then
     scheduled_arguments=(--reconcile-only --alpaca-submit-sell-orders)
 else

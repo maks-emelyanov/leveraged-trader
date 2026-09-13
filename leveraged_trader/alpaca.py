@@ -75,6 +75,7 @@ from .storage import (
     alpaca_managed_buy_fill_observation_authorizes_mutation,
     alpaca_managed_buy_order_observation_issue,
     alpaca_managed_position_aliases,
+    alpaca_managed_position_asset_ids,
     alpaca_managed_sell_fill_observations,
     alpaca_managed_sell_fill_order_ids,
     alpaca_managed_sell_generation_intents,
@@ -6476,6 +6477,7 @@ def _fetch_durable_buy_cancellation_lineages(
     expected_client_order_id: str,
     expected_symbol: str,
     expected_alpaca_asset_id: str | None,
+    accepted_alpaca_asset_ids: Collection[str] | None = None,
 ) -> tuple[list[list[dict]], list[dict], list[str]]:
     """Best-effort refresh every independently accepted buy retained for follow-up."""
     lineages: list[list[dict]] = []
@@ -6494,11 +6496,15 @@ def _fetch_durable_buy_cancellation_lineages(
                 direct_order,
                 expected_client_order_id,
             )
+            observed_asset_id = _replacement_chain_stable_asset_id(lineage)
+            lineage_expected_asset_id = expected_alpaca_asset_id
+            if observed_asset_id in frozenset(accepted_alpaca_asset_ids or ()):
+                lineage_expected_asset_id = observed_asset_id
             attributed_lineage = _safely_attributed_buy_order_lineage(
                 leaf,
                 expected_client_order_id=expected_client_order_id,
                 expected_symbol=expected_symbol,
-                expected_alpaca_asset_id=expected_alpaca_asset_id,
+                expected_alpaca_asset_id=lineage_expected_asset_id,
                 expected_alpaca_order_id=persisted_order_id,
                 replacement_chain=lineage,
             )
@@ -6527,6 +6533,7 @@ def _tracked_buy_lineages_intent_issue(
     expected_client_order_id: str,
     expected_symbol: str,
     expected_alpaca_asset_id: str | None,
+    accepted_alpaca_asset_ids: Collection[str] | None = None,
     expected_qty: float | None,
     expected_limit_price: float | None,
 ) -> str | None:
@@ -6538,11 +6545,15 @@ def _tracked_buy_lineages_intent_issue(
         if lineage_ids in seen_lineages:
             continue
         seen_lineages.add(lineage_ids)
+        observed_asset_id = _replacement_chain_stable_asset_id(lineage)
+        lineage_expected_asset_id = expected_alpaca_asset_id
+        if observed_asset_id in frozenset(accepted_alpaca_asset_ids or ()):
+            lineage_expected_asset_id = observed_asset_id
         issue = _buy_order_identity_issue(
             lineage[-1],
             expected_client_order_id=expected_client_order_id,
             expected_symbol=expected_symbol,
-            expected_alpaca_asset_id=expected_alpaca_asset_id,
+            expected_alpaca_asset_id=lineage_expected_asset_id,
             expected_alpaca_order_id=None,
             expected_qty=expected_qty,
             expected_limit_price=expected_limit_price,
@@ -6578,6 +6589,7 @@ def _historical_managed_sell_lineages(
     historical_leaves: dict[str, dict] = {}
     intent_issues: list[str] = []
     persisted_generation_intents = alpaca_managed_sell_generation_intents(conn, position_id)
+    accepted_asset_ids = frozenset(alpaca_managed_position_asset_ids(position))
 
     for persisted_order_id in alpaca_managed_sell_fill_order_ids(conn, position_id):
         if persisted_order_id in observed_orders:
@@ -6608,11 +6620,17 @@ def _historical_managed_sell_lineages(
             raise SellOrderIdentityError(
                 "historical sell replacement root is not attributable to this managed position"
             )
+        lineage_asset_id = _replacement_chain_stable_asset_id(lineage)
+        if accepted_asset_ids and lineage_asset_id not in accepted_asset_ids:
+            raise SellOrderIdentityError(
+                "historical sell replacement lineage conflicts with every managed asset-ID generation"
+            )
+        lineage_expected_asset_id = lineage_asset_id if accepted_asset_ids else expected_alpaca_asset_id
         if not all(
             _order_matches_core_intent(
                 order,
                 expected_symbol=symbol,
-                expected_alpaca_asset_id=expected_alpaca_asset_id,
+                expected_alpaca_asset_id=lineage_expected_asset_id,
                 expected_side="sell",
                 expected_order_type="limit",
                 expected_time_in_force="gtc",
@@ -12849,6 +12867,7 @@ def _audit_recently_closed_managed_position(
     buy_client_order_id = str(position["buy_client_order_id"])
     sell_client_order_id = _optional_str(position.get("sell_client_order_id"))
     persisted_asset_id = _optional_str(position.get("alpaca_asset_id"))
+    accepted_asset_ids = frozenset(alpaca_managed_position_asset_ids(position))
     tracked_buy_cancellation_ids = _managed_buy_followup_order_ids(position)
     tracked_buy_resolution_issues: list[str] = []
     tracked_buy_lineages: list[list[dict]] = []
@@ -12860,6 +12879,7 @@ def _audit_recently_closed_managed_position(
                 expected_client_order_id=buy_client_order_id,
                 expected_symbol=symbol,
                 expected_alpaca_asset_id=persisted_asset_id,
+                accepted_alpaca_asset_ids=accepted_asset_ids,
             )
         )
         if not tracked_buy_lineages:
@@ -12917,7 +12937,7 @@ def _audit_recently_closed_managed_position(
         )
         return
     observed_asset_id = next(iter(observed_asset_ids))
-    if persisted_asset_id is not None and persisted_asset_id != observed_asset_id:
+    if persisted_asset_id is not None and observed_asset_id not in accepted_asset_ids:
         _append_reconciliation_result(
             rows,
             position_id=position_id,
@@ -12963,7 +12983,7 @@ def _audit_recently_closed_managed_position(
             required_failure=True,
         )
         return
-    expected_asset_id = persisted_asset_id or observed_asset_id
+    expected_asset_id = observed_asset_id
     buy_root = buy_replacement_chain[0]
     persisted_buy_order_qty = _optional_positive_float(position.get("buy_order_qty"))
     persisted_buy_order_limit_price = _optional_positive_float(position.get("buy_order_limit_price"))
@@ -12991,6 +13011,7 @@ def _audit_recently_closed_managed_position(
             expected_client_order_id=buy_client_order_id,
             expected_symbol=symbol,
             expected_alpaca_asset_id=expected_asset_id,
+            accepted_alpaca_asset_ids=accepted_asset_ids,
             expected_qty=expected_buy_qty,
             expected_limit_price=expected_buy_limit_price,
         )
@@ -13376,12 +13397,16 @@ def _audit_recently_closed_managed_position(
             current_sell_order_id,
             sell_client_order_id,
         )
+        sell_lineage_asset_id = _replacement_chain_stable_asset_id(sell_replacement_chain)
+        expected_current_sell_asset_id = persisted_asset_id or observed_asset_id
+        if sell_lineage_asset_id in accepted_asset_ids:
+            expected_current_sell_asset_id = sell_lineage_asset_id
         if not _sell_order_identity_is_consistent(
             sell_order,
             expected_sell_client_order_id=sell_client_order_id,
             expected_sell_alpaca_order_id=current_sell_order_id,
             expected_symbol=symbol,
-            expected_alpaca_asset_id=expected_asset_id,
+            expected_alpaca_asset_id=expected_current_sell_asset_id,
             replacement_chain=sell_replacement_chain,
         ):
             _append_reconciliation_result(
@@ -14125,6 +14150,7 @@ def _reconcile_alpaca_managed_positions_pass(
         buy_client_order_id = str(position["buy_client_order_id"])
         sell_client_order_id = _optional_str(position.get("sell_client_order_id"))
         current_sell_status = str(position.get("sell_status") or "").lower()
+        accepted_asset_ids = frozenset(alpaca_managed_position_asset_ids(position))
         try:
             if _reconcile_retained_sell_submission_quarantine(
                 conn=conn,
@@ -14181,6 +14207,7 @@ def _reconcile_alpaca_managed_positions_pass(
                                 expected_client_order_id=buy_client_order_id,
                                 expected_symbol=symbol,
                                 expected_alpaca_asset_id=_optional_str(position.get("alpaca_asset_id")),
+                                accepted_alpaca_asset_ids=accepted_asset_ids,
                             )
                         )
                         if not tracked_buy_lineages:
@@ -14448,7 +14475,8 @@ def _reconcile_alpaca_managed_positions_pass(
                         continue
                     position["alpaca_asset_id"] = observed_buy_asset_id
                     position["state_revision"] = adopted_revision
-                elif persisted_buy_asset_id != observed_buy_asset_id:
+                    accepted_asset_ids = frozenset({observed_buy_asset_id})
+                elif observed_buy_asset_id not in accepted_asset_ids:
                     _append_reconciliation_result(
                         rows,
                         position_id=position_id,
@@ -14467,6 +14495,7 @@ def _reconcile_alpaca_managed_positions_pass(
                         required_failure=True,
                     )
                     continue
+                expected_buy_identity_asset_id = observed_buy_asset_id
                 if tracked_buy_cancellation_ids:
                     if attributed_cancellation_pending:
                         if persisted_buy_status != "pending_cancel":
@@ -14537,7 +14566,7 @@ def _reconcile_alpaca_managed_positions_pass(
                     buy_order,
                     expected_client_order_id=buy_client_order_id,
                     expected_symbol=symbol,
-                    expected_alpaca_asset_id=_optional_str(position.get("alpaca_asset_id")),
+                    expected_alpaca_asset_id=expected_buy_identity_asset_id,
                     expected_alpaca_order_id=_optional_str(position.get("buy_alpaca_order_id")),
                     expected_qty=expected_buy_order_qty,
                     expected_limit_price=expected_buy_order_limit_price,
@@ -14549,7 +14578,8 @@ def _reconcile_alpaca_managed_positions_pass(
                         tracked_buy_lineages,
                         expected_client_order_id=buy_client_order_id,
                         expected_symbol=symbol,
-                        expected_alpaca_asset_id=_optional_str(position.get("alpaca_asset_id")),
+                        expected_alpaca_asset_id=expected_buy_identity_asset_id,
+                        accepted_alpaca_asset_ids=accepted_asset_ids,
                         expected_qty=expected_buy_order_qty,
                         expected_limit_price=expected_buy_order_limit_price,
                     )
@@ -14574,7 +14604,7 @@ def _reconcile_alpaca_managed_positions_pass(
                         buy_order,
                         expected_client_order_id=buy_client_order_id,
                         expected_symbol=symbol,
-                        expected_alpaca_asset_id=_optional_str(position.get("alpaca_asset_id")),
+                        expected_alpaca_asset_id=expected_buy_identity_asset_id,
                         expected_alpaca_order_id=_optional_str(position.get("buy_alpaca_order_id")),
                         replacement_chain=buy_replacement_chain,
                     )
@@ -14630,7 +14660,7 @@ def _reconcile_alpaca_managed_positions_pass(
                             identity_issue=buy_identity_issue,
                             expected_client_order_id=buy_client_order_id,
                             expected_symbol=symbol,
-                            expected_alpaca_asset_id=_optional_str(position.get("alpaca_asset_id")),
+                            expected_alpaca_asset_id=expected_buy_identity_asset_id,
                             expected_alpaca_order_id=_optional_str(position.get("buy_alpaca_order_id")),
                             replacement_chain=buy_replacement_chain,
                         )
@@ -14689,7 +14719,7 @@ def _reconcile_alpaca_managed_positions_pass(
                                 buy_order,
                                 expected_client_order_id=buy_client_order_id,
                                 expected_symbol=symbol,
-                                expected_alpaca_asset_id=_optional_str(position.get("alpaca_asset_id")),
+                                expected_alpaca_asset_id=expected_buy_identity_asset_id,
                                 expected_alpaca_order_id=_optional_str(position.get("buy_alpaca_order_id")),
                                 replacement_chain=buy_replacement_chain,
                             )
@@ -14699,7 +14729,7 @@ def _reconcile_alpaca_managed_positions_pass(
                             buy_order,
                             expected_client_order_id=buy_client_order_id,
                             expected_symbol=symbol,
-                            expected_alpaca_asset_id=_optional_str(position.get("alpaca_asset_id")),
+                            expected_alpaca_asset_id=expected_buy_identity_asset_id,
                             expected_alpaca_order_id=_optional_str(position.get("buy_alpaca_order_id")),
                             replacement_chain=buy_replacement_chain,
                         )
@@ -14725,7 +14755,7 @@ def _reconcile_alpaca_managed_positions_pass(
                     "buy_order": buy_order,
                     "expected_client_order_id": buy_client_order_id,
                     "expected_symbol": symbol,
-                    "expected_alpaca_asset_id": _optional_str(position.get("alpaca_asset_id")),
+                    "expected_alpaca_asset_id": expected_buy_identity_asset_id,
                     "expected_alpaca_order_id": _optional_str(position.get("buy_alpaca_order_id")),
                     "replacement_chain": buy_replacement_chain,
                 }
@@ -15416,6 +15446,8 @@ def _reconcile_alpaca_managed_positions_pass(
                         (
                             current_sell_status
                             in {
+                                "broker_inactive",
+                                "submission_failed",
                                 "submission_pending",
                                 "submission_unknown",
                                 "submission_not_found",
@@ -15746,6 +15778,124 @@ def _reconcile_alpaca_managed_positions_pass(
                             )
                             continue
 
+                        if current_sell_status in {"broker_inactive", "submission_failed"}:
+                            expected_asset_id = _optional_str(position.get("alpaca_asset_id"))
+                            try:
+                                asset = client.asset(expected_asset_id or symbol)
+                                observed_asset_id = _validated_alpaca_asset_id(
+                                    asset,
+                                    expected_symbol=symbol,
+                                )
+                            except Exception:
+                                release_alpaca_managed_sell_submission_fence(
+                                    conn,
+                                    position_id,
+                                    sell_client_order_id=sell_client_order_id,
+                                    claimed_at=retry_claimed_at,
+                                    expected_sell_status="submission_retrying",
+                                    expected_state_revision=retry_claim_state_revision,
+                                    sell_status=current_sell_status,
+                                    notes=durable_note(
+                                        "managed sell retry could not verify the current Alpaca asset state"
+                                    ),
+                                )
+                                raise
+                            asset_is_confirmed_inactive = bool(
+                                expected_asset_id is not None
+                                and observed_asset_id == expected_asset_id
+                                and asset.get("status") == "inactive"
+                                and asset.get("tradable") is False
+                            )
+                            same_asset_buy_is_open = _orders_have_open_order(
+                                open_orders,
+                                symbol,
+                                "buy",
+                                expected_alpaca_asset_id=expected_asset_id,
+                                symbol_aliases=position_aliases,
+                            )
+                            live_qty_matches = _managed_sell_quantities_match(
+                                recovery_qty,
+                                live_position_qty,
+                                mark_price=recovery_target_sell_price,
+                            )
+                            if asset_is_confirmed_inactive and live_qty_matches and not same_asset_buy_is_open:
+                                quarantined = release_alpaca_managed_sell_submission_fence(
+                                    conn,
+                                    position_id,
+                                    sell_client_order_id=sell_client_order_id,
+                                    claimed_at=retry_claimed_at,
+                                    expected_sell_status="submission_retrying",
+                                    expected_state_revision=retry_claim_state_revision,
+                                    sell_status="broker_inactive",
+                                    notes=durable_note(
+                                        "Alpaca paper account reports the exact held asset inactive and "
+                                        "non-tradable; managed exit is quarantined until the broker removes "
+                                        "the position or makes the asset closable"
+                                    ),
+                                )
+                                _append_reconciliation_result(
+                                    rows,
+                                    position_id=position_id,
+                                    symbol=symbol,
+                                    action="sell",
+                                    status="broker_inactive" if quarantined else "superseded",
+                                    buy_client_order_id=buy_client_order_id,
+                                    sell_client_order_id=sell_client_order_id,
+                                    qty=recovery_qty,
+                                    limit_price=recovery_target_sell_price,
+                                    alpaca_order_id=None,
+                                    message=(
+                                        "Alpaca paper account still holds the exact managed quantity but "
+                                        "reports the asset inactive and non-tradable; no executable sell "
+                                        "can be submitted, so the position remains quarantined and blocks "
+                                        "new buys"
+                                        if quarantined
+                                        else "inactive-asset quarantine was superseded by concurrent managed state"
+                                    ),
+                                )
+                                continue
+                            if current_sell_status == "submission_failed" or same_asset_buy_is_open:
+                                released = release_alpaca_managed_sell_submission_fence(
+                                    conn,
+                                    position_id,
+                                    sell_client_order_id=sell_client_order_id,
+                                    claimed_at=retry_claimed_at,
+                                    expected_sell_status="submission_retrying",
+                                    expected_state_revision=retry_claim_state_revision,
+                                    sell_status=current_sell_status,
+                                    notes=durable_note(
+                                        "managed sell submission remains failed and requires review"
+                                        if current_sell_status == "submission_failed"
+                                        else (
+                                            "inactive paper-position recovery is blocked by an open "
+                                            "same-asset buy order"
+                                        )
+                                    ),
+                                )
+                                _append_reconciliation_result(
+                                    rows,
+                                    position_id=position_id,
+                                    symbol=symbol,
+                                    action="sell",
+                                    status=current_sell_status if released else "superseded",
+                                    buy_client_order_id=buy_client_order_id,
+                                    sell_client_order_id=sell_client_order_id,
+                                    qty=recovery_qty,
+                                    limit_price=recovery_target_sell_price,
+                                    alpaca_order_id=None,
+                                    message=(
+                                        "prior managed sell submission failed; the asset is not confirmed "
+                                        "inactive and non-tradable, so automatic resubmission remains disabled"
+                                        if current_sell_status == "submission_failed"
+                                        else (
+                                            "broker-inactive position has an open same-asset buy order; "
+                                            "automatic recovery remains quarantined"
+                                        )
+                                    ),
+                                    required_failure=released,
+                                )
+                                continue
+
                         confirmed_retry_state_revision = confirm_alpaca_managed_sell_submission_retry(
                             conn,
                             position_id,
@@ -15818,12 +15968,17 @@ def _reconcile_alpaca_managed_positions_pass(
                     raise
                 broker_sell_status = _broker_order_status(sell_order, default="unknown")
                 persisted_sell_alpaca_order_id = _optional_str(position.get("sell_alpaca_order_id"))
+                sell_lineage_asset_id = _replacement_chain_stable_asset_id(sell_replacement_chain)
+                accepted_position_asset_ids = frozenset(alpaca_managed_position_asset_ids(position))
+                expected_sell_identity_asset_id = _optional_str(position.get("alpaca_asset_id"))
+                if sell_lineage_asset_id in accepted_position_asset_ids:
+                    expected_sell_identity_asset_id = sell_lineage_asset_id
                 if not _sell_order_identity_is_consistent(
                     sell_order,
                     expected_sell_client_order_id=sell_client_order_id,
                     expected_sell_alpaca_order_id=persisted_sell_alpaca_order_id,
                     expected_symbol=symbol,
-                    expected_alpaca_asset_id=_optional_str(position.get("alpaca_asset_id")),
+                    expected_alpaca_asset_id=expected_sell_identity_asset_id,
                     replacement_chain=sell_replacement_chain,
                 ):
                     _append_incomplete_sell_order_identity_result(
@@ -17781,6 +17936,7 @@ def _migrate_alpaca_managed_position_symbols_impl(
         closed_at = position.get("closed_at")
         expected_closed_at = None if closed_at is None or pd.isna(closed_at) else str(closed_at)
         asset_id = _optional_str(position.get("alpaca_asset_id"))
+        accepted_asset_ids = frozenset(alpaca_managed_position_asset_ids(position))
         current_symbol = live_by_asset_id.get(asset_id) if asset_id is not None else None
         if current_symbol is not None and current_symbol.upper() == prior_symbol:
             return None
@@ -17820,7 +17976,7 @@ def _migrate_alpaca_managed_position_symbols_impl(
                     "does not match the persisted client order; symbol migration is blocked for review"
                 ) from exc
             observed_asset_id = _optional_str(payload.get("asset_id"))
-            if observed_asset_id is None or (asset_id is not None and observed_asset_id != asset_id):
+            if observed_asset_id is None or (asset_id is not None and observed_asset_id not in accepted_asset_ids):
                 raise ValueError(
                     f"Managed position {int(position['id'])} {order_role} order asset identity "
                     "does not match the persisted asset; symbol migration is blocked for review"
@@ -17860,7 +18016,7 @@ def _migrate_alpaca_managed_position_symbols_impl(
                 )
             if attached_order_asset_id is None:
                 attached_order_asset_id = observed_asset_id
-            elif observed_asset_id != attached_order_asset_id:
+            elif observed_asset_id != attached_order_asset_id and asset_id is None:
                 raise ValueError(
                     f"Managed position {int(position['id'])} attached orders report conflicting "
                     "stable asset identities; symbol migration is blocked for review"

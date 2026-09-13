@@ -38,6 +38,8 @@ from leveraged_trader.market_data import (
     exclude_unfinalized_daily_bar,
     load_market_data,
     load_strategy_data,
+    load_symbol_history,
+    load_symbol_history_batch,
     recover_signal_history_for_calendar,
 )
 
@@ -83,6 +85,64 @@ def _tradier_request_from_daemon(url: str, send_connection: object) -> None:
 
 
 class MarketDataTests(unittest.TestCase):
+    def test_symbol_history_batch_returns_valid_frames_and_per_symbol_retry_errors(self) -> None:
+        fields = ["Open", "High", "Low", "Close", "Volume"]
+        columns = pd.MultiIndex.from_product([["AAA", "BBB"], fields])
+        raw = pd.DataFrame(
+            [
+                [100.0, 101.0, 99.0, 100.5, 1_000.0] * 2,
+                [101.0, 102.0, 100.0, 101.5, 1_100.0] * 2,
+            ],
+            index=pd.to_datetime(["2020-01-02", "2020-01-03"]),
+            columns=columns,
+        )
+        with patch(
+            "leveraged_trader.market_data._download_yfinance",
+            return_value=(raw, {"BBB": "provider timeout"}),
+        ):
+            histories, errors = load_symbol_history_batch(["AAA", "BBB"])
+
+        self.assertEqual(set(histories), {"AAA"})
+        self.assertEqual(errors, {"BBB": "provider timeout"})
+        self.assertEqual(
+            histories["AAA"].attrs[MARKET_DATA_PROVIDERS_ATTR],
+            {"AAA": "yahoo_finance"},
+        )
+
+    def test_symbol_history_batch_turns_alias_collision_into_individual_retries(self) -> None:
+        with patch("leveraged_trader.market_data._download_yfinance") as download:
+            histories, errors = load_symbol_history_batch(["abc", "ABC"])
+
+        self.assertFalse(histories)
+        self.assertEqual(set(errors), {"abc", "ABC"})
+        self.assertTrue(all("collide" in reason for reason in errors.values()))
+        download.assert_not_called()
+
+    def test_settled_history_ignores_malformed_current_candle_before_validation(self) -> None:
+        today = pd.Timestamp(datetime.now(ZoneInfo("America/New_York")).date())
+        prior_date = today - pd.Timedelta(days=1)
+        raw = pd.DataFrame(
+            {
+                "Open": [100.0, 110.0],
+                "High": [101.0, 90.0],
+                "Low": [99.0, 109.0],
+                "Close": [100.5, 108.0],
+                "Volume": [1_000.0, 0.0],
+            },
+            index=pd.DatetimeIndex([prior_date, today]),
+        )
+
+        with patch(
+            "leveraged_trader.market_data._download_yfinance",
+            return_value=(raw, {}),
+        ):
+            histories, errors = load_symbol_history_batch(["AAA"])
+            individual = load_symbol_history("AAA")
+
+        self.assertFalse(errors)
+        self.assertEqual(histories["AAA"].index.tolist(), [prior_date])
+        self.assertEqual(individual.index.tolist(), [prior_date])
+
     @patch("leveraged_trader.market_data.requests.get")
     @patch("leveraged_trader.market_data.yf.download")
     def test_requested_symbol_identities_are_validated_before_provider_requests(
@@ -441,6 +501,46 @@ class MarketDataTests(unittest.TestCase):
         self.assertIs(payload[1], raw)
         self.assertEqual(payload[2], {"AAPL": "$AAPL: no timezone found"})
         self.assertEqual(payload[3], {"AAPL": "US0378331005"})
+
+    @patch.object(yfinance_deadline_worker.yf_multi, "_download_impl")
+    def test_yfinance_batch_uses_bounded_worker_thread_stacks(
+        self,
+        mock_download_impl: Mock,
+    ) -> None:
+        mock_download_impl.return_value = pd.DataFrame()
+
+        with patch.object(yfinance_deadline_worker.threading, "stack_size") as stack_size:
+            yfinance_deadline_worker.execute_yfinance_download(
+                ["SPY", "QQQ"],
+                None,
+                None,
+                True,
+                request_timeout_seconds=17.0,
+            )
+
+        stack_size.assert_called_once_with(yfinance_deadline_worker._YFINANCE_WORKER_THREAD_STACK_BYTES)
+
+    def test_yfinance_batch_worker_bounds_glibc_malloc_arenas(self) -> None:
+        expected = ("yfinance_response", pd.DataFrame(), {}, {})
+        with patch.object(
+            yfinance_deadline_worker,
+            "run_deadline_subprocess",
+            return_value=expected,
+        ) as run_worker:
+            actual = yfinance_deadline_worker.run_yfinance_download_with_deadline(
+                ["SPY", "QQQ"],
+                None,
+                None,
+                True,
+                request_timeout_seconds=17.0,
+                deadline=time.monotonic() + 20,
+            )
+
+        self.assertIs(actual, expected)
+        self.assertEqual(
+            run_worker.call_args.kwargs["environment_overrides"],
+            {"MALLOC_ARENA_MAX": "2"},
+        )
 
     def test_yfinance_workers_reject_frames_over_memory_limit_before_writing_result(self) -> None:
         frame = pd.DataFrame(

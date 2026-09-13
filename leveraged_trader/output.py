@@ -136,6 +136,7 @@ STATUS_STYLES = {
     "accepted": "green",
     "batch_aborted": "yellow",
     "batch_budget_exhausted": "yellow",
+    "broker_inactive": "yellow",
     "corrected": "green",
     "filled": "green",
     "submitted": "green",
@@ -874,6 +875,34 @@ class WorkflowReporter:
         self.console.print()
         self.console.print(f"Workflow finished in {format_duration(elapsed_seconds)}.")
         self.console.rule(style="dim")
+
+    def workflow_timings(
+        self,
+        *,
+        download_seconds: float,
+        state_validation_seconds: float,
+        grid_compute_seconds: float,
+        db_sync_seconds: float,
+        report_generation_seconds: float,
+        alpaca_seconds: float,
+        batch_count: int,
+        individual_retry_count: int,
+        rebuild_count: int,
+        update_count: int,
+    ) -> None:
+        self.console.print(
+            "Timing (overlap-aware): "
+            f"downloads {format_duration(download_seconds)}, "
+            f"state verification {format_duration(state_validation_seconds)}, "
+            f"grid {format_duration(grid_compute_seconds)}, "
+            f"database {format_duration(db_sync_seconds)}, "
+            f"reports {format_duration(report_generation_seconds)}, "
+            f"Alpaca {format_duration(alpaca_seconds)}."
+        )
+        self.console.print(
+            f"Market-data batches: {batch_count}; individual retries: {individual_retry_count}; "
+            f"rebuilt assets: {rebuild_count}; updated assets: {update_count}."
+        )
 
     def _table(self, df: pd.DataFrame, columns: list[TableColumn], *, caption: str | None) -> Table:
         table = Table(

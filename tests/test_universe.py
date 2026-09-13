@@ -1844,6 +1844,13 @@ class UniverseTests(unittest.TestCase):
         self.assertEqual(mapping.confidence, "curated")
         self.assertEqual(mapping.mapping_source, "name_proxy")
 
+    def test_sk_hynix_symbol_override_accepts_issuer_underlying_ticker_name(self) -> None:
+        mapping = infer_rsi_mapping("SKHX", "2x Long SKHY Daily ETF")
+
+        self.assertEqual(mapping.rsi_symbol, "SKHY")
+        self.assertEqual(mapping.confidence, "curated")
+        self.assertEqual(mapping.mapping_source, "symbol_override")
+
     def test_normalizes_brkb_to_yahoo_symbol(self) -> None:
         self.assertEqual(infer_rsi_symbol("BRKU", "2X Long BRKB Daily ETF"), "BRK-B")
         self.assertEqual(infer_rsi_symbol("BRKU", "2X Long BRK.B Daily ETF"), "BRK-B")
@@ -1979,72 +1986,109 @@ class UniverseTests(unittest.TestCase):
 
     def test_reviewed_inverse_products_use_unlevered_rsi_proxies(self) -> None:
         expected = {
-            "AIQD": "AIQ",
-            "BERZ": "FNGS",
-            "BIS": "IBB",
-            "BNKD": "KBWB",
-            "BRZD": "EWZ",
-            "BZQ": "EWZ",
-            "DUG": "XLE",
-            "EEV": "EEM",
-            "EFU": "EFA",
-            "EPV": "VGK",
-            "EUO": "FXE",
-            "EWV": "EWJ",
-            "FLYD": "PEJ",
-            "FNGD": "FNGS",
-            "FXP": "FXI",
-            "HYGD": "HYG",
-            "JPND": "EWJ",
-            "KOLD": "UNG",
-            "LQDD": "LQD",
-            "MZZ": "MDY",
-            "NRGD": "XLE",
-            "OILD": "XOP",
-            "QID": "QQQ",
-            "QQDN": "QQQ",
-            "REW": "XLK",
-            "RXD": "XLV",
-            "SCC": "XLY",
-            "SCO": "USO",
-            "SDD": "IJR",
-            "SDP": "XLU",
-            "SIJ": "XLI",
-            "SKF": "XLF",
-            "SKRE": "KRE",
-            "SMHD": "SMH",
-            "SMDD": "MDY",
-            "SMN": "XLB",
-            "SRS": "IYR",
-            "SSG": "SOXX",
-            "SZK": "XLP",
-            "TPEI": "EWT",
-            "WTID": "XLE",
-            "YCS": "FXY",
+            "AIQD": ("MicroSectors Artificial Intelligence 3X Inverse Leveraged ETN", "AIQ"),
+            "BERZ": ("MicroSectors FANG+ -3X Inverse Leveraged ETN", "FNGS"),
+            "BIS": ("ProShares UltraShort Nasdaq Biotechnology", "IBB"),
+            "BNKD": ("MicroSectors Big Banks -3X Inverse Leveraged ETN", "KBWB"),
+            "BRZD": ("MicroSectors Brazil -3X Inverse Leveraged ETN", "EWZ"),
+            "BZQ": ("ProShares UltraShort MSCI Brazil Capped", "EWZ"),
+            "DUG": ("ProShares UltraShort Energy", "XLE"),
+            "EEV": ("ProShares UltraShort MSCI Emerging Markets", "EEM"),
+            "EFU": ("ProShares UltraShort MSCI EAFE", "EFA"),
+            "EPV": ("ProShares UltraShort FTSE Europe", "VGK"),
+            "EUO": ("ProShares UltraShort Euro", "FXE"),
+            "EWV": ("ProShares UltraShort MSCI Japan", "EWJ"),
+            "FLYD": ("MicroSectors Travel -3X Inverse Leveraged ETN", "PEJ"),
+            "FNGD": ("MicroSectors FANG+ -3X Inverse Leveraged ETN", "FNGS"),
+            "FXP": ("ProShares UltraShort FTSE China 50", "FXI"),
+            "HYGD": ("MicroSectors High Yield Corporate Bond -3X Inverse ETN", "HYG"),
+            "JPND": ("MicroSectors Japan -3X Inverse Leveraged ETN", "EWJ"),
+            "KOLD": ("ProShares UltraShort Bloomberg Natural Gas", "UNG"),
+            "LQDD": ("MicroSectors Investment Grade Corporate Bond -3X Inverse ETN", "LQD"),
+            "MZZ": ("ProShares UltraShort MidCap400", "MDY"),
+            "NRGD": ("MicroSectors Big Oil -3X Inverse Leveraged ETN", "XLE"),
+            "OILD": ("MicroSectors Oil & Gas Exploration -3X Inverse Leveraged ETN", "XOP"),
+            "QID": ("ProShares UltraShort QQQ", "QQQ"),
+            "QQDN": ("Tradr 2X Short Innovation 100 Daily ETF", "QQQ"),
+            "REW": ("ProShares UltraShort Technology", "XLK"),
+            "RXD": ("ProShares UltraShort Health Care", "XLV"),
+            "SCC": ("ProShares UltraShort Consumer Discretionary", "XLY"),
+            "SCO": ("ProShares UltraShort Bloomberg Crude Oil", "USO"),
+            "SDD": ("ProShares UltraShort SmallCap600", "IJR"),
+            "SDP": ("ProShares UltraShort Utilities", "XLU"),
+            "SIJ": ("ProShares UltraShort Industrials", "XLI"),
+            "SKF": ("ProShares UltraShort Financials", "XLF"),
+            "SKRE": ("Tuttle Capital Daily 2X Inverse Regional Banks ETF", "KRE"),
+            "SMHD": ("MicroSectors Semiconductors -3X Inverse Leveraged ETN", "SMH"),
+            "SMDD": ("ProShares UltraPro Short MidCap400", "MDY"),
+            "SMN": ("ProShares UltraShort Basic Materials", "XLB"),
+            "SRS": ("ProShares UltraShort Real Estate", "IYR"),
+            "SSG": ("ProShares UltraShort Semiconductors", "SOXX"),
+            "SZK": ("ProShares UltraShort Consumer Staples", "XLP"),
+            "TPEI": ("MicroSectors Taiwan -3X Inverse Leveraged ETN", "EWT"),
+            "WTID": ("MicroSectors Energy -3X Inverse Leveraged ETN", "XLE"),
+            "XLCD": ("MicroSectors Communications -3X Short Exposure ETN", "XLC"),
+            "XLPD": ("MicroSectors Consumer Staples -3X Short Exposure ETN", "XLP"),
+            "YCS": ("ProShares UltraShort Yen", "FXY"),
         }
 
-        for asset_symbol, rsi_symbol in expected.items():
+        for asset_symbol, (name, rsi_symbol) in expected.items():
             with self.subTest(asset_symbol=asset_symbol):
-                mapping = infer_rsi_mapping(asset_symbol, "Inverse leveraged product")
+                mapping = infer_rsi_mapping(asset_symbol, name)
                 self.assertEqual(mapping.rsi_symbol, rsi_symbol)
                 self.assertEqual(mapping.confidence, "curated")
 
     def test_new_microsectors_long_products_share_reference_asset_mappings(self) -> None:
         expected = {
-            "BRZL": "EWZ",
-            "HYGU": "HYG",
-            "JPNU": "EWJ",
-            "LQDU": "LQD",
-            "SMHU": "SMH",
-            "TAWN": "EWT",
+            "BRZL": ("MicroSectors Brazil 3X Leveraged ETN", "EWZ"),
+            "HYGU": ("MicroSectors High Yield Corporate Bond 3X Leveraged ETN", "HYG"),
+            "JPNU": ("MicroSectors Japan 3X Leveraged ETN", "EWJ"),
+            "LQDU": ("MicroSectors Investment Grade Corporate Bond 3X Leveraged ETN", "LQD"),
+            "SMHU": ("MicroSectors Semiconductors 3X Leveraged ETN", "SMH"),
+            "TAWN": ("MicroSectors Taiwan 3X Leveraged ETN", "EWT"),
+            "XLCU": ("MicroSectors Communications +3X Long Exposure ETN", "XLC"),
+            "XLPU": ("MicroSectors Consumer Staples +3X Long Exposure ETN", "XLP"),
         }
 
-        for asset_symbol, rsi_symbol in expected.items():
+        for asset_symbol, (name, rsi_symbol) in expected.items():
             with self.subTest(asset_symbol=asset_symbol):
-                mapping = infer_rsi_mapping(asset_symbol, "Leveraged product")
+                mapping = infer_rsi_mapping(asset_symbol, name)
                 self.assertEqual(mapping.rsi_symbol, rsi_symbol)
                 self.assertEqual(mapping.confidence, "curated")
                 self.assertEqual(mapping.mapping_source, "symbol_override")
+
+    def test_symbol_override_requires_matching_product_identity(self) -> None:
+        cases = {
+            "NVDX": "Unrelated 2X Long ACME Daily ETF",
+            "BRZL": "Unrelated 3X Long Europe Daily ETN",
+            "QID": "Unrelated 2X Short Gold Daily ETF",
+        }
+
+        for asset_symbol, name in cases.items():
+            with self.subTest(asset_symbol=asset_symbol):
+                mapping = infer_rsi_mapping(asset_symbol, name)
+                self.assertEqual(mapping.rsi_symbol, asset_symbol)
+                self.assertEqual(mapping.confidence, "needs_review")
+                self.assertEqual(mapping.mapping_source, "symbol_override_identity_mismatch")
+
+    def test_name_proxy_rejects_multiple_distinct_exposures(self) -> None:
+        cases = {
+            "BASK": "2X Long Bitcoin and Gold Daily ETF",
+            "MIXD": "2X Short S&P 500 and Gold Daily ETF",
+        }
+
+        for asset_symbol, name in cases.items():
+            with self.subTest(asset_symbol=asset_symbol):
+                mapping = infer_rsi_mapping(asset_symbol, name)
+                self.assertEqual(mapping.rsi_symbol, asset_symbol)
+                self.assertEqual(mapping.confidence, "needs_review")
+                self.assertEqual(mapping.mapping_source, "ambiguous_name_proxy")
+
+    def test_equal_weight_name_proxy_is_not_ambiguous_with_broad_sp500_pattern(self) -> None:
+        mapping = infer_rsi_mapping("EQUL", "2X Long S&P 500 Equal Weight Daily ETF")
+
+        self.assertEqual(mapping.rsi_symbol, "RSP")
+        self.assertEqual(mapping.confidence, "curated")
 
     def test_ultrashort_duration_and_unstable_basket_products_are_excluded(self) -> None:
         self.assertTrue({"AMUN", "RBIL", "SGVA", "SLTY", "UYLD", "VGUS", "ZMUN"} <= EXCLUDED_UNIVERSE_SYMBOLS)

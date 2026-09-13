@@ -7,13 +7,14 @@ import math
 import re
 import sqlite3
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, DecimalException
 from functools import cache
 from numbers import Number
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -215,6 +216,7 @@ STRATEGY_STATE_COLUMNS = {
 
 ALPACA_MANAGED_POSITION_COLUMNS = {
     "alpaca_asset_id": "TEXT",
+    "prior_alpaca_asset_ids": "TEXT",
     "state_revision": "INTEGER NOT NULL DEFAULT 0",
     "buy_observation_broker_updated_at": "TEXT",
     "buy_fill_broker_updated_at": "TEXT",
@@ -255,6 +257,8 @@ ALPACA_MANAGED_SELL_FILL_COLUMNS = {
     "submitted_limit_price": "REAL",
 }
 
+_LEGACY_ALPACA_WORKFLOW_LABEL = "Long"
+
 _ALPACA_STATE_REVISION_TRIGGER_NAME = "alpaca_managed_positions_increment_state_revision"
 _ALPACA_STATE_REVISION_GUARD_TRIGGER_NAME = "alpaca_managed_positions_validate_revision_update"
 _ALPACA_STATE_REVISION_GUARD_TRIGGER_SQL = f"""
@@ -284,7 +288,13 @@ _ALPACA_STATE_REVISION_TRIGGER_SQL = f"""
     END
 """
 
-STRATEGY_STATE_SCHEMA_VERSION = 13
+STRATEGY_STATE_SCHEMA_VERSION = 15
+# Strategy fingerprints intentionally have a lifecycle independent from the
+# SQLite migration version.  Broker-only tables may evolve without forcing a
+# replay of every strategy grid.  Keep the serialized payload key below as
+# ``schema_version`` for fingerprint compatibility with version 14 databases.
+STRATEGY_SEMANTICS_VERSION = 14
+StrategyStateVerification = Literal["trusted", "canonical"]
 RSI_ENTRY_RULE_LABELS = {
     "lower": RSI_ENTRY_LOWER,
     "upper": RSI_ENTRY_UPPER,
@@ -1042,6 +1052,7 @@ SQLITE_BUSY_TIMEOUT_MS = 60_000
 _UNSET = object()
 _ALPACA_MANAGED_SELL_DIAGNOSTIC_STATUSES = frozenset(
     {
+        "broker_inactive",
         "fill_quantity_regression",
         "fractional_qty",
         "incomplete_fill_metadata",
@@ -1096,6 +1107,46 @@ def _canonical_optional_alpaca_asset_id(
     if value is None:
         return None
     return _canonical_alpaca_asset_id(value, field_name=field_name)
+
+
+def alpaca_managed_position_asset_ids(position: Mapping[str, object]) -> tuple[str, ...]:
+    """Return the current and broker-rekeyed historical asset IDs for one row."""
+    current_value = position.get("alpaca_asset_id")
+    current_asset_id = (
+        None
+        if current_value is None or bool(pd.isna(current_value))
+        else _canonical_alpaca_asset_id(
+            current_value,
+            field_name="Persisted managed Alpaca current asset ID",
+        )
+    )
+    history_value = position.get("prior_alpaca_asset_ids")
+    if history_value is None or bool(pd.isna(history_value)):
+        prior_asset_ids: list[object] = []
+    else:
+        if type(history_value) is not str:
+            raise ValueError("Persisted managed Alpaca prior asset IDs must be a JSON array.")
+        try:
+            decoded = json.loads(history_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Persisted managed Alpaca prior asset IDs must be valid JSON.") from exc
+        if type(decoded) is not list:
+            raise ValueError("Persisted managed Alpaca prior asset IDs must be a JSON array.")
+        prior_asset_ids = decoded
+    if len(prior_asset_ids) > 64:
+        raise ValueError("Persisted managed Alpaca prior asset ID history is unreasonably large.")
+    normalized_prior = tuple(
+        _canonical_alpaca_asset_id(
+            asset_id,
+            field_name="Persisted managed Alpaca prior asset ID",
+        )
+        for asset_id in prior_asset_ids
+    )
+    if len(set(normalized_prior)) != len(normalized_prior):
+        raise ValueError("Persisted managed Alpaca prior asset IDs contain a duplicate.")
+    if current_asset_id is not None and current_asset_id in normalized_prior:
+        raise ValueError("Persisted managed Alpaca current asset ID is also present in its prior history.")
+    return (() if current_asset_id is None else (current_asset_id,)) + normalized_prior
 
 
 def _canonical_managed_symbol(value: object, *, field_name: str) -> str:
@@ -1408,6 +1459,9 @@ _STATE_DB_TABLE_SCHEMA = """
         PRIMARY KEY (asset_symbol, signal_symbol, buy_rsi, profit_target_multiple)
     );
 
+    CREATE INDEX IF NOT EXISTS strategy_state_signal_dependency
+    ON strategy_state (signal_symbol, asset_symbol, last_date);
+
     CREATE TABLE IF NOT EXISTS strategy_equity (
         asset_symbol TEXT NOT NULL,
         signal_symbol TEXT NOT NULL,
@@ -1509,6 +1563,7 @@ _STATE_DB_TABLE_SCHEMA = """
         workflow TEXT,
         symbol TEXT NOT NULL,
         alpaca_asset_id TEXT,
+        prior_alpaca_asset_ids TEXT,
         signal_symbol TEXT NOT NULL,
         buy_rsi REAL NOT NULL,
         profit_target_multiple REAL NOT NULL,
@@ -4200,6 +4255,19 @@ def _ensure_alpaca_managed_position_columns(conn: sqlite3.Connection) -> None:
     for column_name, column_type in ALPACA_MANAGED_POSITION_COLUMNS.items():
         if column_name not in existing_columns:
             conn.execute(f"ALTER TABLE alpaca_managed_positions ADD COLUMN {column_name} {column_type}")
+    # Managed positions could only be opened by the Long workflow before the
+    # inverse/Short workflow and this column were introduced together. Some
+    # databases have already run the additive migration, so repair every NULL
+    # legacy value rather than limiting the backfill to the first run that adds
+    # the column.
+    conn.execute(
+        """
+        UPDATE alpaca_managed_positions
+        SET workflow = ?
+        WHERE workflow IS NULL
+        """,
+        (_LEGACY_ALPACA_WORKFLOW_LABEL,),
+    )
     # Older reconcilers used an exact fragment in the shared free-form notes as
     # executable state. Promote interrupted closed-shortfall repairs before any
     # later diagnostic can replace or sanitize that note.
@@ -4687,7 +4755,7 @@ def strategy_config_fingerprint(
         profit_target_values,
     )
     payload = {
-        "schema_version": STRATEGY_STATE_SCHEMA_VERSION,
+        "schema_version": STRATEGY_SEMANTICS_VERSION,
         "rsi_entry_rule": rsi_entry_rule,
         "backtest": _normalized_backtest_fingerprint_payload(base_cfg),
         "buy_rsi_values": sorted({_canonical_fingerprint_float(value) for value in normalized_buy_rsi}),
@@ -5157,6 +5225,153 @@ def _zero_trade_rollup_is_semantically_valid(
     )
 
 
+def _trusted_strategy_rows_match_config(
+    conn: sqlite3.Connection,
+    asset_symbol: str,
+    signal_symbol: str,
+    expected_pairs: set[tuple[float, float]],
+    states_by_pair: dict[tuple[float, float], tuple],
+    summaries_by_pair: dict[tuple[float, float], tuple],
+    expected_initial_capital: float,
+) -> bool:
+    """Authenticate protected compact rows without replaying generated math."""
+    shared_chronology: tuple[str, str, int, int] | None = None
+    state_semantics_cache: dict[tuple[object, ...], bool] = {}
+    centered_moments_cache: dict[tuple[object, ...], bool] = {}
+    positive_return_cache: dict[tuple[object, ...], bool] = {}
+    for config_pair in expected_pairs:
+        state_row = states_by_pair[config_pair]
+        summary_row = summaries_by_pair[config_pair]
+        if not _strategy_state_integrity_row_is_valid(
+            state_row,
+            asset_symbol=asset_symbol,
+            signal_symbol=signal_symbol,
+        ):
+            return False
+        state = _strategy_state_from_row(
+            (
+                state_row[2],
+                state_row[3],
+                state_row[5],
+                state_row[7],
+                state_row[8],
+                state_row[9],
+                state_row[10],
+                state_row[11],
+                state_row[6],
+                state_row[4],
+            )
+        )
+        state_semantics_key = tuple(state.values())
+        state_is_valid = state_semantics_cache.get(state_semantics_key)
+        if state_is_valid is None:
+            state_is_valid = _strategy_state_is_semantically_valid(conn, asset_symbol, state)
+            state_semantics_cache[state_semantics_key] = state_is_valid
+        if not state_is_valid:
+            return False
+
+        state_start, state_end = state_row[2:4]
+        summary_start, summary_end, trading_days, summary_trades = summary_row[2:6]
+        state_trades = state_row[4]
+        return_count = summary_row[9]
+        excess_return_count = summary_row[12]
+        positive_return_count = summary_row[15]
+        if any(value is None for value in summary_row[6:21]):
+            return False
+        if (
+            state_start is None
+            or state_end is None
+            or str(state_start) != str(summary_start)
+            or str(state_end) != str(summary_end)
+            or state_trades != summary_trades
+            or float(summary_row[6]) != expected_initial_capital
+            or float(state_row[6]) != float(summary_row[7])
+            or trading_days < 1
+            or return_count + 1 != trading_days
+            or state_trades > 2 * return_count
+            or excess_return_count > return_count
+            or positive_return_count > return_count
+        ):
+            return False
+        return_moments_key = (
+            return_count,
+            summary_row[10],
+            summary_row[11],
+            summary_row[17],
+            summary_row[18],
+        )
+        excess_moments_key = (
+            excess_return_count,
+            summary_row[13],
+            summary_row[14],
+            summary_row[19],
+            summary_row[20],
+        )
+        return_moments_match = centered_moments_cache.get(return_moments_key)
+        if return_moments_match is None:
+            return_moments_match = _persisted_centered_moments_are_consistent(*return_moments_key)
+            centered_moments_cache[return_moments_key] = return_moments_match
+        excess_moments_match = centered_moments_cache.get(excess_moments_key)
+        if excess_moments_match is None:
+            excess_moments_match = _persisted_centered_moments_are_consistent(*excess_moments_key)
+            centered_moments_cache[excess_moments_key] = excess_moments_match
+        if not return_moments_match or not excess_moments_match:
+            return False
+        positive_return_key = (
+            return_count,
+            summary_row[10],
+            summary_row[11],
+            positive_return_count,
+        )
+        positive_return_is_feasible = positive_return_cache.get(positive_return_key)
+        if positive_return_is_feasible is None:
+            positive_return_is_feasible = _positive_return_count_is_feasible(
+                return_count,
+                float(summary_row[10]),
+                float(summary_row[11]),
+                positive_return_count,
+            )
+            positive_return_cache[positive_return_key] = positive_return_is_feasible
+        if not positive_return_is_feasible:
+            return False
+        if state_trades == 0 and (
+            float(state_row[5]) != float(state_row[6])
+            or float(summary_row[6]) != float(state_row[6])
+            or float(summary_row[7]) != float(state_row[6])
+            or float(summary_row[8]) != float(state_row[6])
+            or positive_return_count != 0
+            or float(summary_row[10]) != 0.0
+            or float(summary_row[11]) != 0.0
+            or float(summary_row[16]) != 0.0
+            or float(summary_row[17]) != 0.0
+            or float(summary_row[18]) != 0.0
+        ):
+            return False
+        chronology = (str(state_start), str(state_end), int(trading_days), int(return_count))
+        if shared_chronology is None:
+            shared_chronology = chronology
+        elif chronology != shared_chronology:
+            return False
+
+    if shared_chronology is None:
+        return False
+    start_date, end_date, trading_days, _return_count = shared_chronology
+    persisted_window = conn.execute(
+        """
+        SELECT MIN(date), MAX(date), COUNT(*)
+        FROM market_data
+        WHERE symbol = ? AND date BETWEEN ? AND ?
+        """,
+        (asset_symbol, start_date, end_date),
+    ).fetchone()
+    return bool(
+        persisted_window is not None
+        and persisted_window[0] == start_date
+        and persisted_window[1] == end_date
+        and int(persisted_window[2]) == trading_days
+    )
+
+
 def _strategy_rows_match_config(
     conn: sqlite3.Connection,
     asset_symbol: str,
@@ -5165,7 +5380,10 @@ def _strategy_rows_match_config(
     *,
     base_cfg: BacktestConfig,
     rsi_entry_rule: str,
+    strategy_state_verification: StrategyStateVerification = "trusted",
 ) -> bool:
+    if strategy_state_verification not in {"trusted", "canonical"}:
+        raise ValueError("strategy_state_verification must be 'trusted' or 'canonical'.")
     try:
         expected_initial_capital = float(base_cfg.initial_capital)
     except (TypeError, ValueError, OverflowError):
@@ -5202,17 +5420,28 @@ def _strategy_rows_match_config(
     # Authentication must precede tuple-key coercion, rollup construction, and
     # ranking-metric validation.  A legacy NULL digest or any coordinated
     # mutation therefore fails closed into the caller's full rebuild path.
-    if any(
-        not _strategy_summary_integrity_row_is_valid(row)
-        or not _strategy_summary_validation_row_is_semantically_valid(_strategy_summary_validation_row(row))
-        for row in summary_rows
-    ):
+    if any(not _strategy_summary_integrity_row_is_valid(row) for row in summary_rows):
         return False
     summaries_by_pair = {(row[2], row[3]): _strategy_summary_validation_row(row) for row in summary_rows}
     if len(summaries_by_pair) != len(summary_rows):
         return False
     summary_pairs = set(summaries_by_pair)
     if summary_pairs != expected_pairs:
+        return False
+    if strategy_state_verification == "trusted":
+        return _trusted_strategy_rows_match_config(
+            conn,
+            asset_symbol,
+            signal_symbol,
+            expected_pairs,
+            states_by_pair,
+            summaries_by_pair,
+            expected_initial_capital,
+        )
+    if any(
+        not _strategy_summary_validation_row_is_semantically_valid(summary_row)
+        for summary_row in summaries_by_pair.values()
+    ):
         return False
 
     session_windows: dict[tuple[str, str], tuple[str | None, str | None, int]] = {}
@@ -5352,26 +5581,27 @@ def _strategy_rows_match_config(
             expected_metrics = None if persisted_rollup is None else _rollup_metrics(persisted_rollup)
         except (TypeError, ValueError, OverflowError):
             return False
-        replay_window = (str(state_start_date), str(state_last_date))
-        if replay_window not in canonical_replays:
-            canonical_replays[replay_window] = _canonical_strategy_grid_replay(
-                conn,
-                asset_symbol=asset_symbol,
-                signal_symbol=signal_symbol,
-                config_pairs=sorted(expected_pairs),
-                base_cfg=base_cfg,
-                start_date=replay_window[0],
-                end_date=replay_window[1],
-                rsi_entry_rule=rsi_entry_rule,
-            )
-        canonical_replay = canonical_replays[replay_window]
-        expected_replay = None if canonical_replay is None else canonical_replay.get(config_pair)
-        if (
-            expected_replay is None
-            or not _strategy_states_exactly_match(state, expected_replay[0])
-            or persisted_rollup != expected_replay[1]
-        ):
-            return False
+        if strategy_state_verification == "canonical":
+            replay_window = (str(state_start_date), str(state_last_date))
+            if replay_window not in canonical_replays:
+                canonical_replays[replay_window] = _canonical_strategy_grid_replay(
+                    conn,
+                    asset_symbol=asset_symbol,
+                    signal_symbol=signal_symbol,
+                    config_pairs=sorted(expected_pairs),
+                    base_cfg=base_cfg,
+                    start_date=replay_window[0],
+                    end_date=replay_window[1],
+                    rsi_entry_rule=rsi_entry_rule,
+                )
+            canonical_replay = canonical_replays[replay_window]
+            expected_replay = None if canonical_replay is None else canonical_replay.get(config_pair)
+            if (
+                expected_replay is None
+                or not _strategy_states_exactly_match(state, expected_replay[0])
+                or persisted_rollup != expected_replay[1]
+            ):
+                return False
         if expected_metrics is None or any(
             not _persisted_derived_metric_matches(stored_value, expected_metrics[metric_name])
             for stored_value, metric_name in zip(
@@ -5514,6 +5744,8 @@ def strategy_state_matches_config(
     buy_rsi_values: list[float],
     profit_target_values: list[float],
     rsi_entry_rule: str = "lower",
+    *,
+    strategy_state_verification: StrategyStateVerification = "trusted",
 ) -> bool:
     """Whether persisted state exactly matches the requested simulation setup."""
     rsi_entry_rule_code(rsi_entry_rule)
@@ -5545,6 +5777,7 @@ def strategy_state_matches_config(
         expected_pairs,
         base_cfg=base_cfg,
         rsi_entry_rule=rsi_entry_rule,
+        strategy_state_verification=strategy_state_verification,
     )
 
 
@@ -5610,6 +5843,118 @@ def _market_values_differ(
     return abs(existing_value - incoming_value) > 1e-12 + 1e-12 * abs(incoming_value)
 
 
+_ADJUSTED_PRICE_RATIO_NOISE_TOLERANCE = 3e-6
+_ADJUSTED_PRICE_RATIO_SPREAD_TOLERANCE = 1e-12
+
+
+def _market_candle_values_differ(
+    existing_values: Sequence[object],
+    incoming_values: Sequence[object],
+) -> bool:
+    """Distinguish exact candle corrections from Yahoo adjustment-factor noise.
+
+    Yahoo's unadjusted OHLCV values are stable, but repeated complete-history
+    requests can return an adjusted-close factor a few parts per million apart.
+    yfinance applies that factor uniformly to all four price fields, producing
+    hundreds of thousands of representational changes on every run.  Retain
+    the already authenticated candle only when every OHLC field moved by the
+    same tiny ratio.  This preserves its exact downstream floating-point
+    results while still detecting an adjacent change to any individual price,
+    a tick-boundary change, volume correction, or material adjustment revision.
+    """
+    if len(existing_values) != len(_MARKET_DATA_FIELDS) or len(incoming_values) != len(_MARKET_DATA_FIELDS):
+        raise ValueError("Market candle comparisons require complete OHLCV values.")
+
+    if _market_values_differ(existing_values[-1], incoming_values[-1], "Volume"):
+        return True
+    price_changes = [
+        _market_values_differ(existing, incoming, field)
+        for field, existing, incoming in zip(
+            _MARKET_DATA_FIELDS[:-1],
+            existing_values[:-1],
+            incoming_values[:-1],
+            strict=True,
+        )
+    ]
+    if not any(price_changes):
+        return False
+    if not all(price_changes):
+        return True
+
+    existing_prices: list[float] = []
+    incoming_prices: list[float] = []
+    for existing, incoming in zip(existing_values[:-1], incoming_values[:-1], strict=True):
+        if existing is None or incoming is None or pd.isna(existing) or pd.isna(incoming):
+            return True
+        existing_value = float(existing)
+        incoming_value = float(incoming)
+        if (
+            not math.isfinite(existing_value)
+            or not math.isfinite(incoming_value)
+            or existing_value <= 0
+            or incoming_value <= 0
+        ):
+            return True
+        existing_prices.append(existing_value)
+        incoming_prices.append(incoming_value)
+
+    ratios = [incoming / existing for existing, incoming in zip(existing_prices, incoming_prices, strict=True)]
+    coherent_adjustment_noise = bool(
+        max(abs(ratio - 1.0) for ratio in ratios) <= _ADJUSTED_PRICE_RATIO_NOISE_TOLERANCE
+        and max(ratios) - min(ratios) <= _ADJUSTED_PRICE_RATIO_SPREAD_TOLERANCE
+    )
+    return not coherent_adjustment_noise
+
+
+def _market_candle_change_mask(
+    existing_rows: Sequence[Sequence[object]],
+    incoming_rows: Sequence[Sequence[object]],
+) -> tuple[bool, ...]:
+    """Vectorize exact/coherent candle comparisons for complete histories."""
+    if len(existing_rows) != len(incoming_rows):
+        raise ValueError("Market candle comparison batches must have equal lengths.")
+    if not existing_rows:
+        return ()
+    try:
+        existing = np.asarray(existing_rows, dtype=np.float64)
+        incoming = np.asarray(incoming_rows, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError):
+        return tuple(
+            _market_candle_values_differ(old, new) for old, new in zip(existing_rows, incoming_rows, strict=True)
+        )
+    expected_shape = (len(existing_rows), len(_MARKET_DATA_FIELDS))
+    if existing.shape != expected_shape or incoming.shape != expected_shape:
+        return tuple(
+            _market_candle_values_differ(old, new) for old, new in zip(existing_rows, incoming_rows, strict=True)
+        )
+
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        same = (existing == incoming) | (np.isnan(existing) & np.isnan(incoming))
+        price_changes = ~same[:, :-1]
+        prices_are_positive_finite = np.all(
+            np.isfinite(existing[:, :-1])
+            & np.isfinite(incoming[:, :-1])
+            & (existing[:, :-1] > 0.0)
+            & (incoming[:, :-1] > 0.0),
+            axis=1,
+        )
+        ratios = incoming[:, :-1] / existing[:, :-1]
+        coherent_adjustment_noise = (
+            np.all(price_changes, axis=1)
+            & prices_are_positive_finite
+            & (np.max(np.abs(ratios - 1.0), axis=1) <= _ADJUSTED_PRICE_RATIO_NOISE_TOLERANCE)
+            & (np.max(ratios, axis=1) - np.min(ratios, axis=1) <= _ADJUSTED_PRICE_RATIO_SPREAD_TOLERANCE)
+        )
+        material_price_change = np.any(price_changes, axis=1) & ~coherent_adjustment_noise
+
+        volume_same = same[:, -1]
+        volumes_are_finite = np.isfinite(existing[:, -1]) & np.isfinite(incoming[:, -1])
+        material_volume_change = ~volume_same & (
+            ~volumes_are_finite | (np.abs(existing[:, -1] - incoming[:, -1]) > 1e-12 + 1e-12 * np.abs(incoming[:, -1]))
+        )
+    return tuple(bool(value) for value in material_price_change | material_volume_change)
+
+
 def _revised_market_symbols(
     conn: sqlite3.Connection,
     data: pd.DataFrame,
@@ -5641,19 +5986,7 @@ def _revised_market_symbols(
             if existing is None:
                 continue
             incoming = [row.get(f"{symbol}_{field}") for field in _MARKET_DATA_FIELDS]
-            if any(
-                _market_values_differ(
-                    old,
-                    new,
-                    field,
-                )
-                for field, old, new in zip(
-                    _MARKET_DATA_FIELDS,
-                    existing,
-                    incoming,
-                    strict=True,
-                )
-            ):
+            if _market_candle_values_differ(existing, incoming):
                 revised_symbols.add(symbol)
                 break
     return revised_symbols
@@ -5828,6 +6161,68 @@ def _market_history_values(
     return values_by_date
 
 
+def _safe_market_history_tail_rows(
+    conn: sqlite3.Connection,
+    data: pd.DataFrame,
+    symbol: str,
+) -> dict[str, tuple[object, ...]] | None:
+    """Return append-only rows when a complete history cannot revise prior inputs."""
+    existing_by_date = {
+        str(row[0]): row[1:]
+        for row in conn.execute(
+            """
+            SELECT date, open, high, low, close, volume
+            FROM market_data
+            WHERE symbol = ?
+            """,
+            (symbol,),
+        ).fetchall()
+    }
+    incoming_by_date = _market_history_values(data, symbol)
+    existing_dates = set(existing_by_date)
+    incoming_dates = set(incoming_by_date)
+    if existing_dates.difference(incoming_dates):
+        return None
+    common_dates = sorted(existing_dates)
+    if any(
+        _market_candle_change_mask(
+            [existing_by_date[date] for date in common_dates],
+            [incoming_by_date[date] for date in common_dates],
+        )
+    ):
+        return None
+    new_dates = incoming_dates.difference(existing_dates)
+    if not new_dates:
+        return {}
+    prior_tail = max(existing_dates, default=None)
+    if prior_tail is None or any(date <= prior_tail for date in new_dates):
+        return None
+    if symbol != RISK_FREE_SYMBOL and _signal_additions_affect_processed_inputs(
+        conn,
+        symbol,
+        new_dates,
+    ):
+        # A weekend or otherwise leading signal observation can change the
+        # pending action attached to the already-processed final asset row.
+        return None
+    if symbol in _historically_added_market_symbols(
+        conn,
+        data,
+        [symbol],
+    ):
+        return None
+    return {date: incoming_by_date[date] for date in new_dates}
+
+
+def _market_history_is_unchanged_or_safe_tail(
+    conn: sqlite3.Connection,
+    data: pd.DataFrame,
+    symbol: str,
+) -> bool:
+    """Recognize a complete history that cannot revise processed inputs."""
+    return _safe_market_history_tail_rows(conn, data, symbol) is not None
+
+
 def _synchronize_market_data_history(
     conn: sqlite3.Connection,
     data: pd.DataFrame,
@@ -5861,22 +6256,18 @@ def _synchronize_market_data_history(
     incoming_by_date = _market_history_values(data, symbol)
     existing_dates = set(existing_by_date)
     incoming_dates = set(incoming_by_date)
+    common_dates = sorted(existing_dates.intersection(incoming_dates))
     changed_dates = {
         date
-        for date in existing_dates.intersection(incoming_dates)
-        if any(
-            _market_values_differ(
-                existing,
-                incoming,
-                field,
-            )
-            for field, existing, incoming in zip(
-                _MARKET_DATA_FIELDS,
-                existing_by_date[date],
-                incoming_by_date[date],
-                strict=True,
-            )
+        for date, changed in zip(
+            common_dates,
+            _market_candle_change_mask(
+                [existing_by_date[date] for date in common_dates],
+                [incoming_by_date[date] for date in common_dates],
+            ),
+            strict=True,
         )
+        if changed
     }
     new_dates = incoming_dates.difference(existing_dates)
     removed_dates = existing_dates.difference(incoming_dates)
@@ -5998,12 +6389,14 @@ def save_rsi_values(
             signal_symbol,
             rsi_period,
             _date_str(date),
-            float(row["close"]),
-            None if pd.isna(row["avg_gain"]) else float(row["avg_gain"]),
-            None if pd.isna(row["avg_loss"]) else float(row["avg_loss"]),
-            None if pd.isna(row["rsi"]) else float(row["rsi"]),
+            float(close),
+            None if pd.isna(avg_gain) else float(avg_gain),
+            None if pd.isna(avg_loss) else float(avg_loss),
+            None if pd.isna(rsi) else float(rsi),
         )
-        for date, row in details.iterrows()
+        for date, close, avg_gain, avg_loss, rsi in details.loc[:, ["close", "avg_gain", "avg_loss", "rsi"]].itertuples(
+            index=True, name=None
+        )
     ]
     conn.executemany(
         """
@@ -6184,7 +6577,11 @@ def ensure_rsi_values(
     rsi_period: int,
     close: pd.Series,
     rebuild: bool,
+    *,
+    trusted_cache: bool = False,
 ) -> pd.Series:
+    if type(trusted_cache) is not bool:
+        raise ValueError("trusted_cache must be a boolean.")
     close = close.dropna().sort_index()
     if close.empty:
         return pd.Series(dtype=float)
@@ -6202,24 +6599,42 @@ def ensure_rsi_values(
         return rebuild_values()
 
     requested_last_date = _date_str(close.index[-1])
-    all_cached_rows = conn.execute(
-        """
-        SELECT date, close, avg_gain, avg_loss, rsi
-        FROM rsi_values
-        WHERE signal_symbol = ?
-          AND rsi_period = ?
-        ORDER BY date
-        """,
-        (signal_symbol, rsi_period),
-    ).fetchall()
-    cached_rows = [row for row in all_cached_rows if str(row[0]) <= requested_last_date]
-    if not all_cached_rows or not _rsi_cache_rows_are_valid(
-        cached_rows,
-        close,
-        rsi_period,
-        cache_last_date=str(all_cached_rows[-1][0]),
-    ):
-        return rebuild_values()
+    if trusted_cache:
+        cache_summary = conn.execute(
+            """
+            SELECT COUNT(*), MIN(date), MAX(date)
+            FROM rsi_values
+            WHERE signal_symbol = ? AND rsi_period = ?
+            """,
+            (signal_symbol, rsi_period),
+        ).fetchone()
+        cached_count = 0 if cache_summary is None else int(cache_summary[0])
+        cache_is_canonical_prefix = bool(
+            0 < cached_count <= len(close)
+            and str(cache_summary[1]) == _date_str(close.index[0])
+            and str(cache_summary[2]) == _date_str(close.index[cached_count - 1])
+        )
+        if not cache_is_canonical_prefix:
+            return rebuild_values()
+    else:
+        all_cached_rows = conn.execute(
+            """
+            SELECT date, close, avg_gain, avg_loss, rsi
+            FROM rsi_values
+            WHERE signal_symbol = ?
+              AND rsi_period = ?
+            ORDER BY date
+            """,
+            (signal_symbol, rsi_period),
+        ).fetchall()
+        cached_rows = [row for row in all_cached_rows if str(row[0]) <= requested_last_date]
+        if not all_cached_rows or not _rsi_cache_rows_are_valid(
+            cached_rows,
+            close,
+            rsi_period,
+            cache_last_date=str(all_cached_rows[-1][0]),
+        ):
+            return rebuild_values()
 
     last = pd.read_sql_query(
         """
@@ -6236,6 +6651,15 @@ def ensure_rsi_values(
         return rebuild_values()
 
     last_date = pd.Timestamp(last.loc[0, "date"])
+    if trusted_cache:
+        cached_close = last.loc[0, "close"]
+        expected_close = close.loc[last_date] if last_date in close.index else None
+        try:
+            cached_close_matches = float(cached_close) == float(expected_close)
+        except (TypeError, ValueError, OverflowError):
+            cached_close_matches = False
+        if not cached_close_matches:
+            return rebuild_values()
     new_close = close[close.index > last_date]
     if new_close.empty:
         return load_rsi_series_for_dates(conn, signal_symbol, rsi_period, close.index)
@@ -7683,6 +8107,13 @@ def _optional_loaded_managed_value(value: object) -> object | None:
 
 def _validate_loaded_managed_position_intents(frame: pd.DataFrame) -> pd.DataFrame:
     """Reject post-initialization corruption before broker reconciliation sees it."""
+    for position in frame.to_dict("records"):
+        try:
+            alpaca_managed_position_asset_ids(position)
+        except ValueError as exc:
+            raise ValueError(
+                f"Managed Alpaca position {int(position['id'])} contains invalid durable asset-ID history."
+            ) from exc
     intent_columns = [
         "id",
         "buy_order_qty",
@@ -7760,7 +8191,8 @@ def load_alpaca_managed_positions(conn: sqlite3.Connection, *, active_only: bool
     where = "WHERE closed_at IS NULL" if active_only else ""
     frame = pd.read_sql_query(
         f"""
-        SELECT id, state_revision, workflow, symbol, alpaca_asset_id, signal_symbol,
+        SELECT id, state_revision, workflow, symbol, alpaca_asset_id,
+               prior_alpaca_asset_ids, signal_symbol,
                buy_rsi, profit_target_multiple,
                buy_signal_date, buy_client_order_id, buy_alpaca_order_id,
                buy_submitted_at, buy_order_qty, buy_order_limit_price,
@@ -7804,7 +8236,8 @@ def load_recently_closed_alpaca_managed_positions(
         raise ValueError("Managed Alpaca closed-position audit limit must be at least one.")
     frame = pd.read_sql_query(
         f"""
-        SELECT id, state_revision, workflow, symbol, alpaca_asset_id, signal_symbol,
+        SELECT id, state_revision, workflow, symbol, alpaca_asset_id,
+               prior_alpaca_asset_ids, signal_symbol,
                buy_rsi, profit_target_multiple,
                buy_signal_date, buy_client_order_id, buy_alpaca_order_id,
                buy_submitted_at, buy_order_qty, buy_order_limit_price,
@@ -9119,7 +9552,8 @@ def apply_alpaca_closed_position_broker_correction(
 
         identity = conn.execute(
             """
-            SELECT symbol, alpaca_asset_id, buy_order_qty, buy_order_limit_price,
+            SELECT symbol, alpaca_asset_id, prior_alpaca_asset_ids,
+                   buy_order_qty, buy_order_limit_price,
                    buy_alpaca_order_id, buy_status, filled_qty, filled_avg_price, filled_at,
                    target_sell_price, buy_observation_broker_updated_at,
                    buy_fill_broker_updated_at,
@@ -9137,6 +9571,7 @@ def apply_alpaca_closed_position_broker_correction(
         (
             symbol,
             persisted_asset_id,
+            persisted_prior_asset_ids,
             persisted_buy_qty,
             persisted_buy_limit_price,
             persisted_buy_alpaca_order_id,
@@ -9163,12 +9598,20 @@ def apply_alpaca_closed_position_broker_correction(
             persisted_asset_id,
             field_name="Persisted corrected managed Alpaca position asset ID",
         )
+        accepted_asset_ids = frozenset(
+            alpaca_managed_position_asset_ids(
+                {
+                    "alpaca_asset_id": persisted_asset_id,
+                    "prior_alpaca_asset_ids": persisted_prior_asset_ids,
+                }
+            )
+        )
         persisted_buy_observation_broker_updated_at = _normalize_alpaca_broker_timestamp(
             None
             if persisted_buy_observation_broker_updated_at is None
             else str(persisted_buy_observation_broker_updated_at)
         )
-        if persisted_asset_id is not None and str(persisted_asset_id) != observed_asset_id:
+        if persisted_asset_id is not None and observed_asset_id not in accepted_asset_ids:
             raise ValueError("Corrected Alpaca asset ID conflicts with immutable managed state.")
         persisted_buy_causality_issue = _managed_buy_fill_causality_issue(
             buy_order_qty=(immutable_buy_qty if persisted_buy_qty is None else persisted_buy_qty),
@@ -9780,6 +10223,12 @@ def apply_alpaca_closed_position_broker_correction(
             raise ValueError("Corrected cumulative Alpaca sell accounting must remain finite and non-negative.")
         remaining_qty = effective_buy_qty - sold_qty
         sell_avg_price = sold_value / sold_qty if sold_qty > 0 else None
+        # A zero-fill buy with no sells has no parent accounting basis. Keep
+        # its optional aggregates unmaterialized so the correction remains
+        # equivalent to a never-filled order and passes the startup audit.
+        parent_accounting_is_materialized = effective_buy_qty > 0.0 or sold_qty > 0.0
+        parent_sell_filled_qty = sold_qty if parent_accounting_is_materialized else None
+        parent_remaining_qty = remaining_qty if parent_accounting_is_materialized else None
         residual_is_negligible = _managed_accounting_residual_is_negligible(
             remaining_qty,
             quantity_scale=max(abs(remaining_qty), effective_buy_qty, sold_qty),
@@ -9927,14 +10376,14 @@ def apply_alpaca_closed_position_broker_correction(
                 effective_buy_causality_quarantine,
                 effective_target_sell_price,
                 sell_status,
-                sold_qty,
+                parent_sell_filled_qty,
                 sell_avg_price,
                 effective_sell_filled_at,
                 int(reopen and normalized_sell_renewal_requested_at is not None),
                 normalized_sell_renewal_requested_at,
                 sold_qty,
                 sold_value,
-                remaining_qty,
+                parent_remaining_qty,
                 realized_pl,
                 realized_pl_pct,
                 int(reopen),
@@ -10149,6 +10598,125 @@ def adopt_alpaca_managed_position_asset_if_current(
     # identity conflict represented by the ``None`` return value above.
     _commit_owned_transaction(conn)
     return row
+
+
+def rekey_alpaca_managed_position_asset_if_current(
+    conn: sqlite3.Connection,
+    position_id: int,
+    *,
+    expected_state_revision: int,
+    expected_symbol: str,
+    expected_alpaca_asset_id: str,
+    successor_alpaca_asset_id: str,
+    commit: bool = True,
+) -> int | None:
+    """Replace an active asset ID while preserving the broker's prior identity."""
+    normalized_symbol = _canonical_managed_symbol(
+        expected_symbol,
+        field_name="Managed Alpaca asset rekey symbol",
+    )
+    prior_asset_id = _canonical_alpaca_asset_id(
+        expected_alpaca_asset_id,
+        field_name="Managed Alpaca asset rekey prior asset ID",
+    )
+    successor_asset_id = _canonical_alpaca_asset_id(
+        successor_alpaca_asset_id,
+        field_name="Managed Alpaca asset rekey successor asset ID",
+    )
+    if prior_asset_id == successor_asset_id:
+        raise ValueError("Managed Alpaca asset rekey requires a distinct successor asset ID.")
+    if expected_state_revision < 0:
+        raise ValueError("Managed Alpaca asset rekey requires a non-negative state revision.")
+
+    with _managed_accounting_composite_savepoint(
+        conn,
+        "rekey_alpaca_managed_position_asset_if_current",
+    ):
+        row = conn.execute(
+            """
+            SELECT symbol, alpaca_asset_id, prior_alpaca_asset_ids
+            FROM alpaca_managed_positions
+            WHERE id = ? AND state_revision = ? AND closed_at IS NULL
+              AND symbol = ? AND alpaca_asset_id = ?
+            """,
+            (
+                position_id,
+                expected_state_revision,
+                normalized_symbol,
+                prior_asset_id,
+            ),
+        ).fetchone()
+        if row is None:
+            new_revision = None
+        else:
+            asset_ids = alpaca_managed_position_asset_ids(
+                {
+                    "alpaca_asset_id": row[1],
+                    "prior_alpaca_asset_ids": row[2],
+                }
+            )
+            if successor_asset_id in asset_ids:
+                raise ValueError("Managed Alpaca asset rekey would reuse a prior asset ID.")
+            successor_collision = any(
+                other_id != position_id
+                and successor_asset_id
+                in alpaca_managed_position_asset_ids(
+                    {
+                        "alpaca_asset_id": other_asset_id,
+                        "prior_alpaca_asset_ids": other_prior_asset_ids,
+                    }
+                )
+                for other_id, other_asset_id, other_prior_asset_ids in conn.execute(
+                    """
+                    SELECT id, alpaca_asset_id, prior_alpaca_asset_ids
+                    FROM alpaca_managed_positions
+                    WHERE closed_at IS NULL
+                    """
+                ).fetchall()
+            )
+            if successor_collision:
+                new_revision = None
+            else:
+                prior_history = list(asset_ids[1:])
+                prior_history.append(prior_asset_id)
+                cursor = conn.execute(
+                    """
+                    UPDATE alpaca_managed_positions
+                    SET state_revision = state_revision + 1,
+                        alpaca_asset_id = ?,
+                        prior_alpaca_asset_ids = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND state_revision = ? AND closed_at IS NULL
+                      AND symbol = ? AND alpaca_asset_id = ?
+                    RETURNING state_revision
+                    """,
+                    (
+                        successor_asset_id,
+                        json.dumps(prior_history, separators=(",", ":")),
+                        position_id,
+                        expected_state_revision,
+                        normalized_symbol,
+                        prior_asset_id,
+                    ),
+                )
+                returned = cursor.fetchone()
+                new_revision = None if returned is None else int(returned[0])
+                if new_revision is not None:
+                    conn.executemany(
+                        """
+                        INSERT INTO alpaca_symbol_aliases (alpaca_asset_id, symbol)
+                        VALUES (?, ?)
+                        ON CONFLICT(alpaca_asset_id, symbol) DO UPDATE SET
+                            last_seen_at = CURRENT_TIMESTAMP
+                        """,
+                        (
+                            (prior_asset_id, normalized_symbol),
+                            (successor_asset_id, normalized_symbol),
+                        ),
+                    )
+    if commit:
+        _commit_owned_transaction(conn)
+    return new_revision
 
 
 def migrate_alpaca_managed_position_symbol(
@@ -12988,7 +13556,14 @@ def claim_alpaca_managed_sell_submission_retry_with_revision(
           AND sell_alpaca_order_id IS NULL
           AND closed_at IS NULL
           AND LOWER(sell_status) IN
-              ('submission_pending', 'submission_unknown', 'submission_not_found', 'submission_retrying')
+              (
+                'broker_inactive',
+                'submission_failed',
+                'submission_pending',
+                'submission_unknown',
+                'submission_not_found',
+                'submission_retrying'
+              )
           AND (
                 sell_submission_retry_claimed_at IS NULL
                 OR julianday(sell_submission_retry_claimed_at) IS NULL
@@ -15654,15 +16229,21 @@ def load_best_strategy_summary(
     asset_symbol: str,
     signal_symbol: str,
     rsi_entry_rule: str = "lower",
+    *,
+    strategy_state_preverified: bool = False,
 ) -> dict[str, object] | None:
-    """Load the best row only when every candidate summary authenticates."""
+    """Load the best authentic row after optional prior full-grid verification."""
+    if type(strategy_state_preverified) is not bool:
+        raise ValueError("strategy_state_preverified must be a boolean.")
     order_by = best_strategy_order_by_clause(rsi_entry_rule)
+    row_limit = "LIMIT 1" if strategy_state_preverified else ""
     rows = conn.execute(
         f"""
         SELECT {_STRATEGY_SUMMARY_INTEGRITY_COLUMN_SQL}, integrity_digest
         FROM strategy_summary
         WHERE asset_symbol = ? AND signal_symbol = ?
         ORDER BY {order_by}
+        {row_limit}
         """,
         (asset_symbol, signal_symbol),
     ).fetchall()
@@ -15693,6 +16274,88 @@ def _best_summary_config(
     if row is None:
         return None
     return float(row["buy_rsi"]), float(row["profit_target_multiple"])
+
+
+def _best_summary_config_from_validated_rows(
+    rows: list[tuple],
+    rsi_entry_rule: str,
+) -> tuple[float, float] | None:
+    """Apply SQLite's exact shared ranking order to in-memory summary rows."""
+    if not rows:
+        return None
+    entry_rule_code = rsi_entry_rule_code(rsi_entry_rule)
+
+    def descending_optional(value: object) -> tuple[bool, float]:
+        if value is None:
+            return True, 0.0
+        return False, -float(value)
+
+    def ranking_key(row: tuple) -> tuple:
+        return (
+            *descending_optional(row[11]),
+            *descending_optional(row[8]),
+            *descending_optional(row[9]),
+            -float(row[2]) if entry_rule_code == RSI_ENTRY_UPPER else float(row[2]),
+            float(row[3]),
+        )
+
+    best = min(rows, key=ranking_key)
+    return float(best[2]), float(best[3])
+
+
+def _save_fresh_best_equity_curve(
+    conn: sqlite3.Connection,
+    *,
+    base_cfg: BacktestConfig,
+    asset_symbol: str,
+    signal_symbol: str,
+    buy_rsi: float,
+    profit_target_multiple: float,
+    rsi_entry_rule: str,
+    date_strings: list[str],
+    open_prices: np.ndarray,
+    high_prices: np.ndarray,
+    close_prices: np.ndarray,
+    rsi_values: np.ndarray,
+    risk_free_returns: np.ndarray,
+) -> None:
+    """Compute and persist only the winning curve for a fresh grid."""
+    (
+        equity_values,
+        daily_returns,
+        curve_risk_free_returns,
+        in_position_values,
+        action_executed_values,
+        pending_action_values,
+        trades_executed_values,
+        *_state_values,
+    ) = run_single_equity_curve(
+        open_prices,
+        high_prices,
+        close_prices,
+        rsi_values,
+        risk_free_returns,
+        buy_rsi,
+        profit_target_multiple,
+        base_cfg.initial_capital,
+        _trading_cost_rate(base_cfg),
+        rsi_entry_rule_code(rsi_entry_rule),
+    )
+    records = _equity_records_from_arrays(
+        date_strings=date_strings,
+        asset_symbol=asset_symbol,
+        signal_symbol=signal_symbol,
+        buy_rsi=buy_rsi,
+        profit_target_multiple=profit_target_multiple,
+        equity_values=equity_values,
+        daily_returns=daily_returns,
+        risk_free_returns=curve_risk_free_returns,
+        in_position_values=in_position_values,
+        action_executed_values=action_executed_values,
+        pending_action_values=pending_action_values,
+        trades_executed_values=trades_executed_values,
+    )
+    save_equity_records(conn, records)
 
 
 def _complete_curve_values_match(first: object, second: object) -> bool:
@@ -15796,7 +16459,10 @@ def _equity_curve_is_complete(
     expected_profit_target_values: list[float] | None = None,
     expected_strategy_fingerprint: str | None = None,
     allow_unbound_backtest_config: bool = False,
+    strategy_state_preverified: bool = False,
 ) -> bool:
+    if type(strategy_state_preverified) is not bool:
+        return False
     if base_cfg is None:
         if (
             not allow_unbound_backtest_config
@@ -15845,7 +16511,7 @@ def _equity_curve_is_complete(
             derived_strategy_fingerprint,
         ):
             return False
-        if not _strategy_rows_match_config(
+        if not strategy_state_preverified and not _strategy_rows_match_config(
             conn,
             asset_symbol,
             signal_symbol,
@@ -15895,9 +16561,10 @@ def _equity_curve_is_complete(
         return False
     summary_row = summary_rows[0]
     summary_validation_row = _strategy_summary_validation_row(summary_row)
-    if not _strategy_summary_integrity_row_is_valid(
-        summary_row
-    ) or not _strategy_summary_validation_row_is_semantically_valid(summary_validation_row):
+    if not _strategy_summary_integrity_row_is_valid(summary_row) or (
+        not strategy_state_preverified
+        and not _strategy_summary_validation_row_is_semantically_valid(summary_validation_row)
+    ):
         return False
     summary = summary_validation_row[2:]
     if any(value is None for value in summary[:19]):
@@ -15920,6 +16587,52 @@ def _equity_curve_is_complete(
         or not 0 <= summary_positive_count <= summary_return_count
     ):
         return False
+
+    if strategy_state_preverified:
+        if equity_rows is None:
+            equity_rows = _strategy_equity_curve_rows(
+                conn,
+                asset_symbol,
+                signal_symbol,
+                buy_rsi,
+                profit_target_multiple,
+            )
+        if any(
+            not _strategy_equity_integrity_row_is_valid(
+                row,
+                asset_symbol=asset_symbol,
+                signal_symbol=signal_symbol,
+                buy_rsi=buy_rsi,
+                profit_target_multiple=profit_target_multiple,
+            )
+            for row in equity_rows
+        ):
+            return False
+        equity_dates = [str(row[0]) for row in equity_rows]
+        if (
+            len(equity_dates) != trading_days
+            or len(set(equity_dates)) != len(equity_dates)
+            or not equity_dates
+            or equity_dates[0] != start_date
+            or equity_dates[-1] != end_date
+            or float(equity_rows[0][1]) != float(summary[4])
+            or float(equity_rows[-1][1]) != float(summary[5])
+            or int(equity_rows[-1][7]) != summary_trades
+        ):
+            return False
+        market_dates = [
+            str(row[0])
+            for row in conn.execute(
+                """
+                SELECT date
+                FROM market_data
+                WHERE symbol = ? AND date BETWEEN ? AND ?
+                ORDER BY date
+                """,
+                (asset_symbol, start_date, end_date),
+            ).fetchall()
+        ]
+        return equity_dates == market_dates
 
     state = load_strategy_state(
         conn,
@@ -16501,6 +17214,7 @@ def load_complete_strategy_equity_curve(
     expected_profit_target_values: list[float] | None = None,
     expected_strategy_fingerprint: str | None = None,
     allow_unbound_backtest_config: bool = False,
+    strategy_state_preverified: bool = False,
 ) -> pd.DataFrame | None:
     """Return the retained curve only when its summary, state, and rows agree."""
     if not conn.in_transaction:
@@ -16518,6 +17232,7 @@ def load_complete_strategy_equity_curve(
                 expected_profit_target_values=expected_profit_target_values,
                 expected_strategy_fingerprint=expected_strategy_fingerprint,
                 allow_unbound_backtest_config=allow_unbound_backtest_config,
+                strategy_state_preverified=strategy_state_preverified,
             )
     equity_rows = _strategy_equity_curve_rows(
         conn,
@@ -16540,6 +17255,7 @@ def load_complete_strategy_equity_curve(
         expected_profit_target_values=expected_profit_target_values,
         expected_strategy_fingerprint=expected_strategy_fingerprint,
         allow_unbound_backtest_config=allow_unbound_backtest_config,
+        strategy_state_preverified=strategy_state_preverified,
     ):
         return None
     equity_df = pd.DataFrame(
@@ -16616,30 +17332,47 @@ def _replace_best_equity_curve(
     buy_rsi: float,
     profit_target_multiple: float,
     rsi_entry_rule: str,
+    *,
+    save_summary: bool = True,
+    append_after: str | None = None,
+    full_data: pd.DataFrame | None = None,
+    canonical_signal_close: pd.Series | None = None,
+    canonical_rsi: pd.Series | None = None,
 ) -> None:
     persisted_signal_symbol = _persisted_strategy_signal_symbol(
         conn,
         asset_symbol,
         signal_symbol,
     )
-    full_data = _load_saved_strategy_market_data(
-        conn,
-        asset_symbol,
-        signal_symbol,
-        persisted_signal_symbol,
-    )
+    if full_data is None:
+        full_data = _load_saved_strategy_market_data(
+            conn,
+            asset_symbol,
+            signal_symbol,
+            persisted_signal_symbol,
+        )
+    # Signal histories can contain weekend observations that intentionally feed
+    # the next asset session. They are RSI inputs, not synthetic trading
+    # sessions, so replay the winning curve only on actual asset rows.
+    asset_columns = [f"{asset_symbol}_{field}" for field in _MARKET_DATA_FIELDS]
+    full_data = full_data.loc[~full_data.loc[:, asset_columns].isna().all(axis=1)]
     if full_data.empty:
         return
 
-    canonical_signal_close = load_saved_close_series(conn, persisted_signal_symbol)
+    if canonical_signal_close is None:
+        canonical_signal_close = load_saved_close_series(conn, persisted_signal_symbol)
     if canonical_signal_close.empty:
         return
-    rsi = ensure_rsi_values(
-        conn,
-        persisted_signal_symbol,
-        base_cfg.rsi_period,
-        canonical_signal_close,
-        rebuild=False,
+    rsi = (
+        canonical_rsi
+        if canonical_rsi is not None
+        else ensure_rsi_values(
+            conn,
+            persisted_signal_symbol,
+            base_cfg.rsi_period,
+            canonical_signal_close,
+            rebuild=False,
+        )
     )
     open_prices, high_prices, close_prices, rsi_values, risk_free_returns = _market_arrays(
         full_data,
@@ -16701,19 +17434,82 @@ def _replace_best_equity_curve(
         pending_action_values=pending_action_values,
         trades_executed_values=trades_executed_values,
     )
-    clear_equity_records(conn, asset_symbol, signal_symbol, buy_rsi, profit_target_multiple)
+    if append_after is None:
+        clear_equity_records(conn, asset_symbol, signal_symbol, buy_rsi, profit_target_multiple)
+    else:
+        records = [record for record in records if str(record["date"]) > append_after]
+        if not records:
+            raise RuntimeError("An incremental winning-curve update produced no new equity rows.")
     save_equity_records(conn, records)
 
-    rollup = _update_summary_rollup(SummaryRollup(), records)
-    save_strategy_summary(
-        conn,
-        asset_symbol,
-        signal_symbol,
-        buy_rsi,
-        profit_target_multiple,
-        state,
-        rollup,
-    )
+    if save_summary:
+        rollup = _update_summary_rollup(SummaryRollup(), records)
+        save_strategy_summary(
+            conn,
+            asset_symbol,
+            signal_symbol,
+            buy_rsi,
+            profit_target_multiple,
+            state,
+            rollup,
+        )
+
+
+def _ensure_complete_best_equity_curve(
+    conn: sqlite3.Connection,
+    *,
+    base_cfg: BacktestConfig,
+    asset_symbol: str,
+    signal_symbol: str,
+    config_pairs: list[tuple[float, float]],
+    rsi_entry_rule: str,
+    deadline_check: Callable[[], None] | None = None,
+) -> None:
+    """Authenticate or reconstruct the retained winner without rerunning its grid."""
+    rebuilt_configs: set[tuple[float, float]] = set()
+    for _ in range(len(set(config_pairs)) + 1):
+        if deadline_check is not None:
+            deadline_check()
+        best_config = _best_summary_config(
+            conn,
+            asset_symbol,
+            signal_symbol,
+            rsi_entry_rule,
+        )
+        if best_config is None:
+            return
+        best_buy_rsi, best_profit_target_multiple = best_config
+        if _equity_curve_is_complete(
+            conn,
+            asset_symbol,
+            signal_symbol,
+            best_buy_rsi,
+            best_profit_target_multiple,
+            rsi_period=base_cfg.rsi_period,
+            rsi_entry_rule=rsi_entry_rule,
+            allow_unbound_backtest_config=True,
+        ):
+            prune_non_best_equity_records(
+                conn,
+                asset_symbol,
+                signal_symbol,
+                best_buy_rsi,
+                best_profit_target_multiple,
+            )
+            return
+        if best_config in rebuilt_configs:
+            raise RuntimeError("Best-strategy equity curve reconstruction did not converge.")
+        rebuilt_configs.add(best_config)
+        _replace_best_equity_curve(
+            conn,
+            base_cfg,
+            asset_symbol,
+            signal_symbol,
+            best_buy_rsi,
+            best_profit_target_multiple,
+            rsi_entry_rule,
+        )
+    raise RuntimeError("Best-strategy equity curve reconstruction exceeded the grid size.")
 
 
 def _process_asset_grid(
@@ -16734,9 +17530,46 @@ def _process_asset_grid(
     grid_compute_observer: Callable[[float], None] | None = None,
     rsi_entry_rule: str = "lower",
     isolate_strategy_signal_history: bool | None = None,
-) -> None:
+    strategy_state_verification: StrategyStateVerification = "trusted",
+    strategy_state_preverified: bool = False,
+    deadline_check: Callable[[], None] | None = None,
+    _market_data_presynchronized: bool = False,
+    _prevalidated_safe_tail_rows: dict[str, tuple[object, ...]] | None = None,
+    _prevalidated_best_config: tuple[float, float] | None = None,
+    _winning_curve_source_data: pd.DataFrame | None = None,
+    _winning_curve_signal_close: pd.Series | None = None,
+    _authoritative_histories_prevalidated: bool = False,
+) -> bool:
     if isolate_strategy_signal_history is not None and type(isolate_strategy_signal_history) is not bool:
         raise ValueError("isolate_strategy_signal_history must be a boolean or None.")
+    if strategy_state_verification not in {"trusted", "canonical"}:
+        raise ValueError("strategy_state_verification must be 'trusted' or 'canonical'.")
+    if type(strategy_state_preverified) is not bool:
+        raise ValueError("strategy_state_preverified must be a boolean.")
+    if type(_market_data_presynchronized) is not bool:
+        raise ValueError("_market_data_presynchronized must be a boolean.")
+    if type(_authoritative_histories_prevalidated) is not bool:
+        raise ValueError("_authoritative_histories_prevalidated must be a boolean.")
+    if _prevalidated_safe_tail_rows is not None and (
+        not strategy_state_preverified
+        or not isinstance(_prevalidated_safe_tail_rows, dict)
+        or any(
+            type(date) is not str or not isinstance(values, tuple) or len(values) != len(_MARKET_DATA_FIELDS)
+            for date, values in _prevalidated_safe_tail_rows.items()
+        )
+    ):
+        raise ValueError("Prevalidated safe-tail rows require authenticated strategy state and exact row tuples.")
+    if _prevalidated_best_config is not None and (
+        not strategy_state_preverified
+        or not isinstance(_prevalidated_best_config, tuple)
+        or len(_prevalidated_best_config) != 2
+        or any(type(value) is not float or not math.isfinite(value) for value in _prevalidated_best_config)
+    ):
+        raise ValueError("A prevalidated winning configuration requires authenticated strategy state.")
+    if _market_data_presynchronized and authoritative_histories is not None:
+        raise ValueError("Presynchronized recursive processing cannot accept authoritative histories.")
+    if deadline_check is not None:
+        deadline_check()
     rsi_entry_rule_value = rsi_entry_rule_code(rsi_entry_rule)
     symbols = list(dict.fromkeys([asset_symbol, signal_symbol, RISK_FREE_SYMBOL]))
     private_signal_storage_symbol = _strategy_signal_cache_symbol(asset_symbol, signal_symbol)
@@ -16785,18 +17618,22 @@ def _process_asset_grid(
     persisted_state_is_complete = False
     if not rebuild:
         expected_pairs = _strategy_config_pairs(buy_rsi_values, profit_target_values)
-        persisted_state_is_complete = strategy_config_matches_fingerprint(
-            conn,
-            asset_symbol,
-            signal_symbol,
-            strategy_fingerprint,
-        ) and _strategy_rows_match_config(
-            conn,
-            asset_symbol,
-            signal_symbol,
-            expected_pairs,
-            base_cfg=base_cfg,
-            rsi_entry_rule=rsi_entry_rule,
+        persisted_state_is_complete = strategy_state_preverified or (
+            strategy_config_matches_fingerprint(
+                conn,
+                asset_symbol,
+                signal_symbol,
+                strategy_fingerprint,
+            )
+            and _strategy_rows_match_config(
+                conn,
+                asset_symbol,
+                signal_symbol,
+                expected_pairs,
+                base_cfg=base_cfg,
+                rsi_entry_rule=rsi_entry_rule,
+                strategy_state_verification=strategy_state_verification,
+            )
         )
     presynchronized_symbols = presynchronized_authoritative_symbols or set()
     dependent_alignments_before: dict[tuple[str, str], str | None] = {}
@@ -16812,11 +17649,18 @@ def _process_asset_grid(
     strategy_signal_dates_before: set[str] = set()
     strategy_signal_had_history = False
     strategy_signal_revised = retire_private_signal_history
-    if authoritative_histories is None and (scoped_signal_history or retire_private_signal_history):
+    if (
+        authoritative_histories is None
+        and not _market_data_presynchronized
+        and (scoped_signal_history or retire_private_signal_history)
+    ):
         raise ValueError(
             "An existing or requested pair-scoped signal history requires complete authoritative histories."
         )
-    if authoritative_histories is not None:
+    if _market_data_presynchronized:
+        revised_symbols: set[str] = set()
+        signal_history_revisions: set[str] = set()
+    elif authoritative_histories is not None:
         authoritative_symbols = set(authoritative_histories)
         unexpected_symbols = authoritative_symbols.difference(symbols)
         if unexpected_symbols:
@@ -16839,20 +17683,118 @@ def _process_asset_grid(
         # Validate the complete batch before the first synchronization write so
         # a malformed later symbol cannot leave a partially updated state when
         # this function is used outside the workflow's surrounding transaction.
-        for symbol, history in authoritative_histories.items():
-            validate_market_data_frame(history, symbol, source="Authoritative history")
-        if scoped_signal_history:
-            if stored_signal_history is None:
-                raise ValueError("Pair-scoped workflow processing requires a complete signal history.")
-            if stored_signal_history.empty:
-                raise AssetMarketDataError("Pair-scoped signal history must not be empty.")
-            validate_market_data_frame(
-                stored_signal_history,
-                signal_storage_symbol,
-                source="Pair-scoped signal history",
+        if not _authoritative_histories_prevalidated:
+            for symbol, history in authoritative_histories.items():
+                validate_market_data_frame(history, symbol, source="Authoritative history")
+            if scoped_signal_history:
+                if stored_signal_history is None:
+                    raise ValueError("Pair-scoped workflow processing requires a complete signal history.")
+                if stored_signal_history.empty:
+                    raise AssetMarketDataError("Pair-scoped signal history must not be empty.")
+                validate_market_data_frame(
+                    stored_signal_history,
+                    signal_storage_symbol,
+                    source="Pair-scoped signal history",
+                )
+            if signal_history is not None and signal_symbol in fallback_symbols:
+                validate_market_data_frame(signal_history, signal_symbol, source="Signal history")
+        checkpoint_rows = (
+            conn.execute(
+                """
+                SELECT DISTINCT last_date
+                FROM strategy_state
+                WHERE asset_symbol = ? AND signal_symbol = ?
+                """,
+                (asset_symbol, signal_symbol),
+            ).fetchall()
+            if persisted_state_is_complete
+            else []
+        )
+        fast_tail_checkpoint = (
+            str(checkpoint_rows[0][0]) if len(checkpoint_rows) == 1 and checkpoint_rows[0][0] is not None else None
+        )
+        fast_tail_symbols = [symbol for symbol in authoritative_histories if symbol not in presynchronized_symbols]
+        can_use_fast_tail = bool(
+            not rebuild
+            and persisted_state_is_complete
+            and fast_tail_checkpoint is not None
+            and not fallback_symbols
+            and not scoped_signal_history
+            and not retire_private_signal_history
+        )
+        safe_tail_rows_by_symbol: dict[str, dict[str, tuple[object, ...]]] = {}
+        if can_use_fast_tail:
+            for symbol in fast_tail_symbols:
+                safe_tail_rows = (
+                    _prevalidated_safe_tail_rows
+                    if symbol == asset_symbol and _prevalidated_safe_tail_rows is not None
+                    else _safe_market_history_tail_rows(
+                        conn,
+                        authoritative_histories[symbol],
+                        symbol,
+                    )
+                )
+                if safe_tail_rows is None:
+                    can_use_fast_tail = False
+                    break
+                safe_tail_rows_by_symbol[symbol] = safe_tail_rows
+        if can_use_fast_tail:
+            for symbol in fast_tail_symbols:
+                conn.execute(
+                    "DELETE FROM market_history_removal_candidates WHERE symbol = ?",
+                    (symbol,),
+                )
+                safe_tail_rows = safe_tail_rows_by_symbol[symbol]
+                if safe_tail_rows:
+                    conn.executemany(
+                        """
+                        INSERT INTO market_data
+                        (symbol, date, open, high, low, close, volume)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [(symbol, date, *values) for date, values in sorted(safe_tail_rows.items())],
+                    )
+            asset_columns = [f"{asset_symbol}_{field}" for field in _MARKET_DATA_FIELDS]
+            asset_sessions = ~data.loc[:, asset_columns].isna().all(axis=1)
+            tail_data = data.loc[
+                asset_sessions
+                & np.asarray(
+                    [_date_str(date) > fast_tail_checkpoint for date in data.index],
+                    dtype=np.bool_,
+                )
+            ]
+            # A safe-tail classification can deliberately retain authenticated
+            # historical candles when Yahoo moves every OHLC field by one tiny
+            # coherent adjustment factor.  Replaying the retained winning curve
+            # from the incoming frame would then mix those ignored values with
+            # compact state advanced from the persisted history.  Use the exact
+            # post-synchronization database snapshot for any curve replacement
+            # or append performed by the recursive tail update.
+            winning_curve_source_data = load_saved_market_data(conn, symbols)
+            winning_curve_signal_close = load_saved_close_series(conn, signal_symbol)
+            return _process_asset_grid(
+                conn,
+                tail_data,
+                base_cfg,
+                asset_symbol,
+                signal_symbol,
+                buy_rsi_values,
+                profit_target_values,
+                False,
+                strategy_fingerprint=strategy_fingerprint,
+                commit=commit,
+                grid_compute_observer=grid_compute_observer,
+                rsi_entry_rule=rsi_entry_rule,
+                isolate_strategy_signal_history=False,
+                strategy_state_verification=strategy_state_verification,
+                strategy_state_preverified=True,
+                deadline_check=deadline_check,
+                _market_data_presynchronized=True,
+                _prevalidated_best_config=_prevalidated_best_config,
+                _winning_curve_source_data=winning_curve_source_data,
+                _winning_curve_signal_close=winning_curve_signal_close,
+                _authoritative_histories_prevalidated=True,
             )
-        if signal_history is not None and signal_symbol in fallback_symbols:
-            validate_market_data_frame(signal_history, signal_symbol, source="Signal history")
         if retire_private_signal_history:
             conn.execute("DELETE FROM market_data WHERE symbol = ?", (private_signal_storage_symbol,))
             conn.execute("DELETE FROM rsi_values WHERE signal_symbol = ?", (private_signal_storage_symbol,))
@@ -17091,11 +18033,15 @@ def _process_asset_grid(
         )
     }
 
-    dependent_alignments_after = _saved_signal_dependent_alignments(
-        conn,
-        signal_symbol,
-        asset_symbol=dependent_alignment_asset_filter,
-        exclude_strategy_pair=dependency_excluded_pair,
+    dependent_alignments_after = (
+        {}
+        if _market_data_presynchronized
+        else _saved_signal_dependent_alignments(
+            conn,
+            signal_symbol,
+            asset_symbol=dependent_alignment_asset_filter,
+            exclude_strategy_pair=dependency_excluded_pair,
+        )
     )
     processed_alignment_revised = any(
         dependent_alignments_after.get(dependent) != prior_observation_date
@@ -17178,8 +18124,8 @@ def _process_asset_grid(
         # A prior run can persist fresh market rows and fail before advancing
         # the compact strategy state.  A later tail-only request must not jump
         # over those already-saved sessions merely because they are absent from
-        # the caller's frame.  Widen the compute window only when such a gap is
-        # present, preserving the ordinary one-row incremental fast path.
+        # the caller's frame. Widen when such a gap is present, then reduce the
+        # full authoritative revision-detection snapshot to the actual tail.
         asset_columns = [f"{asset_symbol}_{field}" for field in _MARKET_DATA_FIELDS]
         incoming_asset_data = data.loc[~data.loc[:, asset_columns].isna().all(axis=1)]
         if not incoming_asset_data.empty:
@@ -17220,11 +18166,30 @@ def _process_asset_grid(
                         else load_saved_market_data(conn, symbols)
                     )
                     data = saved_data.loc[[_date_str(date) <= incoming_asset_end for date in saved_data.index]]
+                data = data.loc[[_date_str(date) > checkpoint_date for date in data.index]]
 
     if data.empty:
+        if not strategy_state_preverified:
+            _ensure_complete_best_equity_curve(
+                conn,
+                base_cfg=base_cfg,
+                asset_symbol=asset_symbol,
+                signal_symbol=signal_symbol,
+                config_pairs=[
+                    (float(buy_rsi), float(profit_target_multiple))
+                    for buy_rsi in buy_rsi_values
+                    for profit_target_multiple in profit_target_values
+                ],
+                rsi_entry_rule=rsi_entry_rule,
+                deadline_check=deadline_check,
+            )
+        if strategy_state_generation(conn) != expected_state_generation:
+            raise RuntimeError("Strategy state generation changed during an atomic asset update.")
+        if deadline_check is not None:
+            deadline_check()
         if commit:
             conn.commit()
-        return
+        return rebuild
     if rebuild:
         clear_asset_state(conn, asset_symbol, signal_symbol)
 
@@ -17237,6 +18202,12 @@ def _process_asset_grid(
         base_cfg.rsi_period,
         canonical_signal_close,
         rebuild=rebuild or signal_revised,
+        trusted_cache=bool(
+            strategy_state_preverified
+            and strategy_state_verification == "trusted"
+            and not rebuild
+            and not signal_revised
+        ),
     )
 
     config_pairs = [
@@ -17247,7 +18218,7 @@ def _process_asset_grid(
     if not config_pairs:
         if commit:
             conn.commit()
-        return
+        return rebuild
 
     open_prices, high_prices, close_prices, rsi_values, risk_free_returns = _market_arrays(
         data,
@@ -17470,10 +18441,14 @@ def _process_asset_grid(
             excess_return_m2_values=excess_return_m2_values,
             resume_close_values=resume_close_values,
             history_prefix_observation_counts=history_prefix_observation_counts,
+            _pristine_state=rebuild,
+            _prevalidated_resume_state=(not rebuild and strategy_state_preverified),
         )
     finally:
         if grid_compute_observer is not None:
             grid_compute_observer(max(0.0, time.perf_counter() - grid_compute_started))
+    if deadline_check is not None:
+        deadline_check()
 
     strategy_state_rows: list[tuple] = []
     strategy_summary_rows: list[tuple] = []
@@ -17541,60 +18516,93 @@ def _process_asset_grid(
     save_strategy_states(conn, strategy_state_rows)
     save_strategy_summaries(conn, strategy_summary_rows)
 
-    # Reconstructing a curve also recomputes its summary with sequential
-    # arithmetic.  That can move a numerically tied strategy by one ULP in the
-    # SQL ordering, so converge on a winner before deleting any candidate
-    # curve.  Each grid point is rebuilt at most once; revisiting an incomplete
-    # point means reconstruction made no durable progress and must fail closed.
-    rebuilt_configs: set[tuple[float, float]] = set()
-    for _ in range(len(set(config_pairs)) + 1):
-        best_config = _best_summary_config(
-            conn,
-            asset_symbol,
-            signal_symbol,
+    if strategy_summary_rows:
+        best_config = _best_summary_config_from_validated_rows(
+            strategy_summary_rows,
             rsi_entry_rule,
         )
-        if best_config is None:
-            break
-        best_buy_rsi, best_profit_target_multiple = best_config
-        if _equity_curve_is_complete(
-            conn,
-            asset_symbol,
-            signal_symbol,
-            best_buy_rsi,
-            best_profit_target_multiple,
-            rsi_period=base_cfg.rsi_period,
-            rsi_entry_rule=rsi_entry_rule,
-            allow_unbound_backtest_config=True,
-        ):
+        if best_config is not None:
+            best_summary_row = next(
+                row for row in strategy_summary_rows if (float(row[2]), float(row[3])) == best_config
+            )
+            if date_strings and date_strings[0] == str(best_summary_row[4]):
+                _save_fresh_best_equity_curve(
+                    conn,
+                    base_cfg=base_cfg,
+                    asset_symbol=asset_symbol,
+                    signal_symbol=signal_symbol,
+                    buy_rsi=best_config[0],
+                    profit_target_multiple=best_config[1],
+                    rsi_entry_rule=rsi_entry_rule,
+                    date_strings=date_strings,
+                    open_prices=open_prices,
+                    high_prices=high_prices,
+                    close_prices=close_prices,
+                    rsi_values=rsi_values,
+                    risk_free_returns=risk_free_returns,
+                )
+            else:
+                append_after: str | None = None
+                if not rebuild and _prevalidated_best_config == best_config:
+                    curve_end_row = conn.execute(
+                        """
+                        SELECT MAX(date)
+                        FROM strategy_equity
+                        WHERE asset_symbol = ?
+                          AND signal_symbol = ?
+                          AND buy_rsi = ?
+                          AND profit_target_multiple = ?
+                        """,
+                        (asset_symbol, signal_symbol, *best_config),
+                    ).fetchone()
+                    candidate_curve_end = curve_end_row[0] if curve_end_row else None
+                    if candidate_curve_end is not None and str(candidate_curve_end) < date_strings[-1]:
+                        append_after = str(candidate_curve_end)
+                _replace_best_equity_curve(
+                    conn,
+                    base_cfg,
+                    asset_symbol,
+                    signal_symbol,
+                    best_config[0],
+                    best_config[1],
+                    rsi_entry_rule,
+                    save_summary=False,
+                    append_after=append_after,
+                    full_data=_winning_curve_source_data,
+                    canonical_signal_close=_winning_curve_signal_close,
+                    canonical_rsi=rsi,
+                )
             prune_non_best_equity_records(
                 conn,
                 asset_symbol,
                 signal_symbol,
-                best_buy_rsi,
-                best_profit_target_multiple,
+                best_config[0],
+                best_config[1],
             )
-            break
-        if best_config in rebuilt_configs:
-            raise RuntimeError("Best-strategy equity curve reconstruction did not converge.")
-        rebuilt_configs.add(best_config)
-        _replace_best_equity_curve(
+    # Reconstructing an incremental curve also recomputes its summary with sequential
+    # arithmetic.  That can move a numerically tied strategy by one ULP in the
+    # SQL ordering, so converge on a winner before deleting any candidate
+    # curve.  Each grid point is rebuilt at most once; revisiting an incomplete
+    # point means reconstruction made no durable progress and must fail closed.
+    if not strategy_summary_rows:
+        _ensure_complete_best_equity_curve(
             conn,
-            base_cfg,
-            asset_symbol,
-            signal_symbol,
-            best_buy_rsi,
-            best_profit_target_multiple,
-            rsi_entry_rule,
+            base_cfg=base_cfg,
+            asset_symbol=asset_symbol,
+            signal_symbol=signal_symbol,
+            config_pairs=config_pairs,
+            rsi_entry_rule=rsi_entry_rule,
+            deadline_check=deadline_check,
         )
-    else:
-        raise RuntimeError("Best-strategy equity curve reconstruction exceeded the grid size.")
 
     if strategy_state_generation(conn) != expected_state_generation:
         raise RuntimeError("Strategy state generation changed during an atomic asset update.")
     save_strategy_config(conn, asset_symbol, signal_symbol, strategy_fingerprint)
+    if deadline_check is not None:
+        deadline_check()
     if commit:
         conn.commit()
+    return rebuild
 
 
 def process_asset_grid(
@@ -17615,7 +18623,13 @@ def process_asset_grid(
     grid_compute_observer: Callable[[float], None] | None = None,
     rsi_entry_rule: str = "lower",
     isolate_strategy_signal_history: bool | None = None,
-) -> None:
+    strategy_state_verification: StrategyStateVerification = "trusted",
+    strategy_state_preverified: bool = False,
+    deadline_check: Callable[[], None] | None = None,
+    _prevalidated_safe_tail_rows: dict[str, tuple[object, ...]] | None = None,
+    _prevalidated_best_config: tuple[float, float] | None = None,
+    _authoritative_histories_prevalidated: bool = False,
+) -> bool:
     """Atomically synchronize and process one strategy grid.
 
     Workflow callers pass ``commit=False`` while an outer immediate
@@ -17661,14 +18675,19 @@ def process_asset_grid(
         "grid_compute_observer": grid_compute_observer,
         "rsi_entry_rule": rsi_entry_rule,
         "isolate_strategy_signal_history": isolate_strategy_signal_history,
+        "strategy_state_verification": strategy_state_verification,
+        "strategy_state_preverified": strategy_state_preverified,
+        "deadline_check": deadline_check,
+        "_prevalidated_safe_tail_rows": _prevalidated_safe_tail_rows,
+        "_prevalidated_best_config": _prevalidated_best_config,
+        "_authoritative_histories_prevalidated": _authoritative_histories_prevalidated,
     }
     if not commit:
-        _process_asset_grid(
+        return _process_asset_grid(
             *arguments,
             commit=False,
             **keyword_arguments,
         )
-        return
 
     # Reusing a static name is safe: SQLite savepoints nest, and ROLLBACK TO /
     # RELEASE target the most recent savepoint with that name. Keeping this
@@ -17682,7 +18701,7 @@ def process_asset_grid(
             conn.execute("BEGIN")
         conn.execute(f"SAVEPOINT {savepoint_name}")
         savepoint_active = True
-        _process_asset_grid(
+        result = _process_asset_grid(
             *arguments,
             commit=False,
             **keyword_arguments,
@@ -17700,3 +18719,4 @@ def process_asset_grid(
                 operation="atomic asset-grid processing",
             )
         raise
+    return result
