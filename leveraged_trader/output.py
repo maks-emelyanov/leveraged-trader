@@ -168,6 +168,7 @@ STATUS_STYLES = {
     "position_quantity_mismatch": "red",
     "parse_error": "red",
     "skipped": "yellow",
+    "warming_up": "cyan",
     "source_error": "red",
     "canceled": "red",
     "deferred": "yellow",

@@ -1868,6 +1868,7 @@ def load_strategy_data(
 def load_signal_history(
     signal_symbol: str,
     *,
+    start: str | None = None,
     end: str | None = None,
     auto_adjust: bool = True,
     tradier_cfg: TradierMarketDataConfig | None = None,
@@ -1876,6 +1877,7 @@ def load_signal_history(
     """Load the canonical, settled daily history for one RSI signal symbol."""
     return load_symbol_history(
         signal_symbol,
+        start=start,
         end=end,
         auto_adjust=auto_adjust,
         tradier_cfg=tradier_cfg,
@@ -1960,14 +1962,15 @@ def load_symbol_history_batch(
 def load_symbol_history(
     symbol: str,
     *,
+    start: str | None = None,
     end: str | None = None,
     auto_adjust: bool = True,
     tradier_cfg: TradierMarketDataConfig | None = None,
     deadline_monotonic: float | None = None,
 ) -> pd.DataFrame:
-    """Load complete, settled daily history for one persisted market symbol."""
+    """Load validated, settled daily history for one persisted market symbol."""
     data = load_market_data(
-        start=None,
+        start=start,
         end=end,
         auto_adjust=auto_adjust,
         symbols=[symbol],

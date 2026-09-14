@@ -398,27 +398,35 @@ def save_closed_balanced_managed_position(
     conn: sqlite3.Connection,
     *,
     qty: float = 2,
-    current_sell_client_order_id: str = "rsi-exit-TQQQ-1-r1",
-    current_sell_order_id: str = "sell-current",
+    symbol: str = "TQQQ",
+    signal_symbol: str = "QQQ",
+    buy_order_id: str | None = None,
+    current_sell_client_order_id: str | None = None,
+    current_sell_order_id: str | None = None,
 ) -> dict:
     """Persist a closed position whose current sell exactly covers its buy."""
-    save_alpaca_managed_buy_order(
+    buy_order_id = buy_order_id or ("buy-1" if symbol == "TQQQ" else f"buy-{symbol.lower()}")
+    position_id = save_alpaca_managed_buy_order(
         conn,
-        symbol="TQQQ",
-        alpaca_asset_id="asset-tqqq",
-        signal_symbol="QQQ",
+        symbol=symbol,
+        alpaca_asset_id=f"asset-{symbol.lower()}",
+        signal_symbol=signal_symbol,
         buy_rsi=30,
         profit_target_multiple=1.5,
         buy_signal_date="2026-01-02",
-        buy_client_order_id="rsi-buy-TQQQ-20260102",
-        buy_alpaca_order_id="buy-1",
+        buy_client_order_id=f"rsi-buy-{symbol}-20260102",
+        buy_alpaca_order_id=buy_order_id,
         buy_submitted_at="2026-01-02T14:30:00Z",
         buy_status="filled",
         buy_order_qty=qty,
     )
+    current_sell_client_order_id = current_sell_client_order_id or f"rsi-exit-{symbol}-{position_id}-r1"
+    current_sell_order_id = current_sell_order_id or (
+        "sell-current" if symbol == "TQQQ" and position_id == 1 else f"sell-{symbol.lower()}-current"
+    )
     mark_alpaca_managed_buy_filled(
         conn,
-        1,
+        position_id,
         buy_status="filled",
         filled_qty=qty,
         filled_avg_price=100,
@@ -427,7 +435,7 @@ def save_closed_balanced_managed_position(
     )
     record_alpaca_managed_sell_order(
         conn,
-        1,
+        position_id,
         sell_client_order_id=current_sell_client_order_id,
         sell_alpaca_order_id=current_sell_order_id,
         sell_submitted_at="2026-01-03T14:32:00Z",
@@ -438,16 +446,19 @@ def save_closed_balanced_managed_position(
     )
     mark_alpaca_managed_sell_filled(
         conn,
-        1,
+        position_id,
         sell_status="filled",
         sell_filled_qty=qty,
         sell_filled_avg_price=150,
         sell_filled_at="2026-01-03T14:35:00Z",
         sell_alpaca_order_id=current_sell_order_id,
     )
-    conn.execute("UPDATE alpaca_managed_positions SET closed_at = CURRENT_TIMESTAMP")
+    conn.execute(
+        "UPDATE alpaca_managed_positions SET closed_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (position_id,),
+    )
     conn.commit()
-    return load_alpaca_managed_positions(conn).iloc[0].to_dict()
+    return load_alpaca_managed_positions(conn).loc[lambda rows: rows["id"].eq(position_id)].iloc[0].to_dict()
 
 
 class AlpacaTests(unittest.TestCase):
@@ -569,6 +580,128 @@ class AlpacaTests(unittest.TestCase):
             sell_alpaca_order_id="sell-old",
         )
         self.assertTrue(generation_is_current)
+
+    def test_reconciliation_uses_one_account_order_snapshot_for_multiple_tracked_sells(self) -> None:
+        cfg = self.cfg(buy=True, sell=True)
+        client = Mock()
+        client.cfg = cfg
+        orders: list[dict] = []
+
+        with closing(sqlite3.connect(":memory:")) as conn, conn:
+            init_state_db(conn)
+            for index, symbol in enumerate(("TQQQ", "UPRO"), start=1):
+                position_id = save_alpaca_managed_buy_order(
+                    conn,
+                    symbol=symbol,
+                    alpaca_asset_id=f"asset-{symbol.lower()}",
+                    signal_symbol="QQQ" if symbol == "TQQQ" else "SPY",
+                    buy_rsi=30,
+                    profit_target_multiple=1.5,
+                    buy_signal_date="2026-01-02",
+                    buy_client_order_id=f"rsi-buy-{symbol}-20260102",
+                    buy_alpaca_order_id=f"buy-{index}",
+                    buy_submitted_at="2026-01-02T14:30:00Z",
+                    buy_status="filled",
+                )
+                mark_alpaca_managed_buy_filled(
+                    conn,
+                    position_id,
+                    buy_status="filled",
+                    filled_qty=2,
+                    filled_avg_price=100,
+                    filled_at="2026-01-02T14:31:00Z",
+                    target_sell_price=150,
+                )
+                sell_client_order_id = f"rsi-exit-{symbol}-{position_id}"
+                sell_order_id = f"sell-{index}"
+                record_alpaca_managed_sell_order(
+                    conn,
+                    position_id,
+                    sell_client_order_id=sell_client_order_id,
+                    sell_alpaca_order_id=sell_order_id,
+                    sell_submitted_at="2026-01-02T14:32:00Z",
+                    sell_status="new",
+                    sell_order_qty=2,
+                    sell_order_limit_price=150,
+                )
+                orders.append(
+                    _complete_order_fixture(
+                        {
+                            "id": sell_order_id,
+                            "client_order_id": sell_client_order_id,
+                            "asset_id": f"asset-{symbol.lower()}",
+                            "symbol": symbol,
+                            "side": "sell",
+                            "status": "new",
+                            "qty": "2",
+                            "filled_qty": "0",
+                            "limit_price": "150",
+                            "expires_at": "2027-01-02T20:00:00Z",
+                        }
+                    )
+                )
+
+            client.all_orders.return_value = orders
+            client.positions.return_value = [
+                {
+                    "asset_id": f"asset-{symbol.lower()}",
+                    "asset_class": "us_equity",
+                    "symbol": symbol,
+                    "side": "long",
+                    "qty": "2",
+                }
+                for symbol in ("TQQQ", "UPRO")
+            ]
+            with patch("leveraged_trader.alpaca.AlpacaClient", return_value=client):
+                result = reconcile_alpaca_managed_positions(conn, cfg)
+
+        self.assertEqual(result["Status"].tolist(), ["new", "new"])
+        client.all_orders.assert_called_once_with()
+        client.open_orders.assert_not_called()
+        client.get_order.assert_not_called()
+        client.get_order_by_client_order_id.assert_not_called()
+
+    def test_closed_audits_share_one_account_order_snapshot(self) -> None:
+        cfg = self.cfg(buy=True, sell=True)
+        client = Mock()
+        client.cfg = cfg
+        audited_position_ids: list[int] = []
+
+        def observe_snapshot(*, client: Mock, position: dict, **_kwargs: object) -> None:
+            cached = vars(client).get("_reconciliation_order_payloads")
+            self.assertIsInstance(cached, dict)
+            self.assertIn(position["buy_alpaca_order_id"], cached)
+            self.assertIn(position["sell_alpaca_order_id"], cached)
+            audited_position_ids.append(int(position["id"]))
+
+        with closing(sqlite3.connect(":memory:")) as conn, conn:
+            init_state_db(conn)
+            first = save_closed_balanced_managed_position(conn)
+            second = save_closed_balanced_managed_position(
+                conn,
+                symbol="UPRO",
+                signal_symbol="SPY",
+            )
+            order_ids = {
+                str(position[field])
+                for position in (first, second)
+                for field in ("buy_alpaca_order_id", "sell_alpaca_order_id")
+            }
+            client.all_orders.return_value = [{"id": order_id} for order_id in sorted(order_ids)]
+            with (
+                patch("leveraged_trader.alpaca.AlpacaClient", return_value=client),
+                patch(
+                    "leveraged_trader.alpaca._audit_recently_closed_managed_position",
+                    side_effect=observe_snapshot,
+                ),
+            ):
+                result = reconcile_alpaca_managed_positions(conn, cfg)
+
+        self.assertTrue(result.empty)
+        self.assertEqual(audited_position_ids, [int(first["id"]), int(second["id"])])
+        client.all_orders.assert_called_once_with()
+        client.open_orders.assert_not_called()
+        client.get_order.assert_not_called()
 
     def test_managed_order_identity_rejects_advanced_classes_and_companion_legs(self) -> None:
         simple_order = _complete_order_fixture(
@@ -20983,6 +21116,30 @@ class AlpacaTests(unittest.TestCase):
                 self.assertEqual(raised.exception.results.loc[0, "Status"], sell_status)
                 self.assertIn("cannot be confirmed", raised.exception.results.loc[0, "Message"])
                 self.assertEqual(managed.loc[0, "sell_status"], sell_status)
+
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_all_orders_requests_a_complete_account_snapshot(self, mock_get: Mock) -> None:
+        filled = _complete_order_fixture(
+            {
+                "id": "filled-buy-1",
+                "client_order_id": "rsi-buy-TQQQ-20260102",
+                "asset_id": "asset-tqqq",
+                "symbol": "TQQQ",
+                "side": "buy",
+                "status": "filled",
+                "qty": "2",
+                "filled_qty": "2",
+                "filled_avg_price": "100",
+                "filled_at": "2026-01-02T14:31:00Z",
+            }
+        )
+        mock_get.return_value = response(200, [filled])
+
+        orders = AlpacaClient(self.cfg(buy=True)).all_orders()
+
+        self.assertEqual(orders, [filled])
+        self.assertEqual(mock_get.call_args.kwargs["params"]["status"], "all")
+        self.assertEqual(mock_get.call_args.kwargs["params"]["asset_class"], "us_equity")
 
     @patch("leveraged_trader.alpaca.requests.get")
     def test_open_order_conflict_check_paginates_past_500_orders(self, mock_get: Mock) -> None:

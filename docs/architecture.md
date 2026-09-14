@@ -24,7 +24,7 @@ Leveraged Trader is organized as a small package with IO-heavy boundaries kept s
 - `leveraged_trader.storage`: SQLite schema, persisted strategy state, market data, RSI values, summaries, and Alpaca managed-position records.
 - `leveraged_trader.runtime_files`: private runtime-directory, SQLite-file, sidecar, and publication identity checks.
 - `leveraged_trader.reports`: best-strategy summaries, pending buy recommendations, and latest sell-event reports.
-- `leveraged_trader.alpaca`: Alpaca paper account, position, open-order, managed-position reconciliation, and order submission integration.
+- `leveraged_trader.alpaca`: Alpaca paper account, position, account-order, managed-position reconciliation, and order submission integration.
 - `leveraged_trader._http_deadline_worker`: isolated, killable HTTP transport for bounded Alpaca, Tradier, and universe-source requests.
 - `leveraged_trader._yfinance_deadline_worker`: isolated, killable Yahoo Finance download and recent-price requests.
 - `leveraged_trader.output`: terminal progress, section headings, status coloring, and width-aware table rendering.
@@ -53,7 +53,7 @@ boundary because Python's SQLite binding opens VFS sidecars by pathname.
 Order-enabled workflows additionally acquire one fixed private per-user Alpaca paper-account lock,
 so separate databases and output directories cannot race the same broker exposure or cash snapshot.
 
-1. Initialize the SQLite schema and, when managed-sell submission is explicitly enabled, reconcile active Alpaca managed positions before refreshing market data. This startup reconciliation can attach or renew managed GTC sells for buys that filled after a previous run.
+1. Initialize the SQLite schema and, when managed-sell submission is explicitly enabled, reconcile active Alpaca managed positions before refreshing market data. This startup reconciliation can attach or renew managed GTC sells for buys that filled after a previous run. Multi-position reconciliation reuses one strictly validated, paginated account-order snapshot; exact ID lookups remain the fallback for absent orders and replacement links, and an unusable historical snapshot falls back to the validated open-order list before per-order reads.
 2. Load the current leveraged ETF/ETN universe from Nasdaq ETF definitions plus best-effort issuer ETF and ETN tables, then split executable products into long and inverse/short workflow groups. The primary Nasdaq feed and every issuer/ETN source are saved to `universe_workflow_source_status`; fetch failures and unparseable responses are surfaced as a degraded universe and can be made fatal with `--require-workflow-source-success`, which is enabled automatically for Alpaca buy submission unless explicitly disabled, while a successfully parsed issuer source with zero leveraged matches remains healthy. An empty or implausibly small Nasdaq ETF table is a parser failure, not an authoritative snapshot.
    Issuer discovery includes ProShares, Direxion, Leverage Shares, GraniteShares, Defiance, AdvisorShares, AXS Investments, Kurv, Innovator, Tuttle Capital, Tradr, REX Shares, KraneShares, Volatility Shares, 21Shares, YieldMax, Tidal, Roundhill, Themes, Simplify, MicroSectors, and UBS ETRACS. REX products come from the official Cboe issuer listing because the issuer site blocks unattended requests, while Tradr uses only its current explicit target/exposure tables so legacy product tables cannot override current leverage.
 3. Merge universe sources by symbol, infer leverage/direction, and infer each leveraged asset's RSI signal symbol. RSI mappings use curated symbol/name proxies, validated generic ticker inference, and explicit self-RSI fallbacks where appropriate. Exact-ticker overrides must still match an expected exposure fingerprint in the current product name, protecting against stale metadata and ticker reuse; names matching multiple distinct curated proxies require review. Curated inverse mappings point to an unlevered ETF or spot-market proxy for the product's benchmark. Long-product self-RSI fallbacks remain executable; inverse products without an underlying RSI proxy require manual review because using the product's own RSI would invert the high-RSI entry rule. Review rows are saved to `universe_rsi_mapping_review` and excluded from the executable workflow. Leveraged-looking false positives, such as funds where "ultra-short" describes bond duration, are explicitly excluded, as are products with a changing basket and no stable single RSI proxy. An optional workflow `top_n` limit must be a positive integer; `None` selects every executable discovered asset.
@@ -66,6 +66,12 @@ so separate databases and output directories cannot race the same broker exposur
    The workflow obtains those complete histories in deterministic Yahoo batches of 32 unique
    symbols. Every extracted frame passes the same per-symbol validation; provider errors, missing or
    ambiguous frames, and timeouts are retried individually through the normal Yahoo/Tradier path.
+   If strict validation of a signal's full history fails but its asset history is usable, the
+   workflow retries the signal from at least one year before that asset's first settled session.
+   This bounded recovery remains private to the exact asset/signal pair in SQLite and cannot become
+   another strategy's canonical signal cache. Newly listed self-signaled products that do not yet
+   have the RSI period plus one settled observations report `warming_up` and remain non-actionable
+   until enough sessions accumulate.
    Tiny provider-to-provider variation in one coherent adjusted-price factor is retained from the
    already authenticated local history when volume is unchanged; an individual OHLC correction,
    material factor change, calendar change, or volume change still invalidates exact compact state.

@@ -65,6 +65,7 @@ from leveraged_trader.workflow import (
     _atomic_to_csv,
     _build_reports_for_db,
     _clear_stale_workflow_research_outputs,
+    _complete_workflow_asset,
     _concat_report_frames,
     _initialize_state_db,
     _persist_workflow_research_outputs,
@@ -8541,7 +8542,73 @@ publish("new")
             )
 
         self.assertEqual([result.status for result in results], ["skipped", "skipped"])
-        self.assertEqual(signal_download.call_count, 1)
+        self.assertEqual(signal_download.call_count, 2)
+        self.assertIsNone(signal_download.call_args_list[0].kwargs.get("start"))
+        self.assertEqual(signal_download.call_args_list[1].kwargs["start"], "2025-01-01")
+
+    def test_unusable_full_signal_history_retries_a_pair_scoped_window(self) -> None:
+        market_data_session = _WorkflowMarketDataSession()
+        asset_history = self._symbol_history("RCAX")
+        bounded_signal_history = self._symbol_history("RCAT", 10.0)
+        processed: dict[str, object] = {}
+
+        def plan(*_args: object, **_kwargs: object) -> AssetRunPlan:
+            return AssetRunPlan(
+                asset_symbol="RCAX",
+                signal_symbol="RCAT",
+                rebuild=False,
+                start=None,
+                action="Updating",
+                start_label="earliest overlapping history",
+            )
+
+        def load_signal(_symbol: str, *, start: str | None = None, **_kwargs: object) -> pd.DataFrame:
+            if start is None:
+                raise MarketDataDownloadError({"RCAT": "invalid historical OHLCV row"})
+            return bounded_signal_history
+
+        def process(*args: object, **kwargs: object) -> None:
+            processed["signal_history"] = args[3]
+            processed["canonical_signal_history"] = kwargs["canonical_signal_history"]
+            processed["isolate_signal_history"] = kwargs["isolate_signal_history"]
+
+        with (
+            patch("leveraged_trader.workflow._prepare_asset_run", side_effect=plan),
+            patch("leveraged_trader.workflow.load_symbol_history", return_value=asset_history),
+            patch(
+                "leveraged_trader.workflow.load_risk_free_history",
+                return_value=self._symbol_history("^IRX", -95.0),
+            ),
+            patch("leveraged_trader.workflow.load_signal_history", side_effect=load_signal) as signal_download,
+            patch("leveraged_trader.workflow._process_asset_grid_for_db", side_effect=process),
+        ):
+            results = asyncio.run(
+                _run_asset_pipeline(
+                    jobs=[AssetRunJob(1, "RCAX", "RCAT")],
+                    concurrency=1,
+                    db_path="unused.sqlite",
+                    mode="update",
+                    base_cfg=BacktestConfig(),
+                    tradier_cfg=None,
+                    buy_rsi_values=[30.0],
+                    profit_target_values=[1.5],
+                    asset_progress=None,
+                    phase_timings=WorkflowPhaseTimings(),
+                    market_data_session=market_data_session,
+                )
+            )
+
+        self.assertEqual([result.status for result in results], ["done"])
+        self.assertEqual(signal_download.call_count, 2)
+        self.assertEqual(signal_download.call_args_list[1].kwargs["start"], "2025-01-01")
+        self.assertNotIn("RCAT", market_data_session.signal_histories)
+        self.assertIs(
+            market_data_session.calendar_signal_histories[("RCAX", "RCAT")],
+            bounded_signal_history,
+        )
+        self.assertIs(processed["signal_history"], bounded_signal_history)
+        self.assertIsNone(processed["canonical_signal_history"])
+        self.assertIs(processed["isolate_signal_history"], True)
 
     def test_asset_pipelines_share_canonical_histories_across_workflow_sides(self) -> None:
         market_data_session = _WorkflowMarketDataSession()
@@ -9836,7 +9903,7 @@ publish("new")
         self.assertEqual(benchmark_download.call_count, 1)
         signal_download.assert_not_called()
 
-    def test_known_signal_failure_skips_later_asset_downloads(self) -> None:
+    def test_known_full_signal_failure_reuses_one_bounded_retry_for_matching_calendars(self) -> None:
         jobs = [
             AssetRunJob(1, "AAA", "QQQ"),
             AssetRunJob(2, "BBB", "QQQ"),
@@ -9884,9 +9951,9 @@ publish("new")
             )
 
         self.assertEqual([result.status for result in results], ["skipped"] * 3)
-        self.assertEqual(asset_download.call_count, 1)
+        self.assertEqual(asset_download.call_count, 3)
         self.assertEqual(benchmark_download.call_count, 1)
-        self.assertEqual(signal_download.call_count, 1)
+        self.assertEqual(signal_download.call_count, 2)
 
     def test_asset_pipeline_drains_preparation_and_asset_data_failures(self) -> None:
         jobs = [AssetRunJob(1, "AAA", "AAA"), AssetRunJob(2, "BBB", "BBB")]
@@ -9946,6 +10013,49 @@ publish("new")
         self.assertEqual([result.status for result in results], ["skipped", "skipped"])
         self.assertEqual([result.message for result in results], ["provider failed", "asset data failed"])
         self.assertEqual(asset_progress.finish_asset.call_count, 2)
+
+    def test_new_self_signal_asset_reports_rsi_warmup_instead_of_failure(self) -> None:
+        history = self._symbol_history("MNGU").iloc[:11]
+        outcome = PreparedAssetRun(
+            job=AssetRunJob(1, "MNGU", "MNGU", workflow="Long"),
+            plan=AssetRunPlan(
+                asset_symbol="MNGU",
+                signal_symbol="MNGU",
+                rebuild=True,
+                start=None,
+                action="Rebuilding",
+                start_label="earliest overlapping history",
+            ),
+            data=history,
+            asset_history=history,
+            signal_history=history,
+            risk_free_history=self._symbol_history("^IRX", -95.0),
+            canonical_signal_history=history,
+        )
+
+        with patch(
+            "leveraged_trader.workflow._process_asset_grid_for_db",
+            side_effect=AssetMarketDataError(
+                "No finite RSI observations for MNGU align with its finalized market sessions."
+            ),
+        ):
+            result = asyncio.run(
+                _complete_workflow_asset(
+                    outcome,
+                    db_path="unused.sqlite",
+                    base_cfg=BacktestConfig(rsi_period=14),
+                    buy_rsi_values=[30.0],
+                    profit_target_values=[1.5],
+                    rsi_entry_rule="lower",
+                )
+            )
+
+        self.assertEqual(result.status, "warming_up")
+        self.assertEqual(result.rows_processed, 11)
+        self.assertEqual(
+            result.message,
+            "RSI warm-up: 11 of 15 settled MNGU observations are available; 4 more required.",
+        )
 
     def test_asset_pipeline_propagates_database_failures(self) -> None:
         job = AssetRunJob(1, "AAA", "AAA")
@@ -10172,9 +10282,7 @@ publish("new")
                 {"Position ID": 116, "Asset": "TQQQ", "Action": "sell", "Status": "error"},
             ]
         )
-        inactive_holdings = pd.DataFrame(
-            [{"Position ID": 115, "Asset": "LACG", "Status": "retained"}]
-        )
+        inactive_holdings = pd.DataFrame([{"Position ID": 115, "Asset": "LACG", "Status": "retained"}])
         failure = AlpacaReconciliationError("reconciliation failed", reconciliation_results)
         reporter = Mock(spec=WorkflowReporter)
 

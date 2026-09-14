@@ -37,6 +37,7 @@ from leveraged_trader.market_data import (
     _strict_response_json,
     exclude_unfinalized_daily_bar,
     load_market_data,
+    load_signal_history,
     load_strategy_data,
     load_symbol_history,
     load_symbol_history_batch,
@@ -85,6 +86,21 @@ def _tradier_request_from_daemon(url: str, send_connection: object) -> None:
 
 
 class MarketDataTests(unittest.TestCase):
+    def test_signal_history_forwards_a_bounded_start_to_strict_symbol_loading(self) -> None:
+        history = pd.DataFrame()
+        with patch("leveraged_trader.market_data.load_symbol_history", return_value=history) as loader:
+            observed = load_signal_history("RCAT", start="2025-08-27")
+
+        self.assertIs(observed, history)
+        loader.assert_called_once_with(
+            "RCAT",
+            start="2025-08-27",
+            end=None,
+            auto_adjust=True,
+            tradier_cfg=None,
+            deadline_monotonic=None,
+        )
+
     def test_symbol_history_batch_returns_valid_frames_and_per_symbol_retry_errors(self) -> None:
         fields = ["Open", "High", "Low", "Close", "Volume"]
         columns = pd.MultiIndex.from_product([["AAA", "BBB"], fields])

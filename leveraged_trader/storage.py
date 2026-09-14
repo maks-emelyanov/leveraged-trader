@@ -8426,6 +8426,28 @@ def _normalize_alpaca_broker_timestamp(value: str | None) -> str | None:
     return normalized.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
+def _alpaca_broker_event_timestamps_match(left: object, right: object) -> bool:
+    """Match one event time across Alpaca endpoints with different precision."""
+    if left is None or right is None:
+        return left is None and right is None
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    try:
+        normalized_left = _normalize_alpaca_broker_timestamp(left)
+        normalized_right = _normalize_alpaca_broker_timestamp(right)
+    except ValueError:
+        return False
+    if normalized_left is None or normalized_right is None:
+        return normalized_left is None and normalized_right is None
+    parsed_left = datetime.fromisoformat(normalized_left.replace("Z", "+00:00"))
+    parsed_right = datetime.fromisoformat(normalized_right.replace("Z", "+00:00"))
+    # Alpaca's single-order response can retain nanoseconds that its account
+    # order list rounds to microseconds.  Python and SQLite persist only the
+    # latter reliably, so a one-microsecond difference is the same event when
+    # the independent broker revision and accounting snapshots also match.
+    return abs(parsed_left - parsed_right) <= timedelta(microseconds=1)
+
+
 def _normalize_alpaca_closure_timestamp(value: str | None) -> str | None:
     """Normalize usable broker closure time, falling back to local transaction time."""
     try:
@@ -9661,6 +9683,8 @@ def apply_alpaca_closed_position_broker_correction(
         effective_buy_qty = observed_buy_qty
         effective_buy_price = buy_price
         effective_buy_filled_at = persisted_filled_at if filled_at is None and observed_buy_qty > 0 else filled_at
+        if _alpaca_broker_event_timestamps_match(persisted_filled_at, effective_buy_filled_at):
+            effective_buy_filled_at = persisted_filled_at
         effective_target_sell_price = target_sell_price
         effective_buy_broker_updated_at = persisted_buy_broker_updated_at
         persisted_buy_component_revisions = _decode_alpaca_buy_component_revisions(
@@ -10108,6 +10132,8 @@ def apply_alpaca_closed_position_broker_correction(
         effective_sell_filled_at = (
             persisted_sell_filled_at if sell_filled_at is None and prospective_sold_qty > 0 else sell_filled_at
         )
+        if _alpaca_broker_event_timestamps_match(persisted_sell_filled_at, effective_sell_filled_at):
+            effective_sell_filled_at = persisted_sell_filled_at
         current_sell_observation_is_newer = bool(
             observed_current_sell_leaf_id is not None
             and sell_order_observation_is_newer.get(observed_current_sell_leaf_id, False)
@@ -11901,7 +11927,13 @@ def mark_alpaca_managed_buy_filled(
         ) = current
         effective_buy_order_id = buy_alpaca_order_id if buy_alpaca_order_id is not None else current_buy_order_id
         effective_buy_submitted_at = buy_submitted_at if buy_submitted_at is not None else current_buy_submitted_at
+        if current_buy_order_id == effective_buy_order_id and _alpaca_broker_event_timestamps_match(
+            current_buy_submitted_at, effective_buy_submitted_at
+        ):
+            effective_buy_submitted_at = current_buy_submitted_at
         effective_filled_at = filled_at if filled_at is not None else current_filled_at
+        if _alpaca_broker_event_timestamps_match(current_filled_at, effective_filled_at):
+            effective_filled_at = current_filled_at
         effective_broker_updated_at = current_broker_updated_at
         if (
             broker_timestamp_provided
@@ -12833,14 +12865,23 @@ def update_alpaca_managed_sell_status_if_current(
         conn,
         "update_alpaca_managed_sell_status_if_current",
     ):
-        prior_parent_intent = conn.execute(
+        prior_sell_state = conn.execute(
             """
-            SELECT sell_alpaca_order_id, sell_order_qty, sell_order_limit_price
+            SELECT sell_alpaca_order_id, sell_order_qty, sell_order_limit_price,
+                   sell_submitted_at, sell_expires_at
             FROM alpaca_managed_positions
             WHERE id = ?
             """,
             (position_id,),
         ).fetchone()
+        prior_parent_intent = None if prior_sell_state is None else prior_sell_state[:3]
+        if prior_sell_state is not None and (
+            sell_alpaca_order_id is None or prior_sell_state[0] == sell_alpaca_order_id
+        ):
+            if _alpaca_broker_event_timestamps_match(prior_sell_state[3], sell_submitted_at):
+                sell_submitted_at = prior_sell_state[3]
+            if _alpaca_broker_event_timestamps_match(prior_sell_state[4], sell_expires_at):
+                sell_expires_at = prior_sell_state[4]
         cursor = conn.execute(
             f"""
             UPDATE alpaca_managed_positions
@@ -17670,15 +17711,21 @@ def _process_asset_grid(
         if unexpected_presynchronized:
             unexpected = ", ".join(sorted(unexpected_presynchronized))
             raise ValueError(f"Presynchronized market symbols lack authoritative histories: {unexpected}.")
-        if scoped_signal_history and signal_symbol not in authoritative_symbols:
-            raise ValueError("Pair-scoped signal history requires a distinct canonical authoritative signal history.")
         if (
             scoped_signal_history
             and signal_history is not None
+            and signal_symbol in authoritative_symbols
             and authoritative_histories[signal_symbol] is signal_history
         ):
             raise ValueError("Pair-scoped signal history cannot also be the global canonical signal history.")
-        fallback_symbols = [symbol for symbol in symbols if symbol not in authoritative_symbols]
+        # A bounded or provider-recovered signal belongs only to this strategy
+        # pair.  When no usable full canonical history exists, keep it out of
+        # both the authoritative and legacy global symbol paths.
+        fallback_symbols = [
+            symbol
+            for symbol in symbols
+            if symbol not in authoritative_symbols and not (scoped_signal_history and symbol == signal_symbol)
+        ]
 
         # Validate the complete batch before the first synchronization write so
         # a malformed later symbol cannot leave a partially updated state when

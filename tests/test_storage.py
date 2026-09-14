@@ -428,6 +428,48 @@ class StorageOptimizationTests(unittest.TestCase):
         self.assertIsNotNone(row)
         return str(row[0])
 
+    def test_pair_scoped_signal_without_canonical_history_never_populates_global_symbol(self) -> None:
+        data = sample_strategy_data().rename(
+            columns=lambda column: column.replace("TQQQ_", "RCAX_").replace("QQQ_", "RCAT_")
+        )
+        asset_history = data[[column for column in data if column.startswith("RCAX_")]]
+        signal_history = data[[column for column in data if column.startswith("RCAT_")]]
+        risk_free_history = data[[column for column in data if column.startswith(f"{RISK_FREE_SYMBOL}_")]]
+
+        process_asset_grid(
+            self.conn,
+            data,
+            self.cfg,
+            "RCAX",
+            "RCAT",
+            [30.0],
+            [1.5],
+            rebuild=True,
+            signal_history=signal_history,
+            authoritative_histories={
+                "RCAX": asset_history,
+                RISK_FREE_SYMBOL: risk_free_history,
+            },
+            isolate_strategy_signal_history=True,
+        )
+
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM market_data WHERE symbol = 'RCAT'").fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM market_data WHERE symbol LIKE '@strategy-signal-v1/%'").fetchone()[
+                0
+            ],
+            len(signal_history),
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM strategy_state WHERE asset_symbol = 'RCAX' AND signal_symbol = 'RCAT'"
+            ).fetchone()[0],
+            1,
+        )
+
     def test_strategy_fingerprint_is_independent_from_database_migration_version(self) -> None:
         expected = strategy_config_fingerprint(self.cfg, [30.0], [1.5])
         with patch.object(
@@ -15872,6 +15914,87 @@ class AlpacaManagedStorageTests(unittest.TestCase):
         self.assertEqual(replay_result, (True, before[0]))
         self.assertEqual(after, before)
 
+    def test_buy_fill_replay_accepts_account_list_timestamp_rounding(self) -> None:
+        order_id = "buy-account-list-rounding"
+        position_id = save_alpaca_managed_buy_order(
+            self.conn,
+            symbol="WDCX",
+            alpaca_asset_id="asset-wdcx",
+            signal_symbol="WDC",
+            buy_rsi=30,
+            profit_target_multiple=1.2,
+            buy_signal_date="2026-09-11",
+            buy_client_order_id="rsi-buy-WDCX-20260911",
+            buy_alpaca_order_id=order_id,
+            buy_submitted_at="2026-09-14T12:54:59.49851483Z",
+            buy_status="accepted",
+            buy_order_qty=16,
+            buy_order_limit_price=15.64,
+        )
+        direct_revision = "2026-09-14T13:31:36.493795188Z"
+        direct_filled_at = "2026-09-14T13:31:36.49186897Z"
+        self.assertTrue(
+            mark_alpaca_managed_buy_filled(
+                self.conn,
+                position_id,
+                buy_status="filled",
+                filled_qty=16,
+                filled_avg_price=14.89,
+                filled_at=direct_filled_at,
+                target_sell_price=17.87,
+                buy_fill_broker_updated_at=direct_revision,
+                buy_fill_broker_oldest_updated_at=direct_revision,
+                buy_fill_component_revisions={
+                    order_id: {
+                        "broker_updated_at": direct_revision,
+                        "filled_qty": 16,
+                        "filled_value": 238.24,
+                    }
+                },
+                buy_alpaca_order_id=order_id,
+            )
+        )
+        before = self.conn.execute(
+            "SELECT state_revision, filled_at, buy_fill_broker_updated_at FROM alpaca_managed_positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+
+        replay_result = mark_alpaca_managed_buy_filled(
+            self.conn,
+            position_id,
+            buy_status="filled",
+            filled_qty=16,
+            filled_avg_price=14.89,
+            filled_at="2026-09-14T13:31:36.491869Z",
+            target_sell_price=17.87,
+            buy_fill_broker_updated_at="2026-09-14T13:31:36.493795Z",
+            buy_fill_broker_oldest_updated_at="2026-09-14T13:31:36.493795Z",
+            buy_fill_component_revisions={
+                order_id: {
+                    "broker_updated_at": "2026-09-14T13:31:36.493795Z",
+                    "filled_qty": 16,
+                    "filled_value": 238.24,
+                }
+            },
+            buy_alpaca_order_id=order_id,
+            buy_submitted_at="2026-09-14T12:54:59.498515Z",
+            expected_buy_status="filled",
+            expected_buy_alpaca_order_id=order_id,
+            expected_filled_qty=16,
+            expected_filled_avg_price=14.89,
+            expected_target_sell_price=17.87,
+            expected_sell_client_order_id=None,
+            return_state_revision=True,
+        )
+        after = self.conn.execute(
+            "SELECT state_revision, filled_at, buy_fill_broker_updated_at FROM alpaca_managed_positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+
+        self.assertEqual(replay_result, (True, before[0]))
+        self.assertEqual(before[1], direct_filled_at)
+        self.assertEqual(after, before)
+
     def test_buy_fill_replay_preserves_scale_aware_realized_accounting(self) -> None:
         sell_qty = float(np.nextafter(100.0, np.inf))
         position_id = save_alpaca_managed_buy_order(
@@ -20521,6 +20644,72 @@ class AlpacaManagedStorageTests(unittest.TestCase):
         self.assertFalse(stale_applied)
         self.assertEqual(after, before)
         self.assertEqual(after[1:], ("canceled", "2026-07-20T12:02:00.000000Z"))
+
+    def test_sell_status_replay_accepts_account_list_timestamp_rounding(self) -> None:
+        position_id = self.save_position(
+            symbol="WDCX",
+            client_order_id="rsi-buy-WDCX-account-list-rounding",
+            alpaca_asset_id="asset-wdcx",
+        )
+        sell_client_order_id = "rsi-exit-WDCX-account-list-rounding"
+        sell_order_id = "sell-account-list-rounding"
+        direct_submitted_at = "2026-09-14T13:32:43.37460377Z"
+        direct_expires_at = "2026-12-14T21:00:00.12345678Z"
+        direct_revision = "2026-09-14T13:32:43.374604188Z"
+        record_alpaca_managed_sell_order(
+            self.conn,
+            position_id,
+            sell_client_order_id=sell_client_order_id,
+            sell_alpaca_order_id=sell_order_id,
+            sell_submitted_at=direct_submitted_at,
+            sell_status="new",
+            sell_expires_at=direct_expires_at,
+            sell_order_qty=2,
+            sell_order_limit_price=150,
+        )
+        self.assertTrue(
+            update_alpaca_managed_sell_status_if_current(
+                self.conn,
+                position_id,
+                expected_sell_client_order_id=sell_client_order_id,
+                sell_status="new",
+                sell_alpaca_order_id=sell_order_id,
+                sell_submitted_at=direct_submitted_at,
+                sell_expires_at=direct_expires_at,
+                sell_order_qty=2,
+                sell_order_limit_price=150,
+                observed_sell_filled_qty=0,
+                sell_broker_updated_at=direct_revision,
+            )
+        )
+        before = self.conn.execute(
+            "SELECT state_revision, sell_status, sell_submitted_at, sell_expires_at, "
+            "sell_observation_broker_updated_at FROM alpaca_managed_positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+
+        replay_is_current = update_alpaca_managed_sell_status_if_current(
+            self.conn,
+            position_id,
+            expected_sell_client_order_id=sell_client_order_id,
+            sell_status="new",
+            sell_alpaca_order_id=sell_order_id,
+            sell_submitted_at="2026-09-14T13:32:43.374604Z",
+            sell_expires_at="2026-12-14T21:00:00.123457Z",
+            sell_order_qty=2,
+            sell_order_limit_price=150,
+            observed_sell_filled_qty=0,
+            sell_broker_updated_at="2026-09-14T13:32:43.374604Z",
+        )
+        after = self.conn.execute(
+            "SELECT state_revision, sell_status, sell_submitted_at, sell_expires_at, "
+            "sell_observation_broker_updated_at FROM alpaca_managed_positions WHERE id = ?",
+            (position_id,),
+        ).fetchone()
+
+        self.assertTrue(replay_is_current)
+        self.assertEqual(after, before)
+        self.assertEqual(before[2:4], (direct_submitted_at, direct_expires_at))
 
     def test_rejected_sell_fill_replay_does_not_mutate_parent_or_report_current(self) -> None:
         position_id = self.save_position(

@@ -173,6 +173,7 @@ _ALPACA_SUBDOLLAR_PRICE_TICK = Decimal("0.0001")
 _BUY_BATCH_CASH_FRACTION_PER_ELIGIBLE_SIGNAL = 0.05
 _ALPACA_OPEN_ORDER_PAGE_LIMIT = 500
 _ALPACA_OPEN_ORDER_MAX_PAGES = 20
+_ALPACA_RECONCILIATION_ORDER_SNAPSHOT_THRESHOLD = 2
 _ALPACA_REPLACEMENT_CHAIN_LIMIT = 20
 _ALPACA_ORDER_STATUSES = {
     "accepted",
@@ -1037,6 +1038,12 @@ class _IncompleteOpenOrderPayloadError(_OpenOrderSnapshotError):
         )
 
 
+@dataclass
+class _ReconciliationOrderSnapshot:
+    attempted: bool = False
+    orders_by_id: dict[str, dict] | None = None
+
+
 class _DuplicateAlpacaJsonKeyError(ValueError):
     """Raised when an authoritative Alpaca object has ambiguous keys."""
 
@@ -1600,12 +1607,15 @@ def _alpaca_has_open_order(
     return _orders_have_open_order(_alpaca_open_orders(cfg, headers), symbol, side)
 
 
-def _alpaca_open_orders(
+def _alpaca_account_orders(
     cfg: AlpacaOrderConfig,
     headers: dict[str, str],
     *,
+    status: str,
     equity_scope_asset_ids: Collection[str] = (),
 ) -> list[dict]:
+    if status not in {"open", "closed", "all"}:
+        raise ValueError("Alpaca account-order status must be 'open', 'closed', or 'all'.")
     base_url = _canonical_alpaca_paper_base_url(cfg)
     transmitted_sensitive_values = _merged_alpaca_sensitive_values(
         tuple(headers.get(header_name, "") for header_name in ("APCA-API-KEY-ID", "APCA-API-SECRET-KEY"))
@@ -1620,7 +1630,7 @@ def _alpaca_open_orders(
 
     for _ in range(_ALPACA_OPEN_ORDER_MAX_PAGES):
         params: dict[str, object] = {
-            "status": "open",
+            "status": status,
             "asset_class": _ALPACA_US_EQUITY_ASSET_CLASS,
             "limit": _ALPACA_OPEN_ORDER_PAGE_LIMIT,
             "direction": "desc",
@@ -1737,6 +1747,20 @@ def _alpaca_open_orders(
         f"Alpaca open-order pagination exceeded {_ALPACA_OPEN_ORDER_MAX_PAGES} pages; "
         "refusing to perform conflict checks on an incomplete order list",
         observed_rows,
+    )
+
+
+def _alpaca_open_orders(
+    cfg: AlpacaOrderConfig,
+    headers: dict[str, str],
+    *,
+    equity_scope_asset_ids: Collection[str] = (),
+) -> list[dict]:
+    return _alpaca_account_orders(
+        cfg,
+        headers,
+        status="open",
+        equity_scope_asset_ids=equity_scope_asset_ids,
     )
 
 
@@ -4551,6 +4575,15 @@ class AlpacaClient:
             },
         )
 
+    def all_orders(self) -> list[dict]:
+        """Load one complete account order snapshot for reconciliation."""
+        return _alpaca_account_orders(
+            self.cfg,
+            self.headers,
+            status="all",
+            equity_scope_asset_ids=self.equity_scope_asset_ids,
+        )
+
     def submit_limit_buy_order(
         self,
         *,
@@ -6443,6 +6476,19 @@ def _fetch_order_replacement_chain(
     return leaf, chain
 
 
+def _cached_reconciliation_order_payload(
+    client: AlpacaClient,
+    order_id: str | None,
+) -> dict | None:
+    if order_id is None:
+        return None
+    cache = vars(client).get("_reconciliation_order_payloads")
+    if not isinstance(cache, Mapping):
+        return None
+    payload = cache.get(order_id)
+    return payload if isinstance(payload, dict) else None
+
+
 def _fetch_order_payload(
     client: AlpacaClient,
     order_id: str | None,
@@ -6451,15 +6497,17 @@ def _fetch_order_payload(
     validate_order_timestamps: bool = True,
 ) -> tuple[dict, list[dict]]:
     used_direct_id_lookup = order_id is not None
-    response = client.get_order(order_id) if order_id else client.get_order_by_client_order_id(client_order_id)
-    if response.status_code == 404 and order_id:
-        response = client.get_order_by_client_order_id(client_order_id)
-        used_direct_id_lookup = False
-    _require_2xx_response(response)
-    payload = _response_json(
-        response,
-        validate_order_timestamps=validate_order_timestamps,
-    )
+    payload = _cached_reconciliation_order_payload(client, order_id)
+    if payload is None:
+        response = client.get_order(order_id) if order_id else client.get_order_by_client_order_id(client_order_id)
+        if response.status_code == 404 and order_id:
+            response = client.get_order_by_client_order_id(client_order_id)
+            used_direct_id_lookup = False
+        _require_2xx_response(response)
+        payload = _response_json(
+            response,
+            validate_order_timestamps=validate_order_timestamps,
+        )
     if used_direct_id_lookup and _optional_alpaca_broker_identifier(payload.get("id")) != order_id:
         raise _OrderLookupIdentityError(payload)
     return _fetch_order_replacement_chain(
@@ -6486,9 +6534,11 @@ def _fetch_durable_buy_cancellation_lineages(
     seen_order_ids: set[str] = set()
     for persisted_order_id in order_ids:
         try:
-            response = client.get_order(persisted_order_id)
-            _require_2xx_response(response)
-            direct_order = _response_json(response)
+            direct_order = _cached_reconciliation_order_payload(client, persisted_order_id)
+            if direct_order is None:
+                response = client.get_order(persisted_order_id)
+                _require_2xx_response(response)
+                direct_order = _response_json(response)
             if _optional_str(direct_order.get("id")) != persisted_order_id:
                 raise BuyOrderIdentityError("lookup returned a different broker order ID")
             leaf, lineage = _fetch_order_replacement_chain(
@@ -6594,9 +6644,11 @@ def _historical_managed_sell_lineages(
     for persisted_order_id in alpaca_managed_sell_fill_order_ids(conn, position_id):
         if persisted_order_id in observed_orders:
             continue
-        response = client.get_order(persisted_order_id)
-        _require_2xx_response(response)
-        direct_order = _response_json(response)
+        direct_order = _cached_reconciliation_order_payload(client, persisted_order_id)
+        if direct_order is None:
+            response = client.get_order(persisted_order_id)
+            _require_2xx_response(response)
+            direct_order = _response_json(response)
         if _optional_str(direct_order.get("id")) != persisted_order_id:
             raise SellOrderIdentityError("historical sell-fill audit returned a different broker order ID")
         leaf, lineage = _resolve_order_replacement_chain(client, direct_order)
@@ -13972,6 +14024,7 @@ def _reconcile_alpaca_managed_positions_pass(
     *,
     audit_closed: bool,
     skip_active_position_ids: frozenset[int] = frozenset(),
+    order_snapshot: _ReconciliationOrderSnapshot | None = None,
 ) -> pd.DataFrame:
     columns = [
         "Position ID",
@@ -14030,6 +14083,51 @@ def _reconcile_alpaca_managed_positions_pass(
         sensitive_values,
         _alpaca_client_sensitive_values(client),
     )
+    order_snapshot = order_snapshot or _ReconciliationOrderSnapshot()
+    tracked_order_ids = {
+        order_id
+        for position in reconciliation_candidates.to_dict("records")
+        for value in (
+            position.get("buy_alpaca_order_id"),
+            position.get("sell_alpaca_order_id"),
+        )
+        if (order_id := _optional_alpaca_broker_identifier(value)) is not None
+    }
+    snapshot_candidate_count = (
+        len(recently_closed_positions)
+        if audit_closed
+        else sum(
+            _optional_alpaca_broker_identifier(position.get("sell_alpaca_order_id")) is not None
+            for position in positions.to_dict("records")
+        )
+    )
+    if (
+        snapshot_candidate_count >= _ALPACA_RECONCILIATION_ORDER_SNAPSHOT_THRESHOLD
+        and len(tracked_order_ids) >= _ALPACA_RECONCILIATION_ORDER_SNAPSHOT_THRESHOLD
+        and not order_snapshot.attempted
+    ):
+        order_snapshot.attempted = True
+        try:
+            account_orders = client.all_orders()
+            if not isinstance(account_orders, list):
+                raise TypeError("Alpaca all-orders snapshot must be a list.")
+        except Exception:
+            # An old closed order can make the all-orders validation fail even
+            # when current open orders are usable. Preserve the active-sell
+            # fast path before falling back to exact lookups.
+            try:
+                account_orders = client.open_orders()
+                if not isinstance(account_orders, list):
+                    raise TypeError("Alpaca open-orders snapshot must be a list.")
+            except Exception:
+                account_orders = []
+        order_snapshot.orders_by_id = {
+            order_id: order
+            for order in account_orders
+            if (order_id := _optional_alpaca_broker_identifier(order.get("id"))) is not None
+        }
+    if order_snapshot.orders_by_id is not None:
+        client._reconciliation_order_payloads = order_snapshot.orders_by_id
 
     def durable_note(value: str | None) -> str | None:
         return _alpaca_durable_diagnostic_note(
@@ -17556,6 +17654,7 @@ def _reconcile_alpaca_managed_positions_impl(
     phase_results: list[pd.DataFrame] = []
     phase_failures: list[str] = []
     closed_audit_blocked = False
+    order_snapshot = _ReconciliationOrderSnapshot()
 
     def combined_phase_results() -> pd.DataFrame:
         nonempty_results = [result for result in phase_results if not result.empty]
@@ -17571,6 +17670,7 @@ def _reconcile_alpaca_managed_positions_impl(
                 conn,
                 cfg,
                 audit_closed=False,
+                order_snapshot=order_snapshot,
             )
         )
     except AlpacaReconciliationError as exc:
@@ -17692,6 +17792,7 @@ def _reconcile_alpaca_managed_positions_impl(
                         cfg,
                         audit_closed=True,
                         skip_active_position_ids=initial_active_position_ids,
+                        order_snapshot=order_snapshot,
                     )
                 )
             except AlpacaReconciliationError as exc:

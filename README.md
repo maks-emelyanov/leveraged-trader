@@ -16,7 +16,9 @@ Licensed under the MIT License. See [LICENSE](LICENSE).
   products without an underlying RSI proxy are held for review because applying the inverse entry
   rule to the product's own RSI would reverse the intended signal.
 - Downloads daily Yahoo Finance OHLCV data, with optional raw-price Tradier fallback for skipped
-  symbols when automatic price adjustment is disabled.
+  symbols when automatic price adjustment is disabled. If an otherwise usable RSI symbol has bad
+  rows outside a newly listed asset's lifetime, it retries an asset-bounded signal window without
+  publishing that recovered history as the symbol's global canonical history.
 - Computes SMA-seeded Wilder RSI and optimizes low-RSI long entries, high-RSI inverse-product entries, and shared profit-target sell multiples.
 - Models each profit target as a resting, tick-rounded GTC limit: favorable opening gaps fill at the open, and intraday High touches fill at the limit.
   On an entry session, the daily-bar model assumes the managed target becomes active immediately
@@ -680,6 +682,9 @@ Buy orders:
 Managed sell orders:
 
 - Are reconciled from persisted managed buy records, not from the latest optimized sell signal.
+- Reuse one strictly validated, paginated Alpaca account-order snapshot across multi-position
+  reconciliation, with exact order-ID lookups for missing rows or replacement links and a safe
+  fallback to the open-order snapshot if older account history cannot be validated.
 - Use the actual Alpaca filled average buy price times the original sell multiple.
 - Create a protective GTC sell for confirmed whole shares even while the parent buy remains partially filled, and replace it if later buy fills change the covered quantity or average-fill target—even if the prior partial-fill sell already completed.
 - Sell the remaining managed quantity with a GTC limit order; cumulative partial fills remain active until the full buy quantity is closed.
@@ -733,16 +738,23 @@ Managed position lifecycle:
 The leveraged asset's settled sessions define the strategy trading calendar both during live
 processing and when SQLite data is rebuilt into an equity curve. Missing signal sessions never
 remove asset sessions; RSI is calculated from the signal's complete canonical history and aligned
-as-of to asset sessions. An aligned RSI observation may lag its asset session by at most seven
-calendar days. A final Friday may additionally use a settled Saturday or Sunday observation from a
-24/7 proxy for the following open; later weekdays and weekend observations spanning an intervening
-business day fail closed instead of driving stale asset history. Reports apply the same rule. The risk-free
-benchmark is left-joined and forward-filled on that asset calendar, keeping reported strategy days
-and benchmark returns consistent across source gaps.
+as-of to asset sessions. When strict full-history validation fails only because of history outside
+the asset's lifetime, the workflow retries a bounded signal window with at least one year of warm-up.
+That recovery is namespaced to the exact asset/signal pair and never replaces or populates the global
+canonical symbol history. A new self-signaled product without the 15 settled observations required
+for the default 14-day RSI is reported as `warming_up` rather than as a data failure. An aligned RSI
+observation may lag its asset session by at most seven calendar days. A final Friday may additionally
+use a settled Saturday or Sunday observation from a 24/7 proxy for the following open; later weekdays
+and weekend observations spanning an intervening business day fail closed instead of driving stale
+asset history. Reports apply the same rule. The risk-free benchmark is left-joined and forward-filled
+on that asset calendar, keeping reported strategy days and benchmark returns consistent across source
+gaps.
 
 Canonical market histories are compared with their persisted symbols in one bulk read, and SQLite
-writes are limited to new, changed, or removed sessions. Cached signal and risk-free histories are
-synchronized once per workflow while their downloaded frames remain unchanged. Boundary-removal
+writes are limited to new, changed, or removed sessions. Pair-scoped signal recovery is stored under
+a private strategy-signal namespace and is excluded from both canonical and legacy global-symbol
+writes. Cached canonical signal and risk-free histories are synchronized once per workflow while
+their downloaded frames remain unchanged. Boundary-removal
 confirmation records at most one observation per top-level run, so the long and short workflows
 cannot confirm the same transient truncation twice. A commit from another database connection
 discards that run-local synchronization cache before the next asset is processed. If a newly

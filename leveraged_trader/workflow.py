@@ -110,6 +110,7 @@ from .universe import determine_workflow_asset_groups
 
 DEFAULT_WORKFLOW_CONCURRENCY = 4
 MARKET_DATA_BATCH_SIZE = 32
+SIGNAL_HISTORY_RECOVERY_MIN_LOOKBACK_DAYS = 366
 SQLITE_BUSY_TIMEOUT_MS = 60_000
 _MONOTONIC_CLOCK = time.monotonic
 _WALL_CLOCK = time.time
@@ -1746,6 +1747,7 @@ class PreparedAssetRun:
     signal_history: pd.DataFrame
     risk_free_history: pd.DataFrame
     canonical_signal_history: pd.DataFrame | None = None
+    isolate_signal_history: bool = False
     prevalidated_asset_safe_tail_rows: dict[str, tuple[object, ...]] | None = None
 
 
@@ -1779,6 +1781,9 @@ class _WorkflowMarketDataSession:
         self.signal_locks = self.history_locks
         self.signal_histories = self.histories
         self.signal_failures = self.failures
+        self.canonical_signal_failures: dict[str, str] = {}
+        self.bounded_signal_histories: dict[tuple[str, str], pd.DataFrame] = {}
+        self.bounded_signal_failures: dict[tuple[str, str], str] = {}
         self.calendar_signal_histories: dict[tuple[str, str], pd.DataFrame] = {}
         self.calendar_signal_failures: dict[tuple[str, str], str] = {}
         self.risk_free_history_lock = self.history_locks.setdefault(RISK_FREE_SYMBOL, asyncio.Lock())
@@ -3246,6 +3251,7 @@ def _process_asset_grid_for_db(
     strategy_session: _WorkflowStrategySession | None = None,
     rsi_entry_rule: str = "lower",
     canonical_signal_history: pd.DataFrame | None = None,
+    isolate_signal_history: bool | None = None,
     strategy_state_verification: str = "trusted",
     workflow_deadline: _WorkflowDeadline | None = None,
     strategy_state_preverified: bool = False,
@@ -3266,19 +3272,24 @@ def _process_asset_grid_for_db(
 
     transaction_started = time.perf_counter()
     _check_workflow_deadline(workflow_deadline, "before an asset transaction")
-    canonical_signal_history = canonical_signal_history if canonical_signal_history is not None else signal_history
+    if isolate_signal_history is not None and type(isolate_signal_history) is not bool:
+        raise ValueError("isolate_signal_history must be a boolean or None.")
+    if isolate_signal_history is None:
+        isolate_signal_history = bool(
+            canonical_signal_history is not None and signal_history is not canonical_signal_history
+        )
+    if not isolate_signal_history:
+        canonical_signal_history = canonical_signal_history if canonical_signal_history is not None else signal_history
     # Only the run-scoped provider snapshot may occupy the global symbol cache.
     # A calendar recovery is passed separately below and storage namespaces it
     # to this strategy pair, so another pair cannot inherit its RSI history.
-    authoritative_histories = {
-        asset_symbol: asset_history,
-        signal_symbol: canonical_signal_history,
-        RISK_FREE_SYMBOL: risk_free_history,
-    }
-    shared_histories = {
-        signal_symbol: canonical_signal_history,
-        RISK_FREE_SYMBOL: risk_free_history,
-    }
+    authoritative_histories = {asset_symbol: asset_history}
+    shared_histories: dict[str, pd.DataFrame] = {}
+    if canonical_signal_history is not None:
+        authoritative_histories[signal_symbol] = canonical_signal_history
+        shared_histories[signal_symbol] = canonical_signal_history
+    authoritative_histories[RISK_FREE_SYMBOL] = risk_free_history
+    shared_histories[RISK_FREE_SYMBOL] = risk_free_history
     transaction = (
         strategy_session.immediate_transaction()
         if strategy_session is not None
@@ -3365,7 +3376,7 @@ def _process_asset_grid_for_db(
                 ),
                 grid_compute_observer=observe_grid_compute if phase_timings is not None else None,
                 rsi_entry_rule=rsi_entry_rule,
-                isolate_strategy_signal_history=signal_history is not canonical_signal_history,
+                isolate_strategy_signal_history=isolate_signal_history,
                 strategy_state_verification=strategy_state_verification,
                 strategy_state_preverified=not actual_rebuild,
                 _prevalidated_safe_tail_rows=(None if actual_rebuild else prevalidated_asset_safe_tail_rows),
@@ -3698,12 +3709,13 @@ def _skipped_asset_result(
     message: str,
     asset_progress: AssetProgress | None,
     rows_processed: int | None = None,
+    status: str = "skipped",
 ) -> AssetRunResult:
     if asset_progress is not None:
         asset_progress.start_asset(
             asset=job.asset_symbol,
             signal=job.signal_symbol,
-            action="skipping",
+            action="warming up" if status == "warming_up" else "skipping",
         )
     return AssetRunResult(
         workflow_idx=job.workflow_idx,
@@ -3711,9 +3723,30 @@ def _skipped_asset_result(
         signal_symbol=job.signal_symbol,
         action=plan.action,
         rows_processed=rows_processed,
-        status="skipped",
+        status=status,
         message=message,
         workflow=job.workflow,
+    )
+
+
+def _signal_history_recovery_start(asset_history: pd.DataFrame, rsi_period: int) -> str:
+    """Bound a pair-only signal retry while retaining ample RSI warm-up data."""
+    lookback_days = max(SIGNAL_HISTORY_RECOVERY_MIN_LOOKBACK_DAYS, int(rsi_period) * 3)
+    earliest_asset_session = pd.Timestamp(asset_history.index.min()).date()
+    return (earliest_asset_session - timedelta(days=lookback_days)).isoformat()
+
+
+def _rsi_warmup_message(outcome: PreparedAssetRun, rsi_period: int) -> str | None:
+    if outcome.job.asset_symbol != outcome.job.signal_symbol:
+        return None
+    observations = len(outcome.signal_history)
+    required = int(rsi_period) + 1
+    if observations >= required:
+        return None
+    remaining = required - observations
+    return (
+        f"RSI warm-up: {observations} of {required} settled {outcome.job.signal_symbol} "
+        f"observations are available; {remaining} more required."
     )
 
 
@@ -3732,6 +3765,9 @@ async def _prepare_workflow_asset(
     risk_free_history_lock: asyncio.Lock,
     risk_free_histories: dict[str, pd.DataFrame],
     signal_failures: dict[str, str] | None = None,
+    canonical_signal_failures: dict[str, str] | None = None,
+    bounded_signal_histories: dict[tuple[str, str], pd.DataFrame] | None = None,
+    bounded_signal_failures: dict[tuple[str, str], str] | None = None,
     calendar_signal_histories: dict[tuple[str, str], pd.DataFrame] | None = None,
     calendar_signal_failures: dict[tuple[str, str], str] | None = None,
     risk_free_failures: dict[str, str] | None = None,
@@ -3778,6 +3814,12 @@ async def _prepare_workflow_asset(
     _check_workflow_deadline(workflow_deadline, "before market-data downloads")
     if signal_failures is None:
         signal_failures = {}
+    if canonical_signal_failures is None:
+        canonical_signal_failures = {}
+    if bounded_signal_histories is None:
+        bounded_signal_histories = {}
+    if bounded_signal_failures is None:
+        bounded_signal_failures = {}
     if calendar_signal_histories is None:
         calendar_signal_histories = {}
     if calendar_signal_failures is None:
@@ -3810,7 +3852,7 @@ async def _prepare_workflow_asset(
     async with signal_lock:
         signal_failure = signal_failures.get(job.signal_symbol)
         calendar_signal_failure = calendar_signal_failures.get(calendar_signal_key)
-    if signal_failure is not None:
+    if signal_failure is not None and job.signal_symbol == job.asset_symbol:
         return _skipped_asset_result(
             job=job,
             plan=plan,
@@ -3923,7 +3965,7 @@ async def _prepare_workflow_asset(
 
     async with signal_lock:
         signal_failure = signal_failures.get(job.signal_symbol)
-        if signal_failure is not None:
+        if signal_failure is not None and job.signal_symbol == job.asset_symbol:
             return _skipped_asset_result(
                 job=job,
                 plan=plan,
@@ -3939,7 +3981,13 @@ async def _prepare_workflow_asset(
                 asset_progress=asset_progress,
             )
         canonical_signal_history = signal_histories.get(job.signal_symbol)
-        if canonical_signal_history is None:
+        canonical_signal_failure = canonical_signal_failures.get(job.signal_symbol)
+        if canonical_signal_history is None and canonical_signal_failure is None:
+            # A symbol that already failed as a full asset history has also
+            # failed the identical canonical signal request.  Keep that role
+            # failure separate so a bounded pair-only signal can still run.
+            canonical_signal_failure = signal_failure
+        if canonical_signal_history is None and canonical_signal_failure is None:
             if market_data_session is not None:
                 market_data_session.individual_retry_count += 1
             try:
@@ -3956,34 +4004,78 @@ async def _prepare_workflow_asset(
                 )
             except MarketDataDownloadError as exc:
                 _check_workflow_deadline(workflow_deadline, "during market-data downloads")
-                signal_failure = str(exc)
-                signal_failures[job.signal_symbol] = signal_failure
-                return _skipped_asset_result(
-                    job=job,
-                    plan=plan,
-                    message=signal_failure,
-                    asset_progress=asset_progress,
-                )
-            if canonical_signal_history.empty:
-                signal_failure = f"No settled daily signal history is available for {job.signal_symbol}."
-                signal_failures[job.signal_symbol] = signal_failure
-                return _skipped_asset_result(
-                    job=job,
-                    plan=plan,
-                    message=signal_failure,
-                    asset_progress=asset_progress,
-                )
-            signal_histories[job.signal_symbol] = canonical_signal_history
+                canonical_signal_failure = str(exc)
+                canonical_signal_failures[job.signal_symbol] = canonical_signal_failure
+            else:
+                if canonical_signal_history.empty:
+                    canonical_signal_failure = f"No settled daily signal history is available for {job.signal_symbol}."
+                    canonical_signal_failures[job.signal_symbol] = canonical_signal_failure
+                    canonical_signal_history = None
+                else:
+                    signal_histories[job.signal_symbol] = canonical_signal_history
 
         signal_history = calendar_signal_histories.get(calendar_signal_key)
+        recovery_start: str | None = None
+        if signal_history is None and canonical_signal_history is None:
+            recovery_start = _signal_history_recovery_start(asset_history, base_cfg.rsi_period)
+            bounded_signal_key = (job.signal_symbol, recovery_start)
+            signal_history = bounded_signal_histories.get(bounded_signal_key)
+            retry_failure = bounded_signal_failures.get(bounded_signal_key)
+            if signal_history is None and retry_failure is None:
+                if market_data_session is not None:
+                    market_data_session.individual_retry_count += 1
+                try:
+                    signal_history = await _timed_run_blocking(
+                        phase_timings,
+                        "download",
+                        load_signal_history,
+                        job.signal_symbol,
+                        start=recovery_start,
+                        end=None,
+                        auto_adjust=base_cfg.auto_adjust,
+                        tradier_cfg=tradier_cfg,
+                        deadline_monotonic=(
+                            None if workflow_deadline is None else workflow_deadline.monotonic_deadline
+                        ),
+                        executor=download_executor,
+                    )
+                except MarketDataDownloadError as exc:
+                    _check_workflow_deadline(workflow_deadline, "during market-data downloads")
+                    retry_failure = str(exc)
+                    bounded_signal_failures[bounded_signal_key] = retry_failure
+                else:
+                    if signal_history.empty:
+                        retry_failure = "the provider returned no settled daily rows"
+                        bounded_signal_failures[bounded_signal_key] = retry_failure
+                        signal_history = None
+                    else:
+                        bounded_signal_histories[bounded_signal_key] = signal_history
+            if retry_failure is not None:
+                calendar_signal_failure = (
+                    f"Full {job.signal_symbol} signal history was unusable ({canonical_signal_failure}); "
+                    f"the pair-scoped retry from {recovery_start} also failed: {retry_failure}"
+                )
+                calendar_signal_failures[calendar_signal_key] = calendar_signal_failure
+                return _skipped_asset_result(
+                    job=job,
+                    plan=plan,
+                    message=calendar_signal_failure,
+                    asset_progress=asset_progress,
+                )
+
         if signal_history is None:
+            signal_history = canonical_signal_history
+
+        if calendar_signal_key not in calendar_signal_histories:
+            assert signal_history is not None
+            calendar_recovery_source = signal_history
             if job.signal_symbol == job.asset_symbol or signal_history_overlaps_calendar(
                 calendar_symbol=job.asset_symbol,
                 calendar_history=asset_history,
                 signal_symbol=job.signal_symbol,
-                signal_history=canonical_signal_history,
+                signal_history=signal_history,
             ):
-                signal_history = canonical_signal_history
+                pass
             else:
                 for (_candidate_asset, candidate_signal), candidate_history in calendar_signal_histories.items():
                     recovered_symbols = candidate_history.attrs.get(TRADIER_RECOVERED_SYMBOLS_ATTR, [])
@@ -3997,6 +4089,8 @@ async def _prepare_workflow_asset(
                     ):
                         signal_history = candidate_history
                         break
+                else:
+                    signal_history = None
             if signal_history is None:
                 try:
                     signal_history = await _timed_run_blocking(
@@ -4006,7 +4100,7 @@ async def _prepare_workflow_asset(
                         calendar_symbol=job.asset_symbol,
                         calendar_history=asset_history,
                         signal_symbol=job.signal_symbol,
-                        signal_history=canonical_signal_history,
+                        signal_history=calendar_recovery_source,
                         auto_adjust=base_cfg.auto_adjust,
                         tradier_cfg=tradier_cfg,
                         executor=download_executor,
@@ -4014,6 +4108,12 @@ async def _prepare_workflow_asset(
                 except MarketDataDownloadError as exc:
                     _check_workflow_deadline(workflow_deadline, "during market-data downloads")
                     calendar_signal_failure = str(exc)
+                    if canonical_signal_history is None:
+                        calendar_signal_failure = (
+                            f"Full {job.signal_symbol} signal history was unusable "
+                            f"({canonical_signal_failure}); pair-scoped calendar recovery failed: "
+                            f"{calendar_signal_failure}"
+                        )
                     calendar_signal_failures[calendar_signal_key] = calendar_signal_failure
                     return _skipped_asset_result(
                         job=job,
@@ -4022,6 +4122,8 @@ async def _prepare_workflow_asset(
                         asset_progress=asset_progress,
                     )
             calendar_signal_histories[calendar_signal_key] = signal_history
+
+        isolate_signal_history = signal_history is not canonical_signal_history
 
     data = _strategy_data_from_authoritative_histories(
         asset_symbol=job.asset_symbol,
@@ -4057,6 +4159,7 @@ async def _prepare_workflow_asset(
         signal_history=signal_history,
         risk_free_history=risk_free_history,
         canonical_signal_history=canonical_signal_history,
+        isolate_signal_history=isolate_signal_history,
         prevalidated_asset_safe_tail_rows=prevalidated_asset_safe_tail_rows,
     )
 
@@ -4100,6 +4203,7 @@ async def _complete_workflow_asset(
                 strategy_session,
                 rsi_entry_rule,
                 canonical_signal_history=outcome.canonical_signal_history,
+                isolate_signal_history=outcome.isolate_signal_history,
                 strategy_state_verification=strategy_state_verification,
                 workflow_deadline=workflow_deadline,
                 strategy_state_preverified=outcome.plan.strategy_state_preverified,
@@ -4112,11 +4216,18 @@ async def _complete_workflow_asset(
         # storage, runtime-integrity, concurrency, or programming failure and
         # must abort the workflow before reports or broker work can proceed.
         except AssetMarketDataError as exc:
+            warmup_message = (
+                _rsi_warmup_message(outcome, base_cfg.rsi_period)
+                if str(exc).startswith("No finite RSI observations")
+                else None
+            )
             return _skipped_asset_result(
                 job=outcome.job,
                 plan=outcome.plan,
-                message=str(exc),
+                message=warmup_message or str(exc),
                 asset_progress=asset_progress,
+                rows_processed=len(outcome.data) if warmup_message is not None else None,
+                status="warming_up" if warmup_message is not None else "skipped",
             )
 
         return AssetRunResult(
@@ -4204,6 +4315,9 @@ async def _run_asset_pipeline(
     signal_locks = market_data_session.signal_locks
     signal_histories = market_data_session.signal_histories
     signal_failures = market_data_session.signal_failures
+    canonical_signal_failures = market_data_session.canonical_signal_failures
+    bounded_signal_histories = market_data_session.bounded_signal_histories
+    bounded_signal_failures = market_data_session.bounded_signal_failures
     calendar_signal_histories = market_data_session.calendar_signal_histories
     calendar_signal_failures = market_data_session.calendar_signal_failures
     risk_free_history_lock = market_data_session.risk_free_history_lock
@@ -4233,6 +4347,9 @@ async def _run_asset_pipeline(
             risk_free_history_lock=risk_free_history_lock,
             risk_free_histories=risk_free_histories,
             signal_failures=signal_failures,
+            canonical_signal_failures=canonical_signal_failures,
+            bounded_signal_histories=bounded_signal_histories,
+            bounded_signal_failures=bounded_signal_failures,
             calendar_signal_histories=calendar_signal_histories,
             calendar_signal_failures=calendar_signal_failures,
             risk_free_failures=risk_free_failures,
