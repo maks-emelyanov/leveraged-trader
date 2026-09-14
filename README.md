@@ -478,6 +478,10 @@ CSV reports are written to `outputs/` by default:
 - `sell_signals.csv`: winning-strategy sell-event rows, including targets executed on the latest
   settled session. These are research results, not live order instructions.
 - `managed_positions.csv`: persisted managed Alpaca buy and protective-sell lifecycle state.
+- `alpaca_inactive_holdings.csv`: open holdings that Alpaca reports as inactive and non-tradable,
+  retained at the paper broker with quantity, estimated remaining buy cost, frozen target, and
+  last-check accounting. These amounts are lifecycle accounting, not realized P/L or a current
+  market valuation.
 - `alpaca_realized_pnl.csv`: realized P/L summaries derived from complete managed-position fills.
 - `alpaca_reconciliation_results.csv`: per-position results from the latest managed-position
   reconciliation.
@@ -507,6 +511,8 @@ managed_positions = snapshot.read_csv("managed_positions.csv")
 The returned in-memory files all belong to `snapshot.generation`, even if another workflow publishes
 after the load; `snapshot.snapshot_kind` and `snapshot.filenames` describe the manifest scope. A
 missing, publishing, changed, or checksum-mismatched snapshot is rejected.
+Snapshot schema version 2 adds `alpaca_inactive_holdings.csv` to every broker-state generation;
+consumers should use `snapshot.filenames` rather than assuming the older fixed file set.
 `validate_alpaca_snapshot(output_dir)` remains available as an integrity check of the current paths,
 but its result must not be used to authorize later direct opens because publication can begin between
 the validation and those opens.
@@ -690,10 +696,13 @@ Managed sell orders:
 - Resubmit expired GTC sells when renewal is enabled and the managed position is still open.
 - Require recurring runs with managed sell submission enabled for renewal and resubmission to occur; persisted state alone does not schedule broker requests.
 - Are not resubmitted automatically after a sell order is rejected or manually canceled.
-- Quarantine an exact-quantity Alpaca paper position when both its deterministic sell is absent and
-  Alpaca identifies the held asset as inactive and non-tradable. The active managed row continues to
-  block new buys and is rechecked on recurring runs; this broker-only paper-account condition is
-  reported as `broker_inactive` instead of failing every otherwise healthy workflow run.
+- Move an exact-quantity Alpaca paper position into the broker-retained inactive-holdings lane when
+  both its deterministic sell is absent and Alpaca identifies the held asset as inactive and
+  non-tradable. The active managed row continues to block new buys and is rechecked on recurring
+  runs; it is reported in `alpaca_inactive_holdings.csv` instead of as a sell-order outcome. If the
+  asset becomes tradable again, the workflow automatically resumes managed-sell submission. Its
+  monitoring event remains in the complete reconciliation audit, but it is excluded from
+  `alpaca_sell_order_results.csv`. The holding does not need to be removed from Alpaca.
 - Skip GTC sell submission for legacy fractional managed quantities and keep the managed position active for review.
 - Keep the managed position active, blocking new buys, until cumulative managed sell fills close the full buy quantity.
 - Block automatic renewal and require manual review if Alpaca reports a partial fill without a valid average fill price, if observed fills regress, or if cumulative sells exceed the managed buy quantity.

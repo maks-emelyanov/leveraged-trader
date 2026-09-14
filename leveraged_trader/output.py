@@ -153,6 +153,7 @@ STATUS_STYLES = {
     "managed_only": "cyan",
     "open_order": "cyan",
     "renewed": "green",
+    "retained": "cyan",
     "symbol_migrated": "cyan",
     "disabled": "yellow",
     "fill_quantity_regression": "red",
@@ -830,6 +831,38 @@ class WorkflowReporter:
             ],
             empty_message="No managed Alpaca positions to reconcile.",
             caption="Full client and Alpaca order IDs are written to alpaca_reconciliation_results.csv.",
+        )
+
+    def inactive_holdings(self, df: pd.DataFrame) -> None:
+        id_column = "Display ID" if "Display ID" in df.columns else "Position ID"
+        self.dataframe(
+            "Broker-Retained Inactive Alpaca Holdings",
+            df,
+            [
+                TableColumn(id_column, "ID", justify="right", formatter=format_int, no_wrap=True),
+                TableColumn("Workflow", no_wrap=True),
+                TableColumn("Asset", no_wrap=True),
+                TableColumn("Qty", justify="right", formatter=format_qty, no_wrap=True),
+                TableColumn("Average Buy Price", "Buy", justify="right", formatter=format_decimal_2, no_wrap=True),
+                TableColumn(
+                    "Estimated Buy Cost",
+                    "Cost",
+                    justify="right",
+                    formatter=format_decimal_2,
+                    no_wrap=True,
+                ),
+                TableColumn(
+                    "Target Sell Price",
+                    "Target",
+                    justify="right",
+                    formatter=format_decimal_2,
+                    no_wrap=True,
+                ),
+                TableColumn("Status", status=True, no_wrap=True),
+                TableColumn("Message", ratio=1, min_width=28, formatter=format_message),
+            ],
+            empty_message="No inactive Alpaca holdings are being retained by the broker.",
+            caption="Full accounting is written to alpaca_inactive_holdings.csv.",
         )
 
     def realized_pnl_summary(self, df: pd.DataFrame) -> None:

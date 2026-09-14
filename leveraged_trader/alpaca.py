@@ -15829,8 +15829,8 @@ def _reconcile_alpaca_managed_positions_pass(
                                     sell_status="broker_inactive",
                                     notes=durable_note(
                                         "Alpaca paper account reports the exact held asset inactive and "
-                                        "non-tradable; managed exit is quarantined until the broker removes "
-                                        "the position or makes the asset closable"
+                                        "non-tradable; the holding remains broker-retained, blocks duplicate "
+                                        "buys, and is monitored until Alpaca makes it tradable again"
                                     ),
                                 )
                                 _append_reconciliation_result(
@@ -15845,10 +15845,10 @@ def _reconcile_alpaca_managed_positions_pass(
                                     limit_price=recovery_target_sell_price,
                                     alpaca_order_id=None,
                                     message=(
-                                        "Alpaca paper account still holds the exact managed quantity but "
-                                        "reports the asset inactive and non-tradable; no executable sell "
-                                        "can be submitted, so the position remains quarantined and blocks "
-                                        "new buys"
+                                        "Inactive, non-tradable paper holding retained at Alpaca; no "
+                                        "executable sell is available, so the workflow records it "
+                                        "separately, blocks new buys, and monitors for "
+                                        "reactivation"
                                         if quarantined
                                         else "inactive-asset quarantine was superseded by concurrent managed state"
                                     ),

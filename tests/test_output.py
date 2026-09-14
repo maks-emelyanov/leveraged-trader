@@ -2609,6 +2609,7 @@ class OutputTests(unittest.TestCase):
     def test_closed_audit_correction_status_renders_as_success(self) -> None:
         self.assertEqual(STATUS_STYLES["corrected"], "green")
         self.assertEqual(STATUS_STYLES["broker_inactive"], "yellow")
+        self.assertEqual(STATUS_STYLES["retained"], "cyan")
 
     def test_paused_nonterminal_broker_statuses_render_as_warnings(self) -> None:
         for status in ("done_for_day", "stopped", "suspended"):

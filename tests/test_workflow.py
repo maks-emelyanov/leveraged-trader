@@ -60,6 +60,8 @@ from leveraged_trader.workflow import (
     WorkflowDeadlineExceeded,
     WorkflowRunError,
     WorkflowStateCleanupError,
+    _alpaca_inactive_holdings_report,
+    _alpaca_sell_order_results,
     _atomic_to_csv,
     _build_reports_for_db,
     _clear_stale_workflow_research_outputs,
@@ -7438,7 +7440,11 @@ publish("new")
                     if state_snapshot_failure and (output_dir / "alpaca_order_results.csv").is_file():
                         raise OSError("state snapshot failed")
                     publication = kwargs.get("publication")
-                    for filename in ("managed_positions.csv", "alpaca_realized_pnl.csv"):
+                    for filename in (
+                        "managed_positions.csv",
+                        "alpaca_inactive_holdings.csv",
+                        "alpaca_realized_pnl.csv",
+                    ):
                         digest = _atomic_to_csv(pd.DataFrame(), output_dir / filename, index=False)
                         if publication is not None:
                             publication.digests[filename] = digest  # type: ignore[union-attr]
@@ -7578,6 +7584,7 @@ publish("new")
                             "alpaca_reconciliation_results.csv",
                             "alpaca_sell_order_results.csv",
                             "managed_positions.csv",
+                            "alpaca_inactive_holdings.csv",
                             "alpaca_realized_pnl.csv",
                         ),
                     )
@@ -10094,12 +10101,128 @@ publish("new")
         self.assertEqual(display_orders.loc[0, "Display ID"], 5)
         self.assertTrue(pd.isna(display_orders.loc[1, "Display ID"]))
 
+    def test_inactive_holdings_are_accounted_separately_from_sell_orders(self) -> None:
+        managed_positions = pd.DataFrame(
+            [
+                {
+                    "id": 115,
+                    "workflow": "Long",
+                    "symbol": "LACG",
+                    "alpaca_asset_id": "asset-lacg",
+                    "sell_status": "broker_inactive",
+                    "filled_qty": 49,
+                    "filled_avg_price": 4.12,
+                    "sold_qty": 0,
+                    "remaining_qty": 49,
+                    "target_sell_price": 6.18,
+                    "closed_at": None,
+                    "updated_at": "2026-09-14 14:12:42",
+                },
+                {
+                    "id": 116,
+                    "workflow": "Long",
+                    "symbol": "DONE",
+                    "sell_status": "broker_inactive",
+                    "filled_qty": 1,
+                    "filled_avg_price": 10,
+                    "sold_qty": 0,
+                    "remaining_qty": 1,
+                    "target_sell_price": 15,
+                    "closed_at": "2026-09-13 14:00:00",
+                },
+                {
+                    "id": 117,
+                    "workflow": "Long",
+                    "symbol": "RECOVERED",
+                    "sell_status": "accepted",
+                    "filled_qty": 1,
+                    "filled_avg_price": 10,
+                    "sold_qty": 0,
+                    "remaining_qty": 1,
+                    "target_sell_price": 15,
+                    "closed_at": None,
+                },
+            ]
+        )
+        reconciliation_results = pd.DataFrame(
+            [
+                {"Position ID": 115, "Asset": "LACG", "Action": "sell", "Status": "broker_inactive"},
+                {"Position ID": 117, "Asset": "TQQQ", "Action": "sell", "Status": "new"},
+                {"Position ID": 118, "Asset": "UPRO", "Action": "buy", "Status": "filled"},
+            ]
+        )
+
+        inactive = _alpaca_inactive_holdings_report(managed_positions)
+        sell_orders = _alpaca_sell_order_results(reconciliation_results)
+
+        self.assertEqual(inactive["Asset"].tolist(), ["LACG"])
+        self.assertEqual(inactive["Status"].tolist(), ["retained"])
+        self.assertEqual(inactive["Qty"].tolist(), [49])
+        self.assertAlmostEqual(inactive.loc[0, "Estimated Buy Cost"], 201.88)
+        self.assertAlmostEqual(inactive.loc[0, "Target Value"], 302.82)
+        self.assertIn("monitored for reactivation", inactive.loc[0, "Message"])
+        self.assertEqual(sell_orders["Asset"].tolist(), ["TQQQ"])
+
+    def test_failed_reconciliation_keeps_inactive_holdings_in_dedicated_terminal_lane(self) -> None:
+        from leveraged_trader import workflow as workflow_module
+
+        reconciliation_results = pd.DataFrame(
+            [
+                {"Position ID": 115, "Asset": "LACG", "Action": "sell", "Status": "broker_inactive"},
+                {"Position ID": 116, "Asset": "TQQQ", "Action": "sell", "Status": "error"},
+            ]
+        )
+        inactive_holdings = pd.DataFrame(
+            [{"Position ID": 115, "Asset": "LACG", "Status": "retained"}]
+        )
+        failure = AlpacaReconciliationError("reconciliation failed", reconciliation_results)
+        reporter = Mock(spec=WorkflowReporter)
+
+        with (
+            patch.object(workflow_module, "_persist_alpaca_reconciliation_snapshot"),
+            patch.object(
+                workflow_module,
+                "_load_alpaca_inactive_holdings_for_db",
+                return_value=inactive_holdings,
+            ),
+        ):
+            workflow_module._persist_alpaca_reconciliation_failure(
+                failure,
+                db_path="state.sqlite",
+                output_dir="outputs",
+                publication=Mock(),
+                reporter=reporter,
+                alpaca_cfg=AlpacaOrderConfig(),
+            )
+
+        rendered_reconciliation = reporter.reconciliation.call_args.args[0]
+        self.assertEqual(rendered_reconciliation["Asset"].tolist(), ["TQQQ"])
+        reporter.inactive_holdings.assert_called_once()
+        pd.testing.assert_frame_equal(
+            reporter.inactive_holdings.call_args.args[0],
+            inactive_holdings,
+        )
+
     def test_write_workflow_outputs_uses_terminal_display_ids_for_alpaca_tables(self) -> None:
         managed_positions = pd.DataFrame(
             [
                 {"id": 2, "symbol": "KLAG", "buy_client_order_id": "buy-KLAG"},
                 {"id": 3, "symbol": "MPG", "buy_client_order_id": "buy-MPG", "closed_at": "2026-01-03"},
                 {"id": 5, "symbol": "AXTU", "buy_client_order_id": "buy-AXTU"},
+                {
+                    "id": 7,
+                    "workflow": "Long",
+                    "symbol": "LACG",
+                    "alpaca_asset_id": "asset-lacg",
+                    "buy_client_order_id": "buy-LACG",
+                    "sell_status": "broker_inactive",
+                    "filled_qty": 49,
+                    "filled_avg_price": 4.12,
+                    "sold_qty": 0,
+                    "remaining_qty": 49,
+                    "target_sell_price": 6.18,
+                    "updated_at": "2026-09-14 14:12:42",
+                },
             ]
         )
         reconciliation_results = pd.DataFrame(
@@ -10127,6 +10250,19 @@ publish("new")
                     "Limit Price": 9.57,
                     "Alpaca Order ID": "alpaca-sell-AXTU",
                     "Message": "managed sell already submitted",
+                },
+                {
+                    "Position ID": 7,
+                    "Workflow": "Long",
+                    "Asset": "LACG",
+                    "Action": "sell",
+                    "Status": "broker_inactive",
+                    "Buy Client Order ID": "buy-LACG",
+                    "Sell Client Order ID": "sell-LACG",
+                    "Qty": 49,
+                    "Limit Price": 6.18,
+                    "Alpaca Order ID": None,
+                    "Message": "inactive holding retained at Alpaca",
                 },
             ]
         )
@@ -10176,6 +10312,8 @@ publish("new")
                 workflow_timer=WorkflowTimer.start(),
             )
             written_reconciliation = pd.read_csv(output_dir / "alpaca_reconciliation_results.csv")
+            written_sell_orders = pd.read_csv(output_dir / "alpaca_sell_order_results.csv")
+            written_inactive = pd.read_csv(output_dir / "alpaca_inactive_holdings.csv")
             written_orders = pd.read_csv(output_dir / "alpaca_order_results.csv")
             output = output_buffer.getvalue()
 
@@ -10183,7 +10321,12 @@ publish("new")
         self.assertEqual(len(axtu_lines), 2)
         for line in axtu_lines:
             self.assertRegex(line, r"^\s*3\s+AXTU\b")
-        self.assertEqual(written_reconciliation["Position ID"].tolist(), [2, 5])
+        self.assertEqual(written_reconciliation["Position ID"].tolist(), [2, 5, 7])
+        self.assertEqual(written_sell_orders["Position ID"].tolist(), [2, 5])
+        self.assertEqual(written_inactive["Asset"].tolist(), ["LACG"])
+        self.assertEqual(written_inactive["Status"].tolist(), ["retained"])
+        self.assertIn("Broker-Retained Inactive Alpaca Holdings", output)
+        self.assertEqual(sum("LACG" in line for line in output.splitlines()), 1)
         self.assertNotIn("Display ID", written_reconciliation.columns)
         self.assertNotIn("Display ID", written_orders.columns)
 

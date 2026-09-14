@@ -133,6 +133,7 @@ _ALPACA_RECONCILIATION_SNAPSHOT_FILENAMES = (
     "alpaca_reconciliation_results.csv",
     "alpaca_sell_order_results.csv",
     "managed_positions.csv",
+    "alpaca_inactive_holdings.csv",
     "alpaca_realized_pnl.csv",
 )
 _ALPACA_WORKFLOW_SNAPSHOT_FILENAMES = (
@@ -141,6 +142,7 @@ _ALPACA_WORKFLOW_SNAPSHOT_FILENAMES = (
 )
 _ALPACA_CURRENT_STATE_SNAPSHOT_FILENAMES = (
     "managed_positions.csv",
+    "alpaca_inactive_holdings.csv",
     "alpaca_realized_pnl.csv",
 )
 _ALPACA_SNAPSHOT_MANIFEST_FILENAME = "alpaca_snapshot_manifest.csv"
@@ -184,7 +186,7 @@ _WINDOWS_FILE_CASE_SENSITIVE_INFO = 23
 _WINDOWS_FILE_CS_FLAG_CASE_SENSITIVE_DIR = 0x00000001
 _WINDOWS_MOVEFILE_REPLACE_EXISTING = 0x00000001
 _WINDOWS_MOVEFILE_WRITE_THROUGH = 0x00000008
-_ALPACA_SNAPSHOT_SCHEMA_VERSION = "1"
+_ALPACA_SNAPSHOT_SCHEMA_VERSION = "2"
 _REPORT_CLEANUP_PREFIX = ".leveraged-trader-report-cleanup-"
 _ALPACA_SNAPSHOT_MANIFEST_COLUMNS = (
     "Schema Version",
@@ -193,6 +195,20 @@ _ALPACA_SNAPSHOT_MANIFEST_COLUMNS = (
     "Snapshot Kind",
     "Filename",
     "SHA256",
+)
+_ALPACA_INACTIVE_HOLDINGS_COLUMNS = (
+    "Position ID",
+    "Workflow",
+    "Asset",
+    "Alpaca Asset ID",
+    "Qty",
+    "Average Buy Price",
+    "Estimated Buy Cost",
+    "Target Sell Price",
+    "Target Value",
+    "Status",
+    "Last Checked",
+    "Message",
 )
 _ALPACA_SNAPSHOT_FILENAMES_BY_KIND = {
     "reconciliation": _ALPACA_RECONCILIATION_SNAPSHOT_FILENAMES,
@@ -2156,6 +2172,87 @@ def _combined_workflow_assets(workflow_asset_groups: dict[str, pd.DataFrame]) ->
     return out
 
 
+def _alpaca_inactive_holdings_report(managed_positions: pd.DataFrame) -> pd.DataFrame:
+    """Describe broker-retained holdings that Alpaca cannot currently trade."""
+    if managed_positions.empty or "sell_status" not in managed_positions.columns:
+        return pd.DataFrame(columns=_ALPACA_INACTIVE_HOLDINGS_COLUMNS)
+
+    inactive_mask = (
+        managed_positions["sell_status"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .eq("broker_inactive")
+    )
+    if "closed_at" in managed_positions.columns:
+        closed_at = managed_positions["closed_at"]
+        inactive_mask &= closed_at.isna() | closed_at.astype(str).str.strip().eq("")
+    inactive = managed_positions.loc[inactive_mask].copy()
+    if inactive.empty:
+        return pd.DataFrame(columns=_ALPACA_INACTIVE_HOLDINGS_COLUMNS)
+
+    def values(column: str) -> pd.Series:
+        if column in inactive.columns:
+            return inactive[column]
+        return pd.Series(None, index=inactive.index, dtype=object)
+
+    filled_qty = pd.to_numeric(values("filled_qty"), errors="coerce")
+    sold_qty = pd.to_numeric(values("sold_qty"), errors="coerce").fillna(0.0)
+    remaining_qty = pd.to_numeric(values("remaining_qty"), errors="coerce")
+    quantity = remaining_qty.where(remaining_qty.notna(), filled_qty - sold_qty)
+    average_buy_price = pd.to_numeric(values("filled_avg_price"), errors="coerce")
+    target_sell_price = pd.to_numeric(values("target_sell_price"), errors="coerce")
+    with np.errstate(over="ignore", invalid="ignore"):
+        estimated_buy_cost = quantity * average_buy_price
+        target_value = quantity * target_sell_price
+    estimated_buy_cost = estimated_buy_cost.where(np.isfinite(estimated_buy_cost))
+    target_value = target_value.where(np.isfinite(target_value))
+
+    report = pd.DataFrame(
+        {
+            "Position ID": values("id"),
+            "Workflow": values("workflow"),
+            "Asset": values("symbol"),
+            "Alpaca Asset ID": values("alpaca_asset_id"),
+            "Qty": quantity,
+            "Average Buy Price": average_buy_price,
+            "Estimated Buy Cost": estimated_buy_cost,
+            "Target Sell Price": target_sell_price,
+            "Target Value": target_value,
+            "Status": "retained",
+            "Last Checked": values("updated_at"),
+            "Message": (
+                "Inactive, non-tradable holding retained at Alpaca; monitored for reactivation "
+                "and still blocks duplicate buys"
+            ),
+        },
+        index=inactive.index,
+    )
+    return report.reset_index(drop=True).reindex(columns=_ALPACA_INACTIVE_HOLDINGS_COLUMNS)
+
+
+def _alpaca_sell_order_results(reconciliation_results: pd.DataFrame) -> pd.DataFrame:
+    """Return actual sell-order outcomes, excluding broker-retained holdings."""
+    if "Action" not in reconciliation_results.columns:
+        return pd.DataFrame()
+    sell_results = reconciliation_results.loc[reconciliation_results["Action"].eq("sell")].copy()
+    if "Status" in sell_results.columns:
+        retained = sell_results["Status"].fillna("").astype(str).str.strip().str.lower().eq("broker_inactive")
+        sell_results = sell_results.loc[~retained].copy()
+    return sell_results
+
+
+def _standard_alpaca_reconciliation_results(reconciliation_results: pd.DataFrame) -> pd.DataFrame:
+    """Keep broker-retained holdings out of the ordinary terminal reconciliation table."""
+    if "Status" not in reconciliation_results.columns:
+        return reconciliation_results.copy()
+    retained = (
+        reconciliation_results["Status"].fillna("").astype(str).str.strip().str.lower().eq("broker_inactive")
+    )
+    return reconciliation_results.loc[~retained].copy()
+
+
 def _with_workflow_column(df: pd.DataFrame, workflow_label: str) -> pd.DataFrame:
     out = df.copy()
     if "Workflow" in out.columns:
@@ -2184,7 +2281,7 @@ def _persist_current_alpaca_state(
     snapshot_completed = False
     try:
         with _state_connection(db_path) as conn:
-            # Both reports describe one broker-state generation. A plain SELECT
+            # All reports describe one broker-state generation. A plain SELECT
             # does not start a transaction in sqlite3's legacy transaction mode,
             # so establish the read snapshot explicitly before either loader.
             conn.execute("BEGIN")
@@ -2205,16 +2302,28 @@ def _persist_current_alpaca_state(
                 except BaseException as exc:
                     failures.append((label, exc))
                 else:
+                    safe_frame = _safe_alpaca_workflow_result_messages(
+                        frame,
+                        alpaca_cfg=alpaca_cfg,
+                    )
                     loaded_frames.append(
                         (
                             label,
-                            _safe_alpaca_workflow_result_messages(
-                                frame,
-                                alpaca_cfg=alpaca_cfg,
-                            ),
+                            safe_frame,
                             filename,
                         )
                     )
+                    if filename == "managed_positions.csv":
+                        loaded_frames.append(
+                            (
+                                "broker-retained inactive holdings",
+                                _safe_alpaca_workflow_result_messages(
+                                    _alpaca_inactive_holdings_report(frame),
+                                    alpaca_cfg=alpaca_cfg,
+                                ),
+                                "alpaca_inactive_holdings.csv",
+                            )
+                        )
         snapshot_completed = True
     except BaseException as exc:
         failures.append(("SQLite read snapshot", exc))
@@ -2570,11 +2679,7 @@ def _persist_alpaca_reconciliation_snapshot_impl(
         alpaca_cfg=alpaca_cfg,
     )
     output_path = Path(output_dir)
-    sell_results = (
-        reconciliation_results[reconciliation_results["Action"].eq("sell")]
-        if "Action" in reconciliation_results
-        else pd.DataFrame()
-    )
+    sell_results = _alpaca_sell_order_results(reconciliation_results)
     try:
         _prepare_workflow_output_directory_for_publication(output_path)
     except BaseException as exc:
@@ -2681,11 +2786,7 @@ def _finish_alpaca_workflow_snapshot(
         reconciliation_results,
         alpaca_cfg=alpaca_cfg,
     )
-    sell_results = (
-        reconciliation_results[reconciliation_results["Action"].eq("sell")]
-        if "Action" in reconciliation_results
-        else pd.DataFrame()
-    )
+    sell_results = _alpaca_sell_order_results(reconciliation_results)
     failures: list[tuple[str, BaseException]] = []
     for action, publish in (
         (
@@ -2754,7 +2855,26 @@ def _persist_alpaca_reconciliation_failure(
         publication=publication,
         alpaca_cfg=alpaca_cfg,
     )
-    reporter.reconciliation(exc.results)
+    try:
+        inactive_holdings = _safe_alpaca_workflow_result_messages(
+            _load_alpaca_inactive_holdings_for_db(db_path),
+            alpaca_cfg=alpaca_cfg,
+        )
+    except BaseException as inactive_holdings_failure:
+        detail = _best_effort_alpaca_exception_diagnostic(
+            inactive_holdings_failure,
+            alpaca_cfg=alpaca_cfg,
+        )
+        _add_safe_alpaca_workflow_note(
+            exc,
+            f"Failed to render the dedicated broker-retained inactive-holdings report: {detail}",
+            alpaca_cfg=alpaca_cfg,
+        )
+        reporter.reconciliation(exc.results)
+    else:
+        reporter.reconciliation(_standard_alpaca_reconciliation_results(exc.results))
+        if not inactive_holdings.empty:
+            reporter.inactive_holdings(inactive_holdings)
 
 
 def _reconcile_alpaca_managed_positions_for_db(
@@ -3520,6 +3640,18 @@ def _load_alpaca_realized_pnl_for_db(
         return build_alpaca_realized_pnl_summary(connection, include_workflow=True)
     with _state_connection(db_path) as conn:
         return build_alpaca_realized_pnl_summary(conn, include_workflow=True)
+
+
+def _load_alpaca_inactive_holdings_for_db(
+    db_path: str,
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> pd.DataFrame:
+    managed_positions = _load_alpaca_managed_positions_for_db(
+        db_path,
+        connection=connection,
+    )
+    return _alpaca_inactive_holdings_report(managed_positions)
 
 
 def _processed_message(data: pd.DataFrame, start_label: str) -> str:
@@ -6165,6 +6297,11 @@ def _run_alpaca_reconciliation_impl(
                     realized_pnl_summary,
                     alpaca_cfg=alpaca_cfg,
                 )
+                inactive_holdings = _load_alpaca_inactive_holdings_for_db(locked_db_path)
+                inactive_holdings = _safe_alpaca_workflow_result_messages(
+                    inactive_holdings,
+                    alpaca_cfg=alpaca_cfg,
+                )
         except BaseException as exc:
             if reconciliation_error is not None:
                 if exc is reconciliation_error:
@@ -6198,7 +6335,9 @@ def _run_alpaca_reconciliation_impl(
 
         assert reconciliation_results is not None
         try:
-            reporter.reconciliation(reconciliation_results)
+            reporter.reconciliation(_standard_alpaca_reconciliation_results(reconciliation_results))
+            if not inactive_holdings.empty:
+                reporter.inactive_holdings(inactive_holdings)
             reporter.realized_pnl_summary(realized_pnl_summary)
             reporter.workflow_footer(workflow_timer.elapsed_seconds())
         except BaseException as exc:
@@ -6288,6 +6427,14 @@ def _write_workflow_outputs(
         reconciliation_results=reconciliation_results,
         order_results=order_results,
     )
+    terminal_reconciliation_results = _standard_alpaca_reconciliation_results(
+        terminal_reconciliation_results
+    )
+    inactive_holdings = _alpaca_inactive_holdings_report(managed_positions)
+    terminal_inactive_holdings = _terminal_alpaca_inactive_holdings(
+        managed_positions,
+        inactive_holdings,
+    )
     reporter.settings(
         mode=mode,
         db_path=db_path,
@@ -6351,6 +6498,12 @@ def _write_workflow_outputs(
         )
         _publish_alpaca_snapshot_csv(
             broker_publication,
+            inactive_holdings,
+            filename="alpaca_inactive_holdings.csv",
+            index=False,
+        )
+        _publish_alpaca_snapshot_csv(
+            broker_publication,
             reconciliation_results,
             filename="alpaca_reconciliation_results.csv",
             index=False,
@@ -6372,11 +6525,13 @@ def _write_workflow_outputs(
 
     if alpaca_cfg.sell_enabled:
         reporter.reconciliation(terminal_reconciliation_results)
+        if not terminal_inactive_holdings.empty:
+            reporter.inactive_holdings(terminal_inactive_holdings)
     reporter.realized_pnl_summary(realized_pnl_summary)
     if broker_publication is not None:
         _publish_alpaca_snapshot_csv(
             broker_publication,
-            sell_reconciliation_results,
+            _alpaca_sell_order_results(sell_reconciliation_results),
             filename="alpaca_sell_order_results.csv",
             index=False,
         )
@@ -6421,6 +6576,19 @@ def _terminal_alpaca_display_results(
             display_reconciliation_results["Position ID"], errors="coerce"
         ).map(display_id_by_position)
     return display_order_results, display_reconciliation_results
+
+
+def _terminal_alpaca_inactive_holdings(
+    managed_positions: pd.DataFrame,
+    inactive_holdings: pd.DataFrame,
+) -> pd.DataFrame:
+    display = inactive_holdings.copy()
+    display_id_by_position, _ = _managed_position_display_id_maps(managed_positions)
+    if display_id_by_position and "Position ID" in display.columns:
+        display["Display ID"] = pd.to_numeric(display["Position ID"], errors="coerce").map(
+            display_id_by_position
+        )
+    return display
 
 
 def _managed_position_display_id_maps(managed_positions: pd.DataFrame) -> tuple[dict[int, int], dict[str, int]]:
