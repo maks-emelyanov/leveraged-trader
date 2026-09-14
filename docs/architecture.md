@@ -5,16 +5,19 @@ Leveraged Trader is organized as a small package with IO-heavy boundaries kept s
 ## Entry Points
 
 - `main.py` is a compatibility wrapper.
+- `leveraged_trader.__main__` implements `python -m leveraged_trader` by delegating to the CLI.
 - `leveraged_trader.cli:main` is the package entry point.
 - The `leveraged-trader` console script is defined in `pyproject.toml`.
 
 ## Modules
 
+- `leveraged_trader.__init__`: package version metadata.
 - `leveraged_trader.config`: constants, dataclasses, and `.env` loading.
 - `leveraged_trader.universe`: multi-source leveraged ETF/ETN universe discovery, leverage/direction parsing, and RSI symbol inference.
 - `leveraged_trader.market_data`: Yahoo Finance daily OHLCV loading with guarded raw-price Tradier fallback for skipped symbols.
 - `leveraged_trader.indicators`: indicator calculations such as RSI.
 - `leveraged_trader.backtest`: shared strategy initial state and performance summary calculations.
+- `leveraged_trader.benchmark`: overlap-aware workflow phase and total elapsed-time measurement.
 - `leveraged_trader.accounting`: shared quantity and notional tolerances for managed-position reconciliation and reporting.
 - `leveraged_trader.pricing`: shared Decimal-based Alpaca target-price and tick-rounding semantics.
 - `leveraged_trader.optimized_backtest`: validated NumPy/Numba grid and equity-curve simulation kernels.
@@ -128,7 +131,7 @@ driven by managed-position reconciliation instead of the latest optimized parame
 
 ## Runtime Configuration
 
-The top-level CLI supports API behavior settings by flag or environment variable, but Alpaca and Tradier credentials are accepted only from environment variables or a private `.env` file so they do not appear in process listings or shell history. Alpaca buy and managed-sell submission default to off. Alpaca access is hard-restricted to `https://paper-api.alpaca.markets`; the validation allows one trailing slash but rejects live endpoints, custom paths, ports, queries, fragments, and embedded user information. `load_dotenv` reads local `.env` values only when the corresponding key is not already set in the environment, so exported shell variables still take precedence. A configured `SEC_USER_AGENT` must contain both a meaningful non-placeholder operator/application identity and a monitored contact email; a bare email and reserved example/test domains are rejected. The SEC identity is host-scoped to SEC requests, while other universe hosts use the generic project identity. Universe redirects are followed only when the normalized scheme, host, and effective port remain unchanged; cross-origin redirects are rejected before a follow-up request. Each accepted hop bypasses proxies, validates that every resolved address is public, and pins that DNS snapshot to the socket connection without replacing the URL hostname used for HTTPS SNI and certificate verification. `ALPACA_BATCH_CASH_FRACTION` is rejected if present because buy sizing is now derived from the current eligible buy count. Use `--no-color` for plain terminal output.
+The top-level CLI supports API behavior settings by flag or environment variable, but Alpaca and Tradier credentials are accepted only from environment variables or a private `.env` file so they do not appear in process listings or shell history. Alpaca buy and managed-sell submission default to off. Alpaca access is hard-restricted to `https://paper-api.alpaca.markets`; the validation allows one trailing slash but rejects live endpoints, custom paths, ports, queries, fragments, and embedded user information. When Tradier fallback and a bearer token are enabled, the base URL is similarly restricted to an official HTTPS `api.tradier.com` or `sandbox.tradier.com` API root, optionally followed by `/v1`. `load_dotenv` reads local `.env` values only when the corresponding key is not already set in the environment, so exported shell variables still take precedence. A configured `SEC_USER_AGENT` must contain both a meaningful non-placeholder operator/application identity and a monitored contact email; a bare email and reserved example/test domains are rejected. The SEC identity is host-scoped to SEC requests, while other universe hosts use the generic project identity. Universe redirects are followed only when the normalized scheme, host, and effective port remain unchanged; cross-origin redirects are rejected before a follow-up request. Each accepted hop bypasses proxies, validates that every resolved address is public, and pins that DNS snapshot to the socket connection without replacing the URL hostname used for HTTPS SNI and certificate verification. `ALPACA_BATCH_CASH_FRACTION` is rejected on full workflow runs because buy sizing is now derived from the current eligible buy count; reconciliation-only mode ignores it because that path cannot submit buys. Use `--no-color` for plain terminal output.
 
 ## Scheduled Operation
 

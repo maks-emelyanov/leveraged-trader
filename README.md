@@ -35,6 +35,35 @@ Licensed under the MIT License. See [LICENSE](LICENSE).
 - Submits and renews managed Alpaca GTC limit sells from actual fill price times the original sell multiple, including partial buy fills.
 - Guards Alpaca buys against already-held symbols, active managed positions, and open buy or sell orders.
 
+## Strategy and Backtest Contract
+
+The default CLI uses a fixed research configuration. These strategy settings are not currently CLI
+options:
+
+| Setting | Default CLI behavior |
+| --- | --- |
+| Starting capital | `$100,000` of simulated cash per parameter combination |
+| RSI | 14-session SMA-seeded Wilder RSI |
+| Long-product entry grid | RSI thresholds `20` through `50`, inclusive, in increments of `1`; enter when RSI is at or below the threshold |
+| Inverse-product entry grid | RSI thresholds `50` through `80`, inclusive, in increments of `1`; enter when the underlying proxy RSI is at or above the threshold |
+| Profit-target grid | Return multiples `1.10` through `5.00`, inclusive, in increments of `0.10` |
+| Simulated trading costs | `1` basis point of fee plus `2` basis points of slippage on each buy and sell notional |
+| Position sizing | Commit all available simulated cash, including fractional shares; this differs from whole-share Alpaca paper-order sizing |
+| Risk-free series | Yahoo Finance `^IRX`, interpreted as an annual percentage yield and converted to a 252-session daily return |
+
+An RSI entry signal on a settled asset session schedules a simulated purchase at the next asset
+session's opening price. The position is marked at each close. Its tick-rounded target is treated as a
+resting limit immediately after entry: a favorable opening gap fills at the open, otherwise an
+intraday High at or above the limit fills at the limit. The current US session is excluded from the
+research history. The backtest's fractional, all-cash execution model is deliberately different from
+the live paper-order budget, whole-share sizing, quote checks, and fill behavior.
+
+Metrics use the asset's settled-session calendar and 252-session annualization. The `^IRX` daily
+risk-free return is `(1 + annual_yield / 100) ** (1 / 252) - 1` and is forward-filled onto that
+calendar. Each asset's winning grid row is selected by non-null Sharpe, then total return, then CAGR.
+Ties prefer the more selective RSI threshold (lower for the Long workflow and higher for the Short
+workflow), followed by the smaller profit target.
+
 ## Setup
 
 The automated schedule requires a Unix-like system with `bash` and per-user `crontab` support.
@@ -110,6 +139,9 @@ trading URLs whenever an Alpaca client is created.
 basis is not guaranteed to match Yahoo's adjusted history, so fallback is eligible only on runs that
 explicitly use `--no-auto-adjust`; adjusted runs fail closed instead of mixing providers. Remove the
 token line or disable fallback with `--no-tradier-fallback` if no Tradier account is configured.
+When fallback and a token are enabled, `TRADIER_BASE_URL` must use the official HTTPS API root at
+`api.tradier.com` or `sandbox.tradier.com`, optionally followed by `/v1`; custom hosts are not
+supported.
 `.env` is ignored by Git; do not commit it or share its contents.
 On POSIX systems the application refuses to read `.env` when group or other users have any access;
 restore owner-only access with `chmod 600 .env` before running it.
@@ -257,8 +289,13 @@ Verify the installed entries and inspect the shared log:
 
 ```bash
 crontab -l
-tail -f outputs/cron.log
+tail -F outputs/cron.log
 ```
+
+The installer creates the output directory but not `cron.log`; the log first appears when a due run
+or due-run preflight writes to it. `tail -F` waits for that first creation and follows later log
+rotation. If the local `tail` does not support `-F`, wait for the file to appear and then use
+`tail -f outputs/cron.log`.
 
 The installer is idempotent: run it again after every project update, moving the checkout or the `uv`
 executable, or changing the managed schedule. Reinstallation publishes a current authenticated
@@ -271,6 +308,30 @@ has a same-named function or a relative PATH entry.
 
 To operate without cron, skip this step and run the commands in the recommended operating schedule
 manually.
+
+#### Disable or remove the automated schedule
+
+Removing the managed crontab block prevents future scheduled runs, including future automatic paper
+buy and managed-sell requests. It does not stop a workflow process that is already running.
+
+Open the current user's crontab:
+
+```bash
+crontab -e
+```
+
+Delete the complete block beginning with `# BEGIN leveraged-trader managed schedule` and ending with
+`# END leveraged-trader managed schedule`, including both marker lines, then save and exit. Do not
+remove unrelated entries. Verify that the managed block is gone:
+
+```bash
+crontab -l
+```
+
+This leaves the checkout, SQLite database, reports, and inactive authenticated bootstrap files in
+place. Run `./scripts/cron/install-crontab` again to restore the schedule. If a workflow was already
+running when the block was removed, let it finish or review that process separately; editing the
+crontab affects only future launches.
 
 ### 7. Updating an existing installation
 
@@ -389,7 +450,9 @@ Common options:
 - `--tradier-fallback / --no-tradier-fallback`: enable or skip Tradier fallback for Yahoo-skipped symbols.
 - `--auto-adjust / --no-auto-adjust`: use adjusted Yahoo OHLC data (default: enabled); Tradier
   fallback is eligible only with `--no-auto-adjust` so histories never mix adjustment bases.
-- `--tradier-base-url URL`: override `TRADIER_BASE_URL` (defaults to Tradier production `/v1`).
+- `--tradier-base-url URL`: override `TRADIER_BASE_URL` (defaults to Tradier production `/v1`). With
+  fallback and a bearer token enabled, the URL must be an official HTTPS `api.tradier.com` or
+  `sandbox.tradier.com` API root, optionally followed by `/v1`; custom hosts are rejected.
 - `--tradier-timeout-seconds INT`: Tradier request timeout in seconds (default: `30`).
 - `--workflow-concurrency INT`: maximum concurrent asset download workers; SQLite strategy updates
   remain serialized (default: `4`; use `1` for fully serial behavior).
@@ -401,17 +464,32 @@ Common options:
 
 CSV reports are written to `outputs/` by default:
 
-- `best_equity_curves.csv`
-- `optimization_summary.csv`
-- `buy_signals.csv`
-- `eligible_buy_signals.csv`
-- `sell_signals.csv`
-- `managed_positions.csv`
-- `alpaca_realized_pnl.csv`
-- `alpaca_reconciliation_results.csv`
-- `alpaca_order_results.csv`
-- `alpaca_sell_order_results.csv`
-- `alpaca_snapshot_manifest.csv`
+- `best_equity_curves.csv`: the complete retained equity curve for each asset's winning grid row,
+  with Long/Short-prefixed curve names.
+- `optimization_summary.csv`: one winning strategy row per successfully processed asset, including
+  its parameters and performance metrics. It is not a dump of every grid combination.
+- `buy_signals.csv`: winning strategies that are flat with a buy pending for the next open, have more
+  than one executed simulated trade, have Sharpe of at least `1.0`, and have a sufficiently fresh RSI
+  observation.
+- `eligible_buy_signals.csv`: `buy_signals.csv` after excluding symbols already represented by an
+  active persisted managed position. “Eligible” is a local pre-broker classification: live holdings,
+  open orders, quotes, cash, market-clock checks, and concurrent state can still make Alpaca skip a
+  row.
+- `sell_signals.csv`: winning-strategy sell-event rows, including targets executed on the latest
+  settled session. These are research results, not live order instructions.
+- `managed_positions.csv`: persisted managed Alpaca buy and protective-sell lifecycle state.
+- `alpaca_realized_pnl.csv`: realized P/L summaries derived from complete managed-position fills.
+- `alpaca_reconciliation_results.csv`: per-position results from the latest managed-position
+  reconciliation.
+- `alpaca_order_results.csv`: per-signal Alpaca paper-buy preflight and submission outcomes.
+- `alpaca_sell_order_results.csv`: managed protective-sell submission, recovery, renewal, and
+  cancellation outcomes.
+- `alpaca_snapshot_manifest.csv`: the committed generation and SHA-256 digest for every broker CSV
+  covered by the current snapshot kind.
+
+The signal CSVs are reports and are never replayed as order queues. Order-enabled workflows use the
+authenticated in-memory report generation and repeat all applicable broker checks immediately before
+submission.
 
 The Alpaca manifest is written with `Status=publishing` before any covered broker CSV changes and
 atomically replaced with `Status=committed` only after every listed SHA-256 digest is available.
@@ -421,6 +499,7 @@ validating and then reopening the replaceable CSV paths:
 ```python
 from leveraged_trader.workflow import load_alpaca_snapshot
 
+output_dir = "outputs"
 snapshot = load_alpaca_snapshot(output_dir)
 managed_positions = snapshot.read_csv("managed_positions.csv")
 ```
@@ -542,7 +621,9 @@ Supported environment variables:
 - `TRADIER_TIMEOUT_SECONDS`
 - `SEC_USER_AGENT` (truthful identity/contact for SEC EDGAR audit requests)
 
-`ALPACA_BATCH_CASH_FRACTION` is intentionally no longer supported. Buy sizing is dynamic, so remove that legacy key from `.env` or the CLI will fail fast instead of silently ignoring it.
+`ALPACA_BATCH_CASH_FRACTION` is intentionally no longer supported. Buy sizing is dynamic, so remove
+that legacy key from `.env`. Full workflow runs fail fast when it is present instead of silently
+ignoring it; `--reconcile-only` ignores it because that mode cannot submit buys or perform buy sizing.
 
 If your environment has not installed project entry points yet, use the module entry point:
 
