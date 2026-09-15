@@ -146,6 +146,10 @@ SELL_INACTIVE_STATUSES = {"canceled", "expired", "rejected"}
 SELL_REPLACEMENT_SAFE_STATUSES = {"canceled", "expired"}
 SELL_RENEWABLE_STATUSES = {"accepted", "accepted_for_bidding", "new", "partially_filled", "pending_new"}
 SELL_CANCEL_PENDING_STATUSES = {"pending_cancel"}
+_LEGACY_FINAL_SELL_HISTORICAL_CANCEL_DIAGNOSTIC = (
+    "final managed-sell submission blocked: historical managed sell exposure is still executable; "
+    "historical exposure cancellation requires confirmation:"
+)
 _ORDER_MAY_BE_ACTIVE_STATUSES = {
     *SELL_RENEWABLE_STATUSES,
     *SELL_CANCEL_PENDING_STATUSES,
@@ -5692,6 +5696,12 @@ _ALPACA_STABLE_EXCEPTION_STR_IMPLEMENTATIONS = frozenset(
         UnicodeTranslateError.__str__,
     }
 )
+_ALPACA_STABLE_EXCEPTION_REPR_IMPLEMENTATIONS = frozenset(
+    {
+        BaseException.__repr__,
+        BaseExceptionGroup.__repr__,
+    }
+)
 
 
 def _alpaca_public_exception_render_hooks_are_stable(exc: BaseException) -> bool:
@@ -5704,7 +5714,7 @@ def _alpaca_public_exception_render_hooks_are_stable(exc: BaseException) -> bool
         return False
     return bool(
         str_implementation in _ALPACA_STABLE_EXCEPTION_STR_IMPLEMENTATIONS
-        and repr_implementation is BaseException.__repr__
+        and repr_implementation in _ALPACA_STABLE_EXCEPTION_REPR_IMPLEMENTATIONS
     )
 
 
@@ -9354,6 +9364,71 @@ def _final_managed_sell_submission_exposure_fence(
                     )
                     return None
                 expected_sell_state_revision = cancellation_fence_revision
+                if exact_payload is None:
+                    cancellation_requested_at = _utc_now().isoformat().replace("+00:00", "Z")
+                    cancellation_owned = update_alpaca_managed_sell_status_if_current(
+                        conn,
+                        position_id,
+                        expected_sell_client_order_id=sell_client_order_id,
+                        expected_sell_status=expected_sell_status,
+                        expected_sell_alpaca_order_id=None,
+                        expected_sell_filled_qty=_optional_float(current_position.get("sell_filled_qty")),
+                        expected_sell_renewal_count=int(current_position.get("sell_renewal_count") or 0),
+                        expected_sell_submission_retry_claimed_at=sell_submission_claimed_at,
+                        expected_sell_renewal_requested_at=_optional_str(
+                            current_position.get("sell_renewal_requested_at")
+                        ),
+                        expected_state_revision=expected_sell_state_revision,
+                        sell_status="pending_cancel",
+                        sell_renewal_requested_at=cancellation_requested_at,
+                        notes=_alpaca_durable_diagnostic_note(
+                            "final managed-sell validation found executable historical exposure; "
+                            "cancellation ownership was durably fenced before broker requests",
+                            cfg=client.cfg,
+                            client=client,
+                        ),
+                    )
+                    if not cancellation_owned:
+                        _append_reconciliation_result(
+                            rows,
+                            position_id=position_id,
+                            symbol=symbol,
+                            action="sell",
+                            status="superseded",
+                            buy_client_order_id=buy_client_order_id,
+                            sell_client_order_id=sell_client_order_id,
+                            qty=filled_qty,
+                            limit_price=target_sell_price,
+                            alpaca_order_id=None,
+                            message=(
+                                "historical managed sell exposure changed before cancellation ownership "
+                                "could be persisted; no broker cancellation was requested"
+                            ),
+                        )
+                        return None
+                    _pending, historical_cancellation_messages = _request_managed_sell_leaf_cancellations(
+                        client,
+                        active_historical_leaves,
+                    )
+                    _append_reconciliation_result(
+                        rows,
+                        position_id=position_id,
+                        symbol=symbol,
+                        action="sell",
+                        status="pending_cancel",
+                        buy_client_order_id=buy_client_order_id,
+                        sell_client_order_id=sell_client_order_id,
+                        qty=filled_qty,
+                        limit_price=target_sell_price,
+                        alpaca_order_id=None,
+                        message=(
+                            f"final managed-sell submission blocked: {issue}; historical exposure "
+                            "cancellation requires confirmation: "
+                            + "; ".join(historical_cancellation_messages)
+                        ),
+                        required_failure=True,
+                    )
+                    return None
                 _pending, historical_cancellation_messages = _request_managed_sell_leaf_cancellations(
                     client,
                     active_historical_leaves,
@@ -15496,6 +15571,14 @@ def _reconcile_alpaca_managed_positions_pass(
                 )
 
             if sell_client_order_id:
+                legacy_historical_cancel_quarantine = bool(
+                    current_sell_status == "incomplete_order_metadata"
+                    and _optional_str(position.get("sell_alpaca_order_id")) is None
+                    and _optional_str(position.get("sell_submission_retry_claimed_at")) is None
+                    and _optional_str(position.get("sell_renewal_requested_at")) is None
+                    and _LEGACY_FINAL_SELL_HISTORICAL_CANCEL_DIAGNOSTIC
+                    in str(position.get("notes") or "").lower()
+                )
                 try:
                     sell_order, sell_replacement_chain = _fetch_order_payload(
                         client,
@@ -15555,14 +15638,18 @@ def _reconcile_alpaca_managed_positions_pass(
                                 current_sell_status == "pending_cancel"
                                 and _optional_str(position.get("sell_alpaca_order_id")) is None
                             )
+                            or legacy_historical_cancel_quarantine
                         )
                         and exc.response is not None
                         and exc.response.status_code == 404
                     ):
                         historical_cancellation_was_fenced = bool(
-                            current_sell_status == "pending_cancel"
-                            and _optional_str(position.get("sell_submission_retry_claimed_at")) is not None
-                            and _optional_str(position.get("sell_renewal_requested_at")) is not None
+                            (
+                                current_sell_status == "pending_cancel"
+                                and _optional_str(position.get("sell_submission_retry_claimed_at")) is not None
+                                and _optional_str(position.get("sell_renewal_requested_at")) is not None
+                            )
+                            or legacy_historical_cancel_quarantine
                         )
                         if current_sell_status == "pending_cancel":
                             pending_retry_token = _optional_str(position.get("sell_submission_retry_claimed_at"))
@@ -15717,6 +15804,7 @@ def _reconcile_alpaca_managed_positions_pass(
                             notes=durable_note(
                                 "managed sell submission was not found by client order ID after recovery"
                             ),
+                            allow_legacy_historical_cancel_quarantine=legacy_historical_cancel_quarantine,
                         )
                         if recovery_intent is None:
                             _append_reconciliation_result(

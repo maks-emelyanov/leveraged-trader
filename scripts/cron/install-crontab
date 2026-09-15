@@ -1905,7 +1905,7 @@ fi
 new_crontab="$(
     printf '%s\n' "$filtered_crontab"
     printf '%s\n' "$marker_start"
-    # Force a noninteractive POSIX shell for cron's outer `-c` invocation.
+    # Force a noninteractive POSIX shell for the outer cron `-c` invocation.
     # The command itself applies its PATH locally, and the prior effective
     # shell-option environment is restored immediately after the job for future
     # appended entries.

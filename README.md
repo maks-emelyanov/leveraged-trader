@@ -34,7 +34,7 @@ Licensed under the MIT License. See [LICENSE](LICENSE).
   Alpaca CSVs with a checksum manifest so readers can reject interrupted mixed generations.
 - Submits guarded, budget-capped whole-share Alpaca paper buy limit orders only with an explicit opt-in flag.
 - Atomically claims a durable Alpaca buy intent before submission, preventing concurrent workers from submitting or closing the same client order ID.
-- Submits and renews managed Alpaca GTC limit sells from actual fill price times the original sell multiple, including partial buy fills.
+- Submits and renews managed Alpaca GTC limit sells from actual fill price times the original sell multiple, including partial buy fills. Replacement cancellation is durably fenced before the broker request, and confirmed legacy cancellation states recover through the same exposure checks.
 - Guards Alpaca buys against already-held symbols, active managed positions, and open buy or sell orders.
 
 ## Strategy and Backtest Contract

@@ -34354,6 +34354,106 @@ class AlpacaTests(unittest.TestCase):
         self.assertTrue(mock_delete.call_args.args[0].endswith("/v2/orders/sell-old"))
         mock_post.assert_not_called()
 
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_missing_sell_retry_recovers_legacy_final_fence_quarantine(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+    ) -> None:
+        canceled_historical_sell = _complete_order_fixture(
+            {
+                "id": "sell-old",
+                "client_order_id": "rsi-exit-TQQQ-1",
+                "asset_id": "asset-tqqq",
+                "symbol": "TQQQ",
+                "side": "sell",
+                "status": "canceled",
+                "qty": "2",
+                "filled_qty": "0",
+                "limit_price": "150",
+            }
+        )
+        submitted_protection = _complete_order_fixture(
+            {
+                "id": "sell-new",
+                "client_order_id": "rsi-exit-TQQQ-1-r1",
+                "asset_id": "asset-tqqq",
+                "symbol": "TQQQ",
+                "side": "sell",
+                "status": "accepted",
+                "qty": "2",
+                "filled_qty": "0",
+                "limit_price": "150",
+                "submitted_at": "2026-01-05T14:30:00Z",
+            }
+        )
+
+        def broker_get(url: str, **_kwargs: object) -> Mock:
+            if url.endswith("/v2/orders:by_client_order_id"):
+                return error_response(404, {})
+            if url.endswith("/v2/orders/sell-old"):
+                return response(200, canceled_historical_sell, complete_orders=False)
+            if url.endswith("/v2/positions"):
+                return response(
+                    200,
+                    [{"asset_id": "asset-tqqq", "symbol": "TQQQ", "qty": "2"}],
+                    complete_orders=False,
+                )
+            if url.endswith("/v2/orders"):
+                return response(200, [], complete_orders=False)
+            raise AssertionError(f"unexpected Alpaca GET: {url}")
+
+        mock_get.side_effect = broker_get
+        mock_post.return_value = response(200, submitted_protection, complete_orders=False)
+        with closing(sqlite3.connect(":memory:")) as conn, conn:
+            init_state_db(conn)
+            self.seed_filled_managed_buy(conn)
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-old",
+                sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="expired",
+                sell_order_qty=2,
+                sell_order_limit_price=150,
+            )
+            self.assertEqual(
+                claim_alpaca_managed_sell_replacement(
+                    conn,
+                    1,
+                    prior_sell_client_order_id="rsi-exit-TQQQ-1",
+                    prior_sell_alpaca_order_id="sell-old",
+                    prior_renewal_count=0,
+                    replacement_sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                    requested_remaining_qty=2,
+                    expected_target_sell_price=150,
+                    notes="replacement claimed",
+                ),
+                2,
+            )
+            update_alpaca_managed_sell_status(
+                conn,
+                1,
+                sell_status="incomplete_order_metadata",
+                notes=(
+                    "Alpaca reported inconsistent managed sell order identity (final managed-sell submission "
+                    "blocked: historical managed sell exposure is still executable; historical exposure "
+                    "cancellation requires confirmation: sell-old: broker cancellation was requested); "
+                    "accounting and automatic renewal are blocked pending review"
+                ),
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn).iloc[0]
+
+        self.assertEqual(result.loc[0, "Status"], "renewed")
+        self.assertEqual(managed["sell_status"], "accepted")
+        self.assertEqual(managed["sell_alpaca_order_id"], "sell-new")
+        self.assertTrue(pd.isna(managed["sell_submission_retry_claimed_at"]))
+        mock_post.assert_called_once()
+
     @patch("leveraged_trader.alpaca.requests.delete")
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")
@@ -36808,6 +36908,91 @@ class AlpacaTests(unittest.TestCase):
             self.assertIsNone(row[0])
             self.assertEqual(row[1], "submission_not_found")
             client.submit_limit_sell_order.assert_not_called()
+
+    def test_final_sell_fence_durably_tracks_historical_cancellation_before_request(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as conn, conn:
+            init_state_db(conn)
+            self.seed_filled_managed_buy(conn)
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-old",
+                sell_submitted_at="2026-01-02T14:32:00Z",
+                sell_status="expired",
+                sell_order_qty=2,
+                sell_order_limit_price=150,
+            )
+            self.assertEqual(
+                claim_alpaca_managed_sell_replacement(
+                    conn,
+                    1,
+                    prior_sell_client_order_id="rsi-exit-TQQQ-1",
+                    prior_sell_alpaca_order_id="sell-old",
+                    prior_renewal_count=0,
+                    replacement_sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                    requested_remaining_qty=2,
+                    expected_target_sell_price=150,
+                    notes="replacement claimed",
+                ),
+                2,
+            )
+            historical_sell = _complete_order_fixture(
+                {
+                    "id": "sell-old",
+                    "client_order_id": "rsi-exit-TQQQ-1",
+                    "asset_id": "asset-tqqq",
+                    "symbol": "TQQQ",
+                    "side": "sell",
+                    "status": "accepted",
+                    "qty": "2",
+                    "filled_qty": "0",
+                    "limit_price": "150",
+                }
+            )
+            client = Mock()
+            client.get_order_by_client_order_id.return_value = response(404, {})
+            client.get_order.return_value = response(200, historical_sell, complete_orders=False)
+            cancellation_states: list[tuple[str, object, object]] = []
+
+            def cancel_after_durable_fence(_order_id: str) -> Mock:
+                cancellation_states.append(
+                    conn.execute(
+                        "SELECT sell_status, sell_submission_retry_claimed_at, sell_renewal_requested_at "
+                        "FROM alpaca_managed_positions WHERE id = 1"
+                    ).fetchone()
+                )
+                return response(204, {}, complete_orders=False)
+
+            client.cancel_order.side_effect = cancel_after_durable_fence
+            rows: list[dict] = []
+            _submit_managed_gtc_sell(
+                conn=conn,
+                client=client,
+                rows=rows,
+                position_id=1,
+                symbol="TQQQ",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                sell_client_order_id="rsi-exit-TQQQ-1-r1",
+                filled_qty=2,
+                target_sell_price=150,
+                increment_renewal_count=True,
+                replacement_message="test managed sell replacement",
+                live_position_qty=2,
+                intent_already_persisted=True,
+                expected_alpaca_asset_id="asset-tqqq",
+            )
+            managed = load_alpaca_managed_positions(conn).iloc[0]
+
+        self.assertEqual(rows[0]["Status"], "pending_cancel")
+        self.assertEqual(managed["sell_status"], "pending_cancel")
+        self.assertTrue(pd.notna(managed["sell_submission_retry_claimed_at"]))
+        self.assertTrue(pd.notna(managed["sell_renewal_requested_at"]))
+        self.assertEqual(len(cancellation_states), 1)
+        self.assertEqual(cancellation_states[0][0], "pending_cancel")
+        self.assertIsNotNone(cancellation_states[0][1])
+        self.assertIsNotNone(cancellation_states[0][2])
+        client.submit_limit_sell_order.assert_not_called()
 
     def test_final_sell_fence_quarantines_duplicate_exact_client_order_ids(self) -> None:
         with closing(sqlite3.connect(":memory:")) as conn, conn:

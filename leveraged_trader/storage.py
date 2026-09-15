@@ -13574,6 +13574,7 @@ def claim_alpaca_managed_sell_submission_retry_with_revision(
     claimed_at: str,
     reclaim_before: str,
     notes: str,
+    allow_legacy_historical_cancel_quarantine: bool = False,
 ) -> AlpacaManagedSellSubmissionClaim | None:
     """Claim a confirmed-missing sell and rebase it to current protection."""
     expected_target_sell_price = canonical_alpaca_limit_price(
@@ -13596,14 +13597,27 @@ def claim_alpaca_managed_sell_submission_retry_with_revision(
           AND sell_client_order_id = ?
           AND sell_alpaca_order_id IS NULL
           AND closed_at IS NULL
-          AND LOWER(sell_status) IN
-              (
-                'broker_inactive',
-                'submission_failed',
-                'submission_pending',
-                'submission_unknown',
-                'submission_not_found',
-                'submission_retrying'
+          AND (
+                LOWER(sell_status) IN
+                    (
+                      'broker_inactive',
+                      'submission_failed',
+                      'submission_pending',
+                      'submission_unknown',
+                      'submission_not_found',
+                      'submission_retrying'
+                    )
+                OR (
+                      ?
+                      AND LOWER(sell_status) = 'incomplete_order_metadata'
+                      AND sell_submission_retry_claimed_at IS NULL
+                      AND sell_renewal_requested_at IS NULL
+                      AND EXISTS (
+                            SELECT 1
+                            FROM alpaca_managed_sell_fills AS historical_sell
+                            WHERE historical_sell.managed_position_id = alpaca_managed_positions.id
+                      )
+                    )
               )
           AND (
                 sell_submission_retry_claimed_at IS NULL
@@ -13621,6 +13635,7 @@ def claim_alpaca_managed_sell_submission_retry_with_revision(
             notes,
             position_id,
             sell_client_order_id,
+            int(allow_legacy_historical_cancel_quarantine),
             reclaim_before,
             expected_target_sell_price,
         ),

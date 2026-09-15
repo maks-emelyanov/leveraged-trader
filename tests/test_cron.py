@@ -1534,26 +1534,25 @@ def test_installed_command_clears_openssl_configuration_before_python(tmp_path: 
         "[ssl_section]\n"
         "system_default = system_default_section\n"
         "[system_default_section]\n"
-        "CipherString = DEFAULT:@SECLEVEL=0\n",
+        "MaxProtocol = TLSv1.2\n",
         encoding="utf-8",
     )
     real_python = (ROOT / ".venv" / "bin" / "python").resolve()
-    context_probe = "import ssl; print(ssl.create_default_context().security_level)"
+    context_probe = "import ssl; print(int(ssl.create_default_context().maximum_version))"
     baseline = subprocess.run(
         [str(real_python), "-I", "-c", context_probe],
         check=True,
         capture_output=True,
         text=True,
     )
-    weakened = subprocess.run(
+    configured = subprocess.run(
         [str(real_python), "-I", "-c", context_probe],
         env={**os.environ, "OPENSSL_CONF": str(openssl_config)},
         check=True,
         capture_output=True,
         text=True,
     )
-    assert int(baseline.stdout) > 0
-    assert int(weakened.stdout) == 0
+    assert configured.stdout != baseline.stdout
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -1594,7 +1593,7 @@ fi
     probe_output = tmp_path / "scheduled-openssl-context"
     scheduled_probe = (
         'import os, ssl; print(os.environ.get("OPENSSL_CONF", "<unset>")); '
-        "print(ssl.create_default_context().security_level)"
+        "print(int(ssl.create_default_context().maximum_version))"
     )
     scheduler.write_text(
         "#!/bin/bash\nset -euo pipefail\n"
@@ -1614,9 +1613,9 @@ fi
             cron_env[name] = _cron_assignment_value(value)
     subprocess.run(["/bin/sh", "-c", cron_command], cwd=repo_dir, env=cron_env, check=True)
 
-    environment_value, security_level = probe_output.read_text(encoding="utf-8").splitlines()
+    environment_value, maximum_version = probe_output.read_text(encoding="utf-8").splitlines()
     assert environment_value == "<unset>"
-    assert int(security_level) == int(baseline.stdout)
+    assert int(maximum_version) == int(baseline.stdout)
 
 
 def test_installer_default_lock_namespace_uses_account_home_for_different_home_values(tmp_path: Path) -> None:
