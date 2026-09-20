@@ -1098,9 +1098,16 @@ class AlpacaBuyBatchError(RuntimeError):
 class AlpacaReconciliationError(RuntimeError):
     """A required reconciliation failure with all completed position rows attached."""
 
-    def __init__(self, message: str, results: pd.DataFrame) -> None:
+    def __init__(
+        self,
+        message: str,
+        results: pd.DataFrame,
+        *,
+        retryable_historical_cancellation: bool = False,
+    ) -> None:
         super().__init__(message)
         self.results = results.copy()
+        self.retryable_historical_cancellation = bool(retryable_historical_cancellation)
 
 
 _BUY_BATCH_CASH_FRACTION_MAX = 0.50
@@ -6077,7 +6084,11 @@ def _alpaca_public_leaf_exception(
                     broker_side_effects_possible=exc.broker_side_effects_possible,
                 )
             else:
-                public_exc = AlpacaReconciliationError(safe_message, safe_results)
+                public_exc = AlpacaReconciliationError(
+                    safe_message,
+                    safe_results,
+                    retryable_historical_cancellation=exc.retryable_historical_cancellation,
+                )
             BaseException.__setattr__(public_exc, "args", (safe_message,))
             public_exc = _set_alpaca_public_exception_metadata(
                 public_exc,
@@ -17689,9 +17700,16 @@ def _reconcile_alpaca_managed_positions_pass(
             result,
         )
     if required_failure_rows.any():
+        required_results = raw_result.loc[required_failure_rows]
+        retryable_historical_cancellation = not systemic_position_ids and (
+            required_results["Action"].eq("sell")
+            & required_results["Status"].eq("pending_cancel")
+            & required_results["Message"].str.startswith(_LEGACY_FINAL_SELL_HISTORICAL_CANCEL_DIAGNOSTIC)
+        ).all()
         raise AlpacaReconciliationError(
             "one or more Alpaca managed positions could not confirm required protective reconciliation",
             result,
+            retryable_historical_cancellation=retryable_historical_cancellation,
         )
     return result
 
@@ -17741,6 +17759,7 @@ def _reconcile_alpaca_managed_positions_impl(
     )
     phase_results: list[pd.DataFrame] = []
     phase_failures: list[str] = []
+    retryable_phase_failures: list[bool] = []
     closed_audit_blocked = False
     order_snapshot = _ReconciliationOrderSnapshot()
 
@@ -17764,6 +17783,7 @@ def _reconcile_alpaca_managed_positions_impl(
     except AlpacaReconciliationError as exc:
         phase_results.append(exc.results)
         phase_failures.append(str(exc))
+        retryable_phase_failures.append(exc.retryable_historical_cancellation)
 
     try:
         if migrate_closed_symbols:
@@ -17855,6 +17875,7 @@ def _reconcile_alpaca_managed_positions_impl(
                     )
                 phase_results.append(pd.DataFrame(migration_rows, columns=columns))
                 phase_failures.append("audit-only managed Alpaca symbol migration failed")
+                retryable_phase_failures.append(False)
                 if closed_migration_applied:
                     # A failed commit or post-commit runtime validation leaves
                     # no safe premise for the broker-active closed audit.
@@ -17886,6 +17907,7 @@ def _reconcile_alpaca_managed_positions_impl(
             except AlpacaReconciliationError as exc:
                 phase_results.append(exc.results)
                 phase_failures.append(str(exc))
+                retryable_phase_failures.append(exc.retryable_historical_cancellation)
     except Exception as exc:
         detail = _alpaca_exception_diagnostic(
             exc,
@@ -17928,7 +17950,11 @@ def _reconcile_alpaca_managed_positions_impl(
 
     combined_results = combined_phase_results()
     if phase_failures:
-        raise AlpacaReconciliationError(phase_failures[0], combined_results)
+        raise AlpacaReconciliationError(
+            phase_failures[0],
+            combined_results,
+            retryable_historical_cancellation=all(retryable_phase_failures),
+        )
     return combined_results
 
 

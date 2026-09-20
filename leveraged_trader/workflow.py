@@ -1652,6 +1652,14 @@ class WorkflowRunError(RuntimeError):
     """Raised when a workflow run cannot produce any usable strategy result."""
 
 
+class _CompletedWorkflowStateInvalidError(WorkflowRunError):
+    """A completed pair cannot be authenticated against the current run."""
+
+    def __init__(self, message: str, pairs: set[tuple[str, str]]) -> None:
+        super().__init__(message)
+        self.pairs = frozenset(pairs)
+
+
 class WorkflowDeadlineExceeded(WorkflowRunError):
     """Raised before broker submission when the analytics cutoff expires."""
 
@@ -2558,11 +2566,13 @@ def _safe_alpaca_reconciliation_error(
     results: pd.DataFrame,
     *,
     alpaca_cfg: AlpacaOrderConfig | None,
+    retryable_historical_cancellation: bool = False,
 ) -> AlpacaReconciliationError:
     """Build a typed reconciliation failure after final composition redaction."""
     return AlpacaReconciliationError(
         _safe_alpaca_workflow_text(message, alpaca_cfg=alpaca_cfg),
         _safe_alpaca_workflow_result_messages(results, alpaca_cfg=alpaca_cfg),
+        retryable_historical_cancellation=retryable_historical_cancellation,
     )
 
 
@@ -2887,7 +2897,54 @@ def _reconcile_alpaca_managed_positions_for_db(
     alpaca_cfg: AlpacaOrderConfig,
 ) -> pd.DataFrame:
     return _run_alpaca_workflow_diagnostic_boundary(
-        lambda: _reconcile_alpaca_managed_positions_for_db_impl(db_path, alpaca_cfg),
+        lambda: _reconcile_alpaca_managed_positions_with_cancellation_retry(db_path, alpaca_cfg),
+        alpaca_cfg=alpaca_cfg,
+    )
+
+
+def _reconcile_alpaca_managed_positions_with_cancellation_retry(
+    db_path: str,
+    alpaca_cfg: AlpacaOrderConfig,
+) -> pd.DataFrame:
+    try:
+        return _reconcile_alpaca_managed_positions_for_db_impl(db_path, alpaca_cfg)
+    except AlpacaReconciliationError as exc:
+        if not exc.retryable_historical_cancellation:
+            raise
+        initial_results = exc.results.copy()
+
+    initial_results["Message"] = (
+        "Initial reconciliation before cancellation retry: " + initial_results["Message"].fillna("").astype(str)
+    )
+
+    # A broker cancellation is asynchronous. The first pass has durably fenced
+    # the old sell, and the next pass repeats every identity, quantity, and
+    # exposure check before it can submit a replacement. Keep the wait bounded
+    # so an unresolved cancellation still produces the usual failure audit.
+    try:
+        time.sleep(10)
+        retry_results = _reconcile_alpaca_managed_positions_for_db_impl(db_path, alpaca_cfg)
+    except AlpacaReconciliationError as exc:
+        exc.results = _safe_alpaca_workflow_result_messages(
+            pd.concat([initial_results, exc.results], ignore_index=True),
+            alpaca_cfg=alpaca_cfg,
+        )
+        raise
+    except BaseException as exc:
+        raise _alpaca_reconciliation_followup_error(
+            initial_results,
+            action="recheck historical sell cancellation",
+            failure=exc,
+            alpaca_cfg=alpaca_cfg,
+        ) from _alpaca_public_exception_cause(exc, cfg=alpaca_cfg)
+
+    completed_initial_results = initial_results.loc[
+        ~(initial_results["Action"].eq("sell") & initial_results["Status"].eq("pending_cancel"))
+    ]
+    if completed_initial_results.empty:
+        return retry_results
+    return _safe_alpaca_workflow_result_messages(
+        pd.concat([completed_initial_results, retry_results], ignore_index=True),
         alpaca_cfg=alpaca_cfg,
     )
 
@@ -3070,6 +3127,7 @@ def _reconcile_alpaca_managed_positions_for_db_impl(
                     failure_message,
                     combined_results,
                     alpaca_cfg=alpaca_cfg,
+                    retryable_historical_cancellation=exc.retryable_historical_cancellation,
                 ) from _alpaca_public_exception_cause(exc, cfg=alpaca_cfg)
             except BaseException as exc:
                 action = (
@@ -3484,17 +3542,20 @@ def _build_reports_for_db(
                     )
                 ):
                     unauthenticated_pairs.add((asset_symbol, signal_symbol))
-            if disappeared_pairs:
-                missing = ", ".join(f"{asset}/{signal}" for asset, signal in sorted(disappeared_pairs))
-                raise WorkflowRunError(
-                    f"Completed workflow state disappeared before reporting for: {missing}. "
-                    "Broker submission was aborted."
-                )
-            if unauthenticated_pairs:
-                missing = ", ".join(f"{asset}/{signal}" for asset, signal in sorted(unauthenticated_pairs))
-                raise WorkflowRunError(
-                    "Completed workflow state no longer matches the requested strategy "
-                    f"grid for: {missing}. Broker submission was aborted."
+            if disappeared_pairs or unauthenticated_pairs:
+                diagnostics = []
+                if disappeared_pairs:
+                    missing = ", ".join(f"{asset}/{signal}" for asset, signal in sorted(disappeared_pairs))
+                    diagnostics.append(f"Completed workflow state disappeared before reporting for: {missing}.")
+                if unauthenticated_pairs:
+                    mismatched = ", ".join(f"{asset}/{signal}" for asset, signal in sorted(unauthenticated_pairs))
+                    diagnostics.append(
+                        "Completed workflow state no longer matches the requested strategy "
+                        f"grid for: {mismatched}."
+                    )
+                raise _CompletedWorkflowStateInvalidError(
+                    " ".join([*diagnostics, "Broker submission was aborted."]),
+                    disappeared_pairs | unauthenticated_pairs,
                 )
         strategy_report_cache = {}
         optimization_summary, curves = summarize_saved_results(
@@ -3518,9 +3579,10 @@ def _build_reports_for_db(
         missing_asset_pairs = processed_asset_pairs - reported_asset_pairs
         if missing_asset_pairs:
             missing = ", ".join(f"{asset}/{signal}" for asset, signal in sorted(missing_asset_pairs))
-            raise WorkflowRunError(
+            raise _CompletedWorkflowStateInvalidError(
                 "Completed workflow state disappeared before report generation for: "
-                f"{missing}. Broker submission was aborted."
+                f"{missing}. Broker submission was aborted.",
+                missing_asset_pairs,
             )
         buy_signals = build_buy_signal_report(
             conn,
@@ -5753,8 +5815,6 @@ async def _run_resumable_optimizations_unlocked(
 
     _check_workflow_deadline(workflow_deadline, "before reporting")
     with reporter.status("Building workflow reports"):
-        side_outputs: list[WorkflowSideOutput] = []
-        realized_pnl_summary = pd.DataFrame()
         report_deadline_kwargs: dict[str, object] = {}
         if workflow_deadline is not None:
             report_deadline_kwargs["deadline_check"] = partial(
@@ -5762,47 +5822,107 @@ async def _run_resumable_optimizations_unlocked(
                 workflow_deadline,
                 "during report generation",
             )
-        for workflow_spec in workflow_specs:
-            workflow_key = str(workflow_spec["key"])
-            workflow_label = str(workflow_spec["label"])
-            workflow_assets = workflow_spec["assets"]
-            assert isinstance(workflow_assets, pd.DataFrame)
-            side_asset_run_results = asset_run_results_by_side.get(workflow_key, [])
-            (
-                side_optimization_summary,
-                side_curves,
-                side_buy_signals,
-                side_eligible_buy_signals,
-                side_sell_signals,
-                realized_pnl_summary,
-            ) = await _timed_run_blocking(
-                phase_timings,
-                "report_generation",
-                _build_reports_for_db,
-                db_path,
-                workflow_assets,
-                base_cfg,
-                _completed_asset_pairs(side_asset_run_results),
-                workflow_label,
-                str(workflow_spec["rsi_entry_rule"]),
-                list(workflow_spec["buy_rsi_values"]),
-                profit_target_values,
-                **report_deadline_kwargs,
-            )
-            side_outputs.append(
-                WorkflowSideOutput(
-                    label=workflow_label,
-                    universe_assets=workflow_assets,
-                    buy_rsi_values=list(workflow_spec["buy_rsi_values"]),
-                    rsi_entry_rule=str(workflow_spec["rsi_entry_rule"]),
-                    asset_run_results=side_asset_run_results,
-                    optimization_summary=side_optimization_summary,
-                    curves=side_curves,
-                    buy_signals=side_buy_signals,
-                    eligible_buy_signals=side_eligible_buy_signals,
-                    sell_signals=side_sell_signals,
+        recovered_pairs: set[tuple[str, str]] = set()
+        while True:
+            side_outputs: list[WorkflowSideOutput] = []
+            realized_pnl_summary = pd.DataFrame()
+            for workflow_spec in workflow_specs:
+                workflow_key = str(workflow_spec["key"])
+                workflow_label = str(workflow_spec["label"])
+                workflow_assets = workflow_spec["assets"]
+                assert isinstance(workflow_assets, pd.DataFrame)
+                side_asset_run_results = asset_run_results_by_side.get(workflow_key, [])
+                try:
+                    (
+                        side_optimization_summary,
+                        side_curves,
+                        side_buy_signals,
+                        side_eligible_buy_signals,
+                        side_sell_signals,
+                        realized_pnl_summary,
+                    ) = await _timed_run_blocking(
+                        phase_timings,
+                        "report_generation",
+                        _build_reports_for_db,
+                        db_path,
+                        workflow_assets,
+                        base_cfg,
+                        _completed_asset_pairs(side_asset_run_results),
+                        workflow_label,
+                        str(workflow_spec["rsi_entry_rule"]),
+                        list(workflow_spec["buy_rsi_values"]),
+                        profit_target_values,
+                        **report_deadline_kwargs,
+                    )
+                except _CompletedWorkflowStateInvalidError as exc:
+                    # A later asset can invalidate an earlier pair's shared
+                    # signal. Rebuild from this run's cached provider snapshot,
+                    # then authenticate every side again before broker work.
+                    if exc.pairs & recovered_pairs:
+                        raise
+                    replay_jobs = [
+                        job
+                        for job in _workflow_jobs(workflow_assets, workflow_label=workflow_label)
+                        if (job.asset_symbol, job.signal_symbol) in exc.pairs
+                    ]
+                    if len(replay_jobs) != len(exc.pairs):
+                        raise
+                    _check_workflow_deadline(workflow_deadline, "before recovering invalidated strategy state")
+                    affected = ", ".join(f"{asset}/{signal}" for asset, signal in sorted(exc.pairs))
+                    reporter.console.print(f"Rebuilding invalidated strategy state: {affected}")
+                    replay_results = await _run_asset_pipeline(
+                        jobs=replay_jobs,
+                        concurrency=concurrency,
+                        db_path=db_path,
+                        mode="rebuild",
+                        base_cfg=base_cfg,
+                        tradier_cfg=tradier_cfg,
+                        buy_rsi_values=list(workflow_spec["buy_rsi_values"]),
+                        profit_target_values=profit_target_values,
+                        asset_progress=None,
+                        phase_timings=phase_timings,
+                        rsi_entry_rule=str(workflow_spec["rsi_entry_rule"]),
+                        history_observation_run_id=history_observation_run_id,
+                        market_data_session=market_data_session,
+                        strategy_state_verification=strategy_state_verification,
+                        workflow_deadline=workflow_deadline,
+                    )
+                    if len(replay_results) != len(replay_jobs) or any(
+                        result.status != "done" for result in replay_results
+                    ):
+                        raise WorkflowRunError(
+                            "Could not recover all invalidated strategy state before reporting. "
+                            "Broker submission was aborted."
+                        ) from exc
+                    recovered_pairs.update(exc.pairs)
+                    replacements = {(result.asset_symbol, result.signal_symbol): result for result in replay_results}
+                    asset_run_results_by_side[workflow_key] = [
+                        replacements.get((result.asset_symbol, result.signal_symbol), result)
+                        for result in side_asset_run_results
+                    ]
+                    all_asset_run_results = [
+                        replacements.get((result.asset_symbol, result.signal_symbol), result)
+                        if result.workflow == workflow_label
+                        else result
+                        for result in all_asset_run_results
+                    ]
+                    break
+                side_outputs.append(
+                    WorkflowSideOutput(
+                        label=workflow_label,
+                        universe_assets=workflow_assets,
+                        buy_rsi_values=list(workflow_spec["buy_rsi_values"]),
+                        rsi_entry_rule=str(workflow_spec["rsi_entry_rule"]),
+                        asset_run_results=side_asset_run_results,
+                        optimization_summary=side_optimization_summary,
+                        curves=side_curves,
+                        buy_signals=side_buy_signals,
+                        eligible_buy_signals=side_eligible_buy_signals,
+                        sell_signals=side_sell_signals,
+                    )
                 )
-            )
+            else:
+                break
 
         optimization_summary = _concat_report_frames([side.optimization_summary for side in side_outputs])
         curves = _concat_report_frames([side.curves for side in side_outputs], axis=1)

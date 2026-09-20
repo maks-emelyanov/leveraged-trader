@@ -48,6 +48,7 @@ from leveraged_trader.alpaca import (
     _append_accepted_buy_processing_failure,
     _append_fenced_stale_sell_submission_result,
     _append_incomplete_sell_fill_result,
+    _append_reconciliation_result,
     _append_recovered_open_sell_result,
     _append_sell_submission_intent_mismatch_result,
     _audit_recently_closed_managed_position,
@@ -34257,6 +34258,74 @@ class AlpacaTests(unittest.TestCase):
         self.assertTrue(pd.isna(managed["sell_alpaca_order_id"]))
         self.assertTrue(pd.isna(managed["closed_at"]))
         mock_post.assert_not_called()
+
+    def test_historical_cancellation_retry_uses_required_failures_before_public_redaction(self) -> None:
+        for filled_failure, systemic_failure in ((False, False), (True, False), (False, True)):
+            with self.subTest(filled_failure=filled_failure, systemic_failure=systemic_failure):
+                cfg = self.cfg(buy=True, sell=True)
+                cfg.api_secret_key = "historical"
+
+                def append_reconciliation_outcomes(
+                    *,
+                    rows: list[dict],
+                    filled_failure: bool = filled_failure,
+                    systemic_failure: bool = systemic_failure,
+                    **_kwargs: object,
+                ) -> bool:
+                    for action, status, message, required_failure in (
+                        (
+                            "sell",
+                            "pending_cancel",
+                            "final managed-sell submission blocked: historical managed sell exposure is still "
+                            "executable; historical exposure cancellation requires confirmation: sell-old",
+                            True,
+                        ),
+                        ("sell", "accepted_for_bidding", "managed sell already submitted", False),
+                        ("buy", "canceled", "buy terminated without a filled position", False),
+                        (
+                            "sell",
+                            "filled",
+                            "managed sell fill quantity does not match the managed buy"
+                            if filled_failure
+                            else "managed target sell filled; position closed",
+                            filled_failure,
+                        ),
+                    ):
+                        _append_reconciliation_result(
+                            rows,
+                            position_id=1,
+                            symbol="TQQQ",
+                            action=action,
+                            status=status,
+                            buy_client_order_id="buy-1",
+                            sell_client_order_id="sell-1",
+                            qty=2,
+                            limit_price=150,
+                            alpaca_order_id=None,
+                            message=message,
+                            required_failure=required_failure,
+                            systemic_failure=systemic_failure,
+                        )
+                    return True
+
+                with closing(sqlite3.connect(":memory:")) as conn, conn:
+                    init_state_db(conn)
+                    self.seed_filled_managed_buy(conn)
+                    with (
+                        patch(
+                            "leveraged_trader.alpaca._reconcile_retained_sell_submission_quarantine",
+                            side_effect=append_reconciliation_outcomes,
+                        ),
+                        self.assertRaises(AlpacaReconciliationError) as raised,
+                    ):
+                        reconcile_alpaca_managed_positions(conn, cfg)
+
+                self.assertEqual(
+                    raised.exception.retryable_historical_cancellation,
+                    not filled_failure and not systemic_failure,
+                )
+                self.assertNotIn("historical", raised.exception.results.loc[0, "Message"])
+                self.assertIn("[redacted credential]", raised.exception.results.loc[0, "Message"])
 
     @patch("leveraged_trader.alpaca.requests.delete")
     @patch("leveraged_trader.alpaca.requests.post")

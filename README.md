@@ -251,6 +251,13 @@ due even when validation finishes during 8:46. The gate runs:
 - Every minute from 9:30 a.m. through 4:00 p.m. Monday-Friday: run the lightweight managed-position
   reconciliation path with sell submission enabled and buy submission disabled.
 
+In full and reconciliation-only workflows, historical-sell cancellations receive one retry after
+10 seconds when they are the only failures requiring protection or fill-accounting correction.
+Successful actions for other positions do not prevent the retry, which repeats the complete
+protective check with fresh broker observations. The final audit retains completed first-pass actions
+marked as initial reconciliation. An unresolved or interrupted retry still fails and publishes the
+initial observations alongside the failure diagnostics.
+
 Candidate-minute clock and locked-environment preflight run before the nonblocking execution/log lock, and a
 non-due invocation exits without acquiring that lock. Thus a slow 8:44 preflight cannot occupy the
 unique 8:45 execution slot. A due invocation acquires the lock after preflight, and the production
@@ -782,6 +789,12 @@ Strategy-state updates use a thread-confined SQLite connection with a separate i
 and persisted generation check for every asset. A benchmark invalidation and the dependent
 asset/config updates therefore commit as one serialized operation even if two workflow processes use
 the same database. Failed transactions do not populate the shared-history synchronization cache.
+If reporting finds that a completed asset/signal pair lost its saved state or no longer matches the
+requested strategy grid, the workflow rebuilds that pair at most once from the current run's cached
+market-data snapshot. This covers shared-history updates that invalidate an earlier completed pair.
+After recovery, report generation restarts for every workflow side and authenticates their state
+again. Recovery retains the workflow deadline; a failed rebuild, repeated invalidation, or expired
+deadline stops the run before recommendation submission.
 
 Each top-level workflow also acquires nonblocking process locks for its database and output directory.
 Runs sharing either resource fail fast instead of overlapping; this includes direct callers of the

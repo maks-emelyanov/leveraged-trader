@@ -45,6 +45,7 @@ from leveraged_trader.reports import build_pending_action_report
 from leveraged_trader.storage import (
     AssetMarketDataError,
     _synchronize_market_data_history,
+    clear_asset_state,
     init_state_db,
     load_aligned_rsi_for_asset_session,
     mark_alpaca_managed_buy_filled,
@@ -66,6 +67,7 @@ from leveraged_trader.workflow import (
     _build_reports_for_db,
     _clear_stale_workflow_research_outputs,
     _complete_workflow_asset,
+    _CompletedWorkflowStateInvalidError,
     _concat_report_frames,
     _initialize_state_db,
     _persist_workflow_research_outputs,
@@ -75,6 +77,7 @@ from leveraged_trader.workflow import (
     _prepare_workflow_asset,
     _process_asset_grid_for_db,
     _reconcile_alpaca_managed_positions_for_db,
+    _reconcile_alpaca_managed_positions_with_cancellation_retry,
     _run_asset_pipeline,
     _run_blocking,
     _state_connection,
@@ -1376,6 +1379,228 @@ publish("new")
                     (output_dir / filename).read_text(encoding="utf-8"),
                     "Generation\nprior-research\n",
                 )
+
+    def test_historical_sell_cancellation_is_rechecked_once_after_broker_confirmation_delay(self) -> None:
+        pending = pd.DataFrame(
+            [
+                {
+                    "Action": "sell",
+                    "Status": "pending_cancel",
+                    "Message": (
+                        "final managed-sell submission blocked: historical managed sell exposure is still "
+                        "executable; historical exposure cancellation requires confirmation: sell-old"
+                    ),
+                }
+            ]
+        )
+        recovered = pd.DataFrame([{"Action": "sell", "Status": "renewed", "Message": "protected"}])
+        with (
+            patch(
+                "leveraged_trader.workflow._reconcile_alpaca_managed_positions_for_db_impl",
+                side_effect=[
+                    AlpacaReconciliationError("pending", pending, retryable_historical_cancellation=True),
+                    recovered,
+                ],
+            ) as reconcile,
+            patch("leveraged_trader.workflow.time.sleep") as sleep,
+        ):
+            result = _reconcile_alpaca_managed_positions_with_cancellation_retry("state.sqlite", AlpacaOrderConfig())
+
+        self.assertIs(result, recovered)
+        self.assertEqual(reconcile.call_count, 2)
+        sleep.assert_called_once_with(10)
+
+    def test_historical_sell_cancellation_retry_retains_unresolved_failure(self) -> None:
+        pending = pd.DataFrame(
+            [
+                {
+                    "Action": "sell",
+                    "Status": "pending_cancel",
+                    "Message": (
+                        "final managed-sell submission blocked: historical managed sell exposure is still "
+                        "executable; historical exposure cancellation requires confirmation: sell-old"
+                    ),
+                }
+            ]
+        )
+        first = AlpacaReconciliationError("pending", pending, retryable_historical_cancellation=True)
+        unresolved = AlpacaReconciliationError("still pending", pending)
+        with (
+            patch(
+                "leveraged_trader.workflow._reconcile_alpaca_managed_positions_for_db_impl",
+                side_effect=[first, unresolved],
+            ) as reconcile,
+            patch("leveraged_trader.workflow.time.sleep") as sleep,
+            self.assertRaises(AlpacaReconciliationError) as raised,
+        ):
+            _reconcile_alpaca_managed_positions_with_cancellation_retry("state.sqlite", AlpacaOrderConfig())
+
+        self.assertIs(raised.exception, unresolved)
+        self.assertEqual(len(raised.exception.results), 2)
+        self.assertTrue(raised.exception.results.loc[0, "Message"].startswith("Initial reconciliation"))
+        self.assertEqual(raised.exception.results.loc[1, "Message"], pending.loc[0, "Message"])
+        self.assertEqual(reconcile.call_count, 2)
+        sleep.assert_called_once_with(10)
+
+    def test_historical_cancellation_retry_retains_migration_and_completed_actions(self) -> None:
+        pending = pd.DataFrame(
+            [
+                {"Action": "sell", "Status": "pending_cancel", "Message": "historical cancellation requested"},
+                {"Action": "sell", "Status": "accepted_for_bidding", "Message": "protective sell accepted"},
+                {"Action": "sell", "Status": "closed", "Message": "position closed"},
+                {"Action": "buy", "Status": "canceled", "Message": "unfilled buy terminated"},
+            ]
+        )
+        recovered = pd.DataFrame([{"Action": "sell", "Status": "renewed", "Message": "protected"}])
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "state.sqlite")
+            _initialize_state_db(db_path)
+            with closing(sqlite3.connect(db_path)) as conn, conn:
+                save_alpaca_managed_buy_order(
+                    conn,
+                    symbol="TQQQ",
+                    signal_symbol="QQQ",
+                    buy_rsi=30,
+                    profit_target_multiple=1.5,
+                    buy_signal_date="2026-01-02",
+                    buy_client_order_id="rsi-buy-TQQQ-cancel-retry",
+                    buy_alpaca_order_id="buy-1",
+                    buy_submitted_at="2026-01-02T14:30:00Z",
+                    buy_status="accepted",
+                )
+            with (
+                patch(
+                    "leveraged_trader.workflow.migrate_alpaca_managed_position_symbols",
+                    side_effect=[{"OLD": "TQQQ"}, {}],
+                ),
+                patch(
+                    "leveraged_trader.workflow.reconcile_alpaca_managed_positions",
+                    side_effect=[
+                        AlpacaReconciliationError("pending", pending, retryable_historical_cancellation=True),
+                        recovered,
+                    ],
+                ) as reconcile,
+                patch("leveraged_trader.workflow.time.sleep") as sleep,
+            ):
+                result = _reconcile_alpaca_managed_positions_for_db(db_path, AlpacaOrderConfig())
+
+        self.assertEqual(
+            result["Status"].tolist(),
+            ["symbol_migrated", "accepted_for_bidding", "closed", "canceled", "renewed"],
+        )
+        self.assertTrue(result.iloc[:-1]["Message"].str.startswith("Initial reconciliation").all())
+        self.assertEqual(result.iloc[-1]["Message"], "protected")
+        self.assertEqual(reconcile.call_count, 2)
+        sleep.assert_called_once_with(10)
+
+    def test_historical_cancellation_retry_preserves_first_audit_after_unexpected_failure(self) -> None:
+        pending = pd.DataFrame(
+            [{"Action": "sell", "Status": "pending_cancel", "Message": "historical cancellation requested"}]
+        )
+        for during_delay in (False, True):
+            with self.subTest(during_delay=during_delay):
+                first = AlpacaReconciliationError("pending", pending, retryable_historical_cancellation=True)
+                with (
+                    patch(
+                        "leveraged_trader.workflow._reconcile_alpaca_managed_positions_for_db_impl",
+                        side_effect=[first, OSError("cannot open database")],
+                    ) as reconcile,
+                    patch(
+                        "leveraged_trader.workflow.time.sleep",
+                        side_effect=KeyboardInterrupt("interrupted") if during_delay else None,
+                    ),
+                    self.assertRaises(AlpacaReconciliationError) as raised,
+                ):
+                    _reconcile_alpaca_managed_positions_for_db("state.sqlite", AlpacaOrderConfig())
+
+                self.assertEqual(raised.exception.results["Status"].tolist(), ["pending_cancel", "error"])
+                self.assertTrue(raised.exception.results.loc[0, "Message"].startswith("Initial reconciliation"))
+                self.assertIn("recheck historical sell cancellation", raised.exception.results.loc[1, "Message"])
+                self.assertEqual(reconcile.call_count, 1 if during_delay else 2)
+
+    def test_historical_cancellation_retry_preserves_first_audit_after_typed_failure(self) -> None:
+        initial = pd.DataFrame(
+            [
+                {"Action": "sell", "Status": "pending_cancel", "Message": "cancellation requested"},
+                {"Action": "sell", "Status": "renewed", "Message": "other position protected"},
+            ]
+        )
+        failed = AlpacaReconciliationError(
+            "broker unavailable", pd.DataFrame([{"Action": "reconcile", "Status": "error", "Message": "503"}])
+        )
+        with (
+            patch(
+                "leveraged_trader.workflow._reconcile_alpaca_managed_positions_for_db_impl",
+                side_effect=[
+                    AlpacaReconciliationError("pending", initial, retryable_historical_cancellation=True),
+                    failed,
+                ],
+            ),
+            patch("leveraged_trader.workflow.time.sleep"),
+            self.assertRaises(AlpacaReconciliationError) as raised,
+        ):
+            _reconcile_alpaca_managed_positions_for_db("state.sqlite", AlpacaOrderConfig())
+
+        self.assertIs(raised.exception, failed)
+        self.assertEqual(failed.results["Status"].tolist(), ["pending_cancel", "renewed", "error"])
+        self.assertTrue(failed.results.iloc[:2]["Message"].str.startswith("Initial reconciliation").all())
+
+    def test_other_protective_reconciliation_errors_are_not_delayed(self) -> None:
+        failed = AlpacaReconciliationError(
+            "unprotected",
+            pd.DataFrame([{"Action": "sell", "Status": "quantity_mismatch", "Message": "wrong quantity"}]),
+        )
+        with (
+            patch(
+                "leveraged_trader.workflow._reconcile_alpaca_managed_positions_for_db_impl",
+                side_effect=failed,
+            ) as reconcile,
+            patch("leveraged_trader.workflow.time.sleep") as sleep,
+            self.assertRaises(AlpacaReconciliationError) as raised,
+        ):
+            _reconcile_alpaca_managed_positions_with_cancellation_retry("state.sqlite", AlpacaOrderConfig())
+
+        self.assertIs(raised.exception, failed)
+        reconcile.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_historical_cancellation_does_not_delay_an_independent_error(self) -> None:
+        for independent_status in ("error", "pending_cancel", "filled"):
+            with self.subTest(independent_status=independent_status):
+                failed = AlpacaReconciliationError(
+                    "multiple failures",
+                    pd.DataFrame(
+                        [
+                            {
+                                "Action": "sell",
+                                "Status": "pending_cancel",
+                                "Message": (
+                                    "final managed-sell submission blocked: historical managed sell exposure is "
+                                    "still executable; historical exposure cancellation requires confirmation: "
+                                    "sell-old"
+                                ),
+                            },
+                            {
+                                "Action": "reconcile",
+                                "Status": independent_status,
+                                "Message": "broker unavailable",
+                            },
+                        ]
+                    ),
+                )
+                with (
+                    patch(
+                        "leveraged_trader.workflow._reconcile_alpaca_managed_positions_for_db_impl",
+                        side_effect=failed,
+                    ) as reconcile,
+                    patch("leveraged_trader.workflow.time.sleep") as sleep,
+                    self.assertRaises(AlpacaReconciliationError) as raised,
+                ):
+                    _reconcile_alpaca_managed_positions_with_cancellation_retry("state.sqlite", AlpacaOrderConfig())
+
+                self.assertIs(raised.exception, failed)
+                reconcile.assert_called_once()
+                sleep.assert_not_called()
 
     def test_reconciliation_only_persists_systemic_failure_rows_before_raising(self) -> None:
         reconciliation = pd.DataFrame(
@@ -6853,7 +7078,10 @@ publish("new")
 
             with (
                 patch("leveraged_trader.workflow.summarize_saved_results") as summarize,
-                self.assertRaisesRegex(WorkflowRunError, "requested strategy grid"),
+                self.assertRaisesRegex(
+                    _CompletedWorkflowStateInvalidError,
+                    "requested strategy grid",
+                ) as raised,
             ):
                 _build_reports_for_db(
                     db_path,
@@ -6865,6 +7093,7 @@ publish("new")
                 )
 
             summarize.assert_not_called()
+            self.assertEqual(raised.exception.pairs, {("TQQQ", "QQQ")})
 
     def test_report_build_reads_one_committed_sqlite_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -7874,6 +8103,502 @@ publish("new")
         self.assertEqual(len(submitted_buy_signals), 1)
         self.assertEqual(submitted_buy_signals[0]["Workflow"].tolist(), ["Long", "Short"])
         self.assertEqual(submitted_buy_signals[0]["Asset"].tolist(), ["TQQQ", "SQQQ"])
+
+    def test_workflow_rebuilds_disappeared_pair_then_rechecks_all_reports(self) -> None:
+        pair = ("BLSG", "BLSH")
+        workflow_assets = pd.DataFrame([{"symbol": pair[0], "name": pair[0], "rsi_symbol": pair[1]}])
+        pipeline_calls: list[tuple[str, list[tuple[str, str]], object]] = []
+        report_sides: list[str | None] = []
+
+        async def fake_pipeline(**kwargs: object) -> list[AssetRunResult]:
+            jobs = kwargs["jobs"]
+            pipeline_calls.append(
+                (
+                    str(kwargs["mode"]),
+                    [(job.asset_symbol, job.signal_symbol) for job in jobs],
+                    kwargs["market_data_session"],
+                )
+            )
+            return [
+                AssetRunResult(
+                    workflow_idx=job.workflow_idx,
+                    asset_symbol=job.asset_symbol,
+                    signal_symbol=job.signal_symbol,
+                    action="Rebuilding" if kwargs["mode"] == "rebuild" else "Updating",
+                    rows_processed=1,
+                    status="done",
+                    message="Processed 1 row",
+                    workflow=job.workflow,
+                )
+                for job in jobs
+            ]
+
+        def fake_reports(
+            _db_path: str,
+            _workflow_assets: pd.DataFrame,
+            _base_cfg: BacktestConfig,
+            _processed_asset_pairs: set[tuple[str, str]],
+            workflow_label: str | None = None,
+            *_args: object,
+            **_kwargs: object,
+        ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+            report_sides.append(workflow_label)
+            if workflow_label == "Long" and report_sides.count("Long") == 1:
+                raise _CompletedWorkflowStateInvalidError("Completed workflow state disappeared", {pair})
+            return (pd.DataFrame(),) * 6
+
+        with tempfile.TemporaryDirectory() as tmp:
+            report_output = io.StringIO()
+            reporter = WorkflowReporter(
+                console=Console(file=report_output, width=100, color_system=None, no_color=True)
+            )
+            with (
+                patch(
+                    "leveraged_trader.workflow._reconcile_alpaca_managed_positions_for_db",
+                    return_value=pd.DataFrame(columns=["Action"]),
+                ),
+                patch(
+                    "leveraged_trader.workflow._load_or_refresh_workflow_assets_for_db", return_value=workflow_assets
+                ),
+                patch("leveraged_trader.workflow._run_asset_pipeline", new=fake_pipeline),
+                patch("leveraged_trader.workflow._build_reports_for_db", side_effect=fake_reports),
+                patch(
+                    "leveraged_trader.workflow._submit_alpaca_paper_buy_orders_for_db",
+                    return_value=pd.DataFrame(columns=["Status"]),
+                ) as submit,
+                patch("leveraged_trader.workflow._load_alpaca_managed_positions_for_db", return_value=pd.DataFrame()),
+                patch("leveraged_trader.workflow._load_alpaca_realized_pnl_for_db", return_value=pd.DataFrame()),
+                patch("leveraged_trader.workflow._write_workflow_outputs"),
+            ):
+                asyncio.run(
+                    run_resumable_optimizations_async(
+                        mode="update",
+                        db_path=str(Path(tmp) / "state.sqlite"),
+                        base_cfg=BacktestConfig(),
+                        universe_cfg=UniverseConfig(),
+                        buy_rsi_values=[30.0],
+                        profit_target_values=[1.5],
+                        alpaca_cfg=AlpacaOrderConfig(),
+                        output_dir=str(Path(tmp) / "outputs"),
+                        reporter=reporter,
+                    )
+                )
+
+        self.assertEqual([call[:2] for call in pipeline_calls], [("update", [pair]), ("rebuild", [pair])])
+        self.assertIs(pipeline_calls[0][2], pipeline_calls[1][2])
+        self.assertEqual(report_sides, ["Long", "Long", "Short"])
+        self.assertIn("Rebuilding invalidated strategy state: BLSG/BLSH", report_output.getvalue())
+        submit.assert_called_once()
+
+    def test_workflow_recovers_missing_and_mismatched_state_before_buy_worker(self) -> None:
+        assets = pd.DataFrame(
+            [
+                {"symbol": "AAA", "name": "A", "rsi_symbol": "QQQ"},
+                {"symbol": "BBB", "name": "B", "rsi_symbol": "QQQ"},
+            ]
+        )
+        histories = {
+            symbol: self._symbol_history(symbol, offset)
+            for symbol, offset in (("AAA", 0.0), ("BBB", 20.0), ("QQQ", 10.0), ("^IRX", -95.0))
+        }
+        modes: list[str] = []
+        submitted_with_both_states = False
+
+        async def process_and_invalidate(**kwargs: object) -> list[AssetRunResult]:
+            mode = str(kwargs["mode"])
+            modes.append(mode)
+            db_path = str(kwargs["db_path"])
+            cfg = kwargs["base_cfg"]
+            results = []
+            for job in kwargs["jobs"]:
+                asset_history = histories[job.asset_symbol]
+                signal_history = histories[job.signal_symbol]
+                risk_free_history = histories["^IRX"]
+                data = _strategy_data_from_authoritative_histories(
+                    asset_symbol=job.asset_symbol,
+                    signal_symbol=job.signal_symbol,
+                    asset_history=asset_history,
+                    signal_history=signal_history,
+                    risk_free_history=risk_free_history,
+                )
+                _process_asset_grid_for_db(
+                    db_path,
+                    data,
+                    asset_history,
+                    signal_history,
+                    risk_free_history,
+                    cfg,
+                    job.asset_symbol,
+                    job.signal_symbol,
+                    kwargs["buy_rsi_values"],
+                    kwargs["profit_target_values"],
+                    True,
+                    canonical_signal_history=signal_history,
+                )
+                results.append(
+                    AssetRunResult(
+                        job.workflow_idx,
+                        job.asset_symbol,
+                        job.signal_symbol,
+                        "Rebuilding",
+                        len(data),
+                        "done",
+                        "processed",
+                        job.workflow,
+                    )
+                )
+            if mode == "update":
+                with closing(sqlite3.connect(db_path)) as conn, conn:
+                    clear_asset_state(conn, "AAA", "QQQ")
+                    conn.execute(
+                        "UPDATE strategy_config SET fingerprint = 'stale' "
+                        "WHERE asset_symbol = 'BBB' AND signal_symbol = 'QQQ'"
+                    )
+            return results
+
+        def submit_after_authentication(
+            db_path: str,
+            _buy_signals: pd.DataFrame,
+            _cfg: AlpacaOrderConfig,
+        ) -> pd.DataFrame:
+            nonlocal submitted_with_both_states
+            with closing(sqlite3.connect(db_path)) as conn:
+                rows = conn.execute(
+                    "SELECT asset_symbol, COUNT(*) FROM strategy_state "
+                    "WHERE asset_symbol IN ('AAA', 'BBB') GROUP BY asset_symbol ORDER BY asset_symbol"
+                ).fetchall()
+            submitted_with_both_states = rows == [("AAA", 1), ("BBB", 1)]
+            return pd.DataFrame(columns=["Status"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = WorkflowReporter(
+                console=Console(file=io.StringIO(), width=100, color_system=None, no_color=True)
+            )
+            with (
+                patch(
+                    "leveraged_trader.workflow._reconcile_alpaca_managed_positions_for_db",
+                    return_value=pd.DataFrame(columns=["Action"]),
+                ),
+                patch("leveraged_trader.workflow._load_or_refresh_workflow_assets_for_db", return_value=assets),
+                patch("leveraged_trader.workflow._run_asset_pipeline", new=process_and_invalidate),
+                patch(
+                    "leveraged_trader.workflow._submit_alpaca_paper_buy_orders_for_db",
+                    side_effect=submit_after_authentication,
+                ) as submit,
+                patch("leveraged_trader.workflow._load_alpaca_managed_positions_for_db", return_value=pd.DataFrame()),
+                patch("leveraged_trader.workflow._load_alpaca_realized_pnl_for_db", return_value=pd.DataFrame()),
+                patch("leveraged_trader.workflow._write_workflow_outputs"),
+            ):
+                asyncio.run(
+                    run_resumable_optimizations_async(
+                        mode="update",
+                        db_path=str(Path(tmp) / "state.sqlite"),
+                        base_cfg=BacktestConfig(rsi_period=3),
+                        universe_cfg=UniverseConfig(),
+                        buy_rsi_values=[30.0],
+                        profit_target_values=[1.5],
+                        alpaca_cfg=AlpacaOrderConfig(),
+                        output_dir=str(Path(tmp) / "outputs"),
+                        reporter=reporter,
+                    )
+                )
+                summary = pd.read_csv(Path(tmp) / "outputs" / "optimization_summary.csv")
+
+        self.assertEqual(modes, ["update", "rebuild"])
+        self.assertEqual(summary["Asset"].tolist(), ["AAA", "BBB"])
+        self.assertTrue(submitted_with_both_states)
+        submit.assert_called_once()
+
+    def test_workflow_recovery_reuses_cached_histories_without_confirming_boundary_removal(self) -> None:
+        workflow_assets = pd.DataFrame([{"symbol": "TQQQ", "name": "T", "rsi_symbol": "QQQ"}])
+        full_signal_history = self._symbol_history("QQQ", 10.0)
+        histories = {
+            "TQQQ": self._symbol_history("TQQQ"),
+            "QQQ": full_signal_history.iloc[1:],
+            "^IRX": self._symbol_history("^IRX", -95.0),
+        }
+        observed_candidates: list[tuple[int, str]] = []
+
+        def batch_loader(symbols: list[str], **_kwargs: object) -> tuple[dict, dict]:
+            return {symbol: histories[symbol] for symbol in symbols}, {}
+
+        def unexpected_individual_download(*_args: object, **_kwargs: object) -> None:
+            self.fail("Recovery must reuse the histories fetched by the original batch.")
+
+        def invalidate_before_first_report(*args: object, **kwargs: object) -> tuple[pd.DataFrame, ...]:
+            if args[4] == "Long":
+                with closing(sqlite3.connect(str(args[0]))) as conn, conn:
+                    candidate = conn.execute(
+                        "SELECT consecutive_observations, last_observed_run_id "
+                        "FROM market_history_removal_candidates WHERE symbol = 'QQQ'"
+                    ).fetchone()
+                    self.assertIsNotNone(candidate)
+                    observed_candidates.append(candidate)
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM strategy_state "
+                            "WHERE asset_symbol = 'TQQQ' AND signal_symbol = 'QQQ'"
+                        ).fetchone()[0],
+                        1,
+                    )
+                    if len(observed_candidates) == 1:
+                        clear_asset_state(conn, "TQQQ", "QQQ")
+            return _build_reports_for_db(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "state.sqlite")
+            with closing(sqlite3.connect(db_path)) as conn, conn:
+                init_state_db(conn)
+                _synchronize_market_data_history(conn, full_signal_history, "QQQ", observation_run_id="seed")
+            reporter = WorkflowReporter(
+                console=Console(file=io.StringIO(), width=100, color_system=None, no_color=True)
+            )
+            with (
+                patch(
+                    "leveraged_trader.workflow._reconcile_alpaca_managed_positions_for_db",
+                    return_value=pd.DataFrame(columns=["Action"]),
+                ),
+                patch(
+                    "leveraged_trader.workflow._load_or_refresh_workflow_assets_for_db", return_value=workflow_assets
+                ),
+                patch("leveraged_trader.workflow.load_symbol_history_batch", side_effect=batch_loader) as download,
+                patch("leveraged_trader.workflow.load_symbol_history", new=unexpected_individual_download),
+                patch("leveraged_trader.workflow.load_signal_history", new=unexpected_individual_download),
+                patch("leveraged_trader.workflow.load_risk_free_history", new=unexpected_individual_download),
+                patch("leveraged_trader.workflow._build_reports_for_db", side_effect=invalidate_before_first_report),
+                patch(
+                    "leveraged_trader.storage._synchronize_market_data_history",
+                    wraps=_synchronize_market_data_history,
+                ) as synchronize,
+                patch(
+                    "leveraged_trader.workflow._submit_alpaca_paper_buy_orders_for_db",
+                    return_value=pd.DataFrame(columns=["Status"]),
+                ) as submit,
+                patch("leveraged_trader.workflow._write_workflow_outputs"),
+            ):
+                asyncio.run(
+                    run_resumable_optimizations_async(
+                        mode="update",
+                        db_path=db_path,
+                        base_cfg=BacktestConfig(rsi_period=3),
+                        universe_cfg=UniverseConfig(),
+                        buy_rsi_values=[30.0],
+                        profit_target_values=[1.5],
+                        alpaca_cfg=AlpacaOrderConfig(),
+                        output_dir=str(Path(tmp) / "outputs"),
+                        workflow_concurrency=1,
+                        reporter=reporter,
+                    )
+                )
+            with closing(sqlite3.connect(db_path)) as conn:
+                stored_signal_count = conn.execute(
+                    "SELECT COUNT(*) FROM market_data WHERE symbol = 'QQQ'"
+                ).fetchone()[0]
+            summary = pd.read_csv(Path(tmp) / "outputs" / "optimization_summary.csv")
+
+        signal_syncs = [call for call in synchronize.call_args_list if call.args[2] == "QQQ"]
+        self.assertEqual(len(signal_syncs), 2)
+        self.assertTrue(all(call.args[1] is histories["QQQ"] for call in signal_syncs))
+        observation_ids = [call.kwargs["observation_run_id"] for call in signal_syncs]
+        self.assertTrue(observation_ids[0])
+        self.assertEqual(observation_ids[0], observation_ids[1])
+        self.assertEqual(observed_candidates, [(1, observation_ids[0]), (1, observation_ids[0])])
+        self.assertEqual(stored_signal_count, len(full_signal_history))
+        self.assertEqual(summary["Asset"].tolist(), ["TQQQ"])
+        download.assert_called_once()
+        submit.assert_called_once()
+
+    def test_workflow_aborts_before_submission_if_recovery_is_incomplete_or_fails(self) -> None:
+        pair = ("TQQQ", "QQQ")
+        workflow_assets = pd.DataFrame([{"symbol": pair[0], "name": "T", "rsi_symbol": pair[1]}])
+        for recovery_outcome in ("skipped", "missing", "error"):
+            with self.subTest(recovery_outcome=recovery_outcome), tempfile.TemporaryDirectory() as tmp:
+                pipeline_modes: list[str] = []
+
+                async def fake_pipeline(
+                    _pipeline_modes: list[str] = pipeline_modes,
+                    _recovery_outcome: str = recovery_outcome,
+                    **kwargs: object,
+                ) -> list[AssetRunResult]:
+                    mode = str(kwargs["mode"])
+                    _pipeline_modes.append(mode)
+                    if mode == "rebuild":
+                        if _recovery_outcome == "error":
+                            raise RuntimeError("Recovery worker failed.")
+                        if _recovery_outcome == "missing":
+                            return []
+                    return [
+                        AssetRunResult(
+                            job.workflow_idx,
+                            job.asset_symbol,
+                            job.signal_symbol,
+                            "Rebuilding",
+                            1,
+                            "skipped" if mode == "rebuild" else "done",
+                            "market data unavailable" if mode == "rebuild" else "processed",
+                            job.workflow,
+                        )
+                        for job in kwargs["jobs"]
+                    ]
+
+                reporter = WorkflowReporter(
+                    console=Console(file=io.StringIO(), width=100, color_system=None, no_color=True)
+                )
+                expected_error = RuntimeError if recovery_outcome == "error" else WorkflowRunError
+                expected_message = "Recovery worker failed" if recovery_outcome == "error" else "Could not recover all"
+                with (
+                    patch(
+                        "leveraged_trader.workflow._reconcile_alpaca_managed_positions_for_db",
+                        return_value=pd.DataFrame(columns=["Action"]),
+                    ),
+                    patch(
+                        "leveraged_trader.workflow._load_or_refresh_workflow_assets_for_db",
+                        return_value=workflow_assets,
+                    ),
+                    patch("leveraged_trader.workflow._run_asset_pipeline", new=fake_pipeline),
+                    patch(
+                        "leveraged_trader.workflow._build_reports_for_db",
+                        side_effect=_CompletedWorkflowStateInvalidError("Completed state disappeared", {pair}),
+                    ),
+                    patch("leveraged_trader.workflow._submit_alpaca_paper_buy_orders_for_db") as submit,
+                    self.assertRaisesRegex(expected_error, expected_message),
+                ):
+                    asyncio.run(
+                        run_resumable_optimizations_async(
+                            mode="update",
+                            db_path=str(Path(tmp) / "state.sqlite"),
+                            base_cfg=BacktestConfig(),
+                            universe_cfg=UniverseConfig(),
+                            buy_rsi_values=[30.0],
+                            profit_target_values=[1.5],
+                            alpaca_cfg=AlpacaOrderConfig(),
+                            output_dir=str(Path(tmp) / "outputs"),
+                            reporter=reporter,
+                        )
+                    )
+
+                self.assertEqual(pipeline_modes, ["update", "rebuild"])
+                submit.assert_not_called()
+
+    def test_workflow_aborts_if_rebuilt_pair_disappears_again(self) -> None:
+        pair = ("BLSG", "BLSH")
+        workflow_assets = pd.DataFrame([{"symbol": pair[0], "name": pair[0], "rsi_symbol": pair[1]}])
+        pipeline_modes: list[str] = []
+
+        async def fake_pipeline(**kwargs: object) -> list[AssetRunResult]:
+            pipeline_modes.append(str(kwargs["mode"]))
+            return [
+                AssetRunResult(
+                    job.workflow_idx, job.asset_symbol, job.signal_symbol, "Updating", 1, "done", "done", job.workflow
+                )
+                for job in kwargs["jobs"]
+            ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = WorkflowReporter(
+                console=Console(file=io.StringIO(), width=100, color_system=None, no_color=True)
+            )
+            with (
+                patch(
+                    "leveraged_trader.workflow._reconcile_alpaca_managed_positions_for_db",
+                    return_value=pd.DataFrame(columns=["Action"]),
+                ),
+                patch(
+                    "leveraged_trader.workflow._load_or_refresh_workflow_assets_for_db", return_value=workflow_assets
+                ),
+                patch("leveraged_trader.workflow._run_asset_pipeline", new=fake_pipeline),
+                patch(
+                    "leveraged_trader.workflow._build_reports_for_db",
+                    side_effect=_CompletedWorkflowStateInvalidError("Completed workflow state disappeared", {pair}),
+                ) as reports,
+                patch("leveraged_trader.workflow._submit_alpaca_paper_buy_orders_for_db") as submit,
+                self.assertRaises(_CompletedWorkflowStateInvalidError),
+            ):
+                asyncio.run(
+                    run_resumable_optimizations_async(
+                        mode="update",
+                        db_path=str(Path(tmp) / "state.sqlite"),
+                        base_cfg=BacktestConfig(),
+                        universe_cfg=UniverseConfig(),
+                        buy_rsi_values=[30.0],
+                        profit_target_values=[1.5],
+                        alpaca_cfg=AlpacaOrderConfig(),
+                        output_dir=str(Path(tmp) / "outputs"),
+                        reporter=reporter,
+                    )
+                )
+
+        self.assertEqual(pipeline_modes, ["update", "rebuild"])
+        self.assertEqual(reports.call_count, 2)
+        submit.assert_not_called()
+
+    def test_short_side_recovery_rechecks_long_report_before_submission(self) -> None:
+        short_pair = ("SQQQ", "QQQ")
+        workflow_asset_groups = {
+            "long": pd.DataFrame([{"symbol": "TQQQ", "name": "T", "rsi_symbol": "QQQ"}]),
+            "short": pd.DataFrame([{"symbol": short_pair[0], "name": "S", "rsi_symbol": short_pair[1]}]),
+        }
+        pipeline_calls: list[tuple[str, str]] = []
+        report_sides: list[str | None] = []
+
+        async def fake_pipeline(**kwargs: object) -> list[AssetRunResult]:
+            jobs = kwargs["jobs"]
+            pipeline_calls.append((str(kwargs["mode"]), jobs[0].asset_symbol))
+            return [
+                AssetRunResult(
+                    job.workflow_idx, job.asset_symbol, job.signal_symbol, "Updating", 1, "done", "done", job.workflow
+                )
+                for job in jobs
+            ]
+
+        def fake_reports(*args: object, **_kwargs: object) -> tuple[pd.DataFrame, ...]:
+            workflow_label = args[4]
+            report_sides.append(workflow_label)
+            if workflow_label == "Short" and report_sides.count("Short") == 1:
+                raise _CompletedWorkflowStateInvalidError("Completed short state disappeared", {short_pair})
+            return (pd.DataFrame(),) * 6
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = WorkflowReporter(
+                console=Console(file=io.StringIO(), width=100, color_system=None, no_color=True)
+            )
+            with (
+                patch(
+                    "leveraged_trader.workflow._reconcile_alpaca_managed_positions_for_db",
+                    return_value=pd.DataFrame(columns=["Action"]),
+                ),
+                patch(
+                    "leveraged_trader.workflow._load_or_refresh_workflow_assets_for_db",
+                    return_value=workflow_asset_groups,
+                ),
+                patch("leveraged_trader.workflow._run_asset_pipeline", new=fake_pipeline),
+                patch("leveraged_trader.workflow._build_reports_for_db", side_effect=fake_reports),
+                patch(
+                    "leveraged_trader.workflow._submit_alpaca_paper_buy_orders_for_db",
+                    return_value=pd.DataFrame(columns=["Status"]),
+                ) as submit,
+                patch("leveraged_trader.workflow._load_alpaca_managed_positions_for_db", return_value=pd.DataFrame()),
+                patch("leveraged_trader.workflow._load_alpaca_realized_pnl_for_db", return_value=pd.DataFrame()),
+                patch("leveraged_trader.workflow._write_workflow_outputs"),
+            ):
+                asyncio.run(
+                    run_resumable_optimizations_async(
+                        mode="update",
+                        db_path=str(Path(tmp) / "state.sqlite"),
+                        base_cfg=BacktestConfig(),
+                        universe_cfg=UniverseConfig(),
+                        buy_rsi_values=[30.0],
+                        short_buy_rsi_values=[70.0],
+                        profit_target_values=[1.5],
+                        alpaca_cfg=AlpacaOrderConfig(),
+                        output_dir=str(Path(tmp) / "outputs"),
+                        reporter=reporter,
+                    )
+                )
+
+        self.assertEqual(pipeline_calls, [("update", "TQQQ"), ("update", "SQQQ"), ("rebuild", "SQQQ")])
+        self.assertEqual(report_sides, ["Long", "Short", "Long", "Short"])
+        submit.assert_called_once()
 
     def test_workflow_fails_when_every_asset_is_skipped(self) -> None:
         workflow_assets = pd.DataFrame([{"symbol": "TQQQ", "name": "T", "rsi_symbol": "QQQ"}])
