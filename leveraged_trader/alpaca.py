@@ -1854,6 +1854,42 @@ def _orders_have_open_order(
     return False
 
 
+def _orders_have_wash_conflicting_open_buy(
+    orders: list[dict],
+    symbol: str,
+    sell_limit_price: float,
+    *,
+    expected_alpaca_asset_id: str | None = None,
+    symbol_aliases: set[str] | None = None,
+) -> bool:
+    """Return whether an open buy would make Alpaca reject this limit sell."""
+    sell_price = Decimal(str(sell_limit_price))
+    for order in orders:
+        if not _orders_have_open_order(
+            [order],
+            symbol,
+            "buy",
+            expected_alpaca_asset_id=expected_alpaca_asset_id,
+            symbol_aliases=symbol_aliases,
+        ):
+            continue
+        order_type = (_alpaca_order_type(order) or "").lower()
+        if order_type == "trailing_stop":
+            # Alpaca documents trailing-stop orders as exempt from its
+            # potential-wash-trade rejection rule.
+            continue
+        if order_type not in {"limit", "stop_limit"}:
+            # Market and stop buys always conflict with a limit sell. Treat an
+            # unexpected type conservatively because this check gates a POST.
+            return True
+        buy_limit_price = _optional_positive_float(order.get("limit_price"))
+        if buy_limit_price is None:
+            return True
+        if Decimal(str(buy_limit_price)) >= sell_price:
+            return True
+    return False
+
+
 def _alpaca_order_type(order: dict) -> str | None:
     """Use Alpaca's legacy type alias only when the primary field is omitted."""
     raw_type = order.get("type")
@@ -6376,6 +6412,19 @@ def _authentication_http_error(
     return not any(marker in detail for marker in order_scoped_markers)
 
 
+def _wash_trade_protection_http_error(exc: HTTPError) -> bool:
+    """Whether Alpaca definitively rejected an order under wash protection."""
+    response = exc.response
+    if response is None or response.status_code != 403:
+        return False
+    detail, body_is_canonical = _canonical_http_error_detail(exc)
+    return bool(
+        body_is_canonical
+        and len(detail) <= _ALPACA_ERROR_SEMANTIC_MAX_CHARS
+        and "potential wash trade detected" in detail.casefold()
+    )
+
+
 def _transient_broker_http_error(exc: HTTPError) -> bool:
     response = exc.response
     return response is None or response.status_code >= 500 or response.status_code in {408, 425, 429}
@@ -9694,6 +9743,37 @@ def _final_managed_sell_submission_exposure_fence(
                 rows[-1]["Status"] = "superseded"
                 rows[-1]["Message"] += "; the managed submission generation changed concurrently"
             return None
+        if _orders_have_wash_conflicting_open_buy(
+            open_orders,
+            symbol,
+            target_sell_price,
+            expected_alpaca_asset_id=expected_alpaca_asset_id,
+            symbol_aliases=position_aliases,
+        ):
+            released = release_no_post(
+                sell_status="submission_not_found",
+                notes=("managed sell submission deferred because a same-asset open buy could cross its limit price"),
+            )
+            _append_reconciliation_result(
+                rows,
+                position_id=position_id,
+                symbol=symbol,
+                action="sell",
+                status="deferred" if released else "superseded",
+                buy_client_order_id=buy_client_order_id,
+                sell_client_order_id=sell_client_order_id,
+                qty=filled_qty,
+                limit_price=target_sell_price,
+                alpaca_order_id=None,
+                message=(
+                    "managed GTC sell deferred because an open same-asset buy could cross it under "
+                    "Alpaca wash-trade protection; reconciliation will retry after the conflict clears"
+                    if released
+                    else "wash-conflict deferral belonged to a superseded managed sell generation"
+                ),
+                required_failure=released,
+            )
+            return None
 
         live_position_asset_id, live_position_qty = _managed_live_position_identity_and_qty(
             client.positions(),
@@ -10280,17 +10360,23 @@ def _submit_managed_gtc_sell(
                 required_failure=True,
             )
             return
+        wash_trade_rejection = _wash_trade_protection_http_error(exc)
+        failed_sell_status = "submission_not_found" if wash_trade_rejection else "submission_failed"
         state_updated = update_alpaca_managed_sell_status_if_current(
             conn,
             position_id,
             expected_sell_client_order_id=sell_client_order_id,
-            sell_status="submission_failed",
+            sell_status=failed_sell_status,
             expected_sell_submission_retry_claimed_at=(
                 sell_submission_retry_claimed_at if sell_submission_retry_claimed_at is not None else _STORAGE_UNSET
             ),
             expected_state_revision=expected_sell_state_revision,
             clear_sell_submission_retry_claim=True,
-            notes=durable_note("managed sell submission failed before an Alpaca order was accepted"),
+            notes=durable_note(
+                "managed sell was rejected by Alpaca wash-trade protection and awaits a non-conflicting retry"
+                if wash_trade_rejection
+                else "managed sell submission failed before an Alpaca order was accepted"
+            ),
         )
         if not state_updated:
             _append_reconciliation_result(
@@ -10312,13 +10398,17 @@ def _submit_managed_gtc_sell(
             position_id=position_id,
             symbol=symbol,
             action="sell",
-            status="error",
+            status="deferred" if wash_trade_rejection else "error",
             buy_client_order_id=buy_client_order_id,
             sell_client_order_id=sell_client_order_id,
             qty=filled_qty,
             limit_price=target_sell_price,
             alpaca_order_id=None,
-            message=error_message,
+            message=(
+                f"{error_message}; reconciliation will retry after conflicting same-asset orders clear"
+                if wash_trade_rejection
+                else error_message
+            ),
             systemic_failure=(
                 _authentication_http_error(exc, sensitive_values=sensitive_values) or _transient_broker_http_error(exc)
             ),
@@ -11874,6 +11964,28 @@ def _submit_replacement_gtc_sell(
     )
 
 
+def _managed_sell_replacement_has_wash_conflict(
+    *,
+    conn: sqlite3.Connection,
+    client: AlpacaClient,
+    position_id: int,
+    symbol: str,
+    target_sell_price: float,
+    expected_alpaca_asset_id: str | None,
+) -> bool:
+    """Check fresh account exposure before canceling an active protective sell."""
+    open_orders = client.open_orders(
+        equity_scope_asset_ids=((expected_alpaca_asset_id,) if expected_alpaca_asset_id is not None else ())
+    )
+    return _orders_have_wash_conflicting_open_buy(
+        open_orders,
+        symbol,
+        target_sell_price,
+        expected_alpaca_asset_id=expected_alpaca_asset_id,
+        symbol_aliases=alpaca_managed_position_aliases(conn, position_id),
+    )
+
+
 def _request_gtc_sell_renewal(
     *,
     conn: sqlite3.Connection,
@@ -11922,6 +12034,65 @@ def _request_gtc_sell_renewal(
             target_sell_price=target_sell_price,
             sell_alpaca_order_id=sell_alpaca_order_id,
             existing_order_preserved=True,
+        )
+        return
+    parent_buy_limit_price = _optional_positive_float(position.get("buy_order_limit_price"))
+    parent_buy_conflicts = bool(
+        not close_on_complete
+        and (parent_buy_limit_price is None or Decimal(str(parent_buy_limit_price)) >= Decimal(str(target_sell_price)))
+    )
+    if parent_buy_conflicts:
+        _append_reconciliation_result(
+            rows,
+            position_id=position_id,
+            symbol=symbol,
+            action="sell",
+            status="deferred",
+            buy_client_order_id=buy_client_order_id,
+            sell_client_order_id=sell_client_order_id,
+            qty=managed_remaining_qty,
+            limit_price=target_sell_price,
+            alpaca_order_id=sell_alpaca_order_id,
+            message=(
+                "managed GTC sell replacement deferred because an open same-asset buy could cross it under "
+                "Alpaca wash-trade protection; the existing sell remains in place"
+            ),
+            required_failure=True,
+        )
+        return
+    expected_alpaca_asset_id = _optional_str(position.get("alpaca_asset_id"))
+    current_sell_order = (replacement_chain or [{}])[-1]
+    current_sell_limit_price = _optional_positive_float(current_sell_order.get("limit_price"))
+    if current_sell_limit_price is None:
+        current_sell_limit_price = _optional_positive_float(position.get("sell_order_limit_price"))
+    replacement_lowers_limit = bool(
+        current_sell_limit_price is not None
+        and Decimal(str(target_sell_price)) < Decimal(str(current_sell_limit_price))
+    )
+    if replacement_lowers_limit and _managed_sell_replacement_has_wash_conflict(
+        conn=conn,
+        client=client,
+        position_id=position_id,
+        symbol=symbol,
+        target_sell_price=target_sell_price,
+        expected_alpaca_asset_id=expected_alpaca_asset_id,
+    ):
+        _append_reconciliation_result(
+            rows,
+            position_id=position_id,
+            symbol=symbol,
+            action="sell",
+            status="deferred",
+            buy_client_order_id=buy_client_order_id,
+            sell_client_order_id=sell_client_order_id,
+            qty=managed_remaining_qty,
+            limit_price=target_sell_price,
+            alpaca_order_id=sell_alpaca_order_id,
+            message=(
+                "managed GTC sell replacement deferred because a fresh open same-asset buy could cross its "
+                "lower limit under Alpaca wash-trade protection; the existing sell remains in place"
+            ),
+            required_failure=True,
         )
         return
     now = _utc_now()
@@ -12485,6 +12656,36 @@ def _request_gtc_sell_renewal(
             and abs(refreshed_limit_price - target_sell_price) <= _alpaca_limit_price_tolerance(target_sell_price)
         )
         if not refreshed_successor_covers_current_intent:
+            successor_lowers_limit = bool(
+                refreshed_limit_price is not None
+                and Decimal(str(target_sell_price)) < Decimal(str(refreshed_limit_price))
+            )
+            if successor_lowers_limit and _managed_sell_replacement_has_wash_conflict(
+                conn=conn,
+                client=client,
+                position_id=position_id,
+                symbol=symbol,
+                target_sell_price=target_sell_price,
+                expected_alpaca_asset_id=expected_alpaca_asset_id,
+            ):
+                _append_reconciliation_result(
+                    rows,
+                    position_id=position_id,
+                    symbol=symbol,
+                    action="sell",
+                    status="deferred",
+                    buy_client_order_id=buy_client_order_id,
+                    sell_client_order_id=prior_sell_client_order_id,
+                    qty=remaining_qty,
+                    limit_price=target_sell_price,
+                    alpaca_order_id=refreshed_sell_alpaca_order_id,
+                    message=(
+                        "inadequate broker-created renewal successor remains active because a fresh open "
+                        "same-asset buy could cross the lower replacement limit under Alpaca wash-trade protection"
+                    ),
+                    required_failure=True,
+                )
+                return
             current_renewal_snapshot = load_current_renewal_snapshot()
             current_is_exact_successor = bool(
                 current_renewal_snapshot is not None

@@ -693,7 +693,14 @@ Managed sell orders:
   reconciliation, with exact order-ID lookups for missing rows or replacement links and a safe
   fallback to the open-order snapshot if older account history cannot be validated.
 - Use the actual Alpaca filled average buy price times the original sell multiple.
-- Create a protective GTC sell for confirmed whole shares even while the parent buy remains partially filled, and replace it if later buy fills change the covered quantity or average-fill target—even if the prior partial-fill sell already completed.
+- Create a protective GTC sell for confirmed whole shares while the parent buy remains partially
+  filled when Alpaca's wash-trade rules allow it, and replace it if later fills change the
+  covered quantity or average-fill target—even if the prior partial-fill sell already completed.
+  If an open same-asset buy could cross the sell target, defer an initial sell or preserve the
+  existing sell during replacement until that conflict clears. A definitive Alpaca wash-trade
+  rejection remains retryable rather than permanently disabling protection. These deferrals are
+  required reconciliation failures, so the current run exits nonzero and a later recurring run
+  retries after the conflict clears.
 - Sell the remaining managed quantity with a GTC limit order; cumulative partial fills remain active until the full buy quantity is closed.
 - Require the live Alpaca holding to exactly match the managed remaining quantity before submitting a fresh or replacement protective order, so splits, corporate actions, and discretionary quantity changes fail closed instead of creating incorrect coverage.
 - Persist a deterministic, buy-specific sell client order ID before broker submission. Its durable
@@ -707,7 +714,9 @@ Managed sell orders:
 - Track managed holdings by Alpaca asset ID across ticker changes. Before changing a managed ticker, the workflow validates attached broker/client-order identity and Alpaca's asset response, rejects asset or ticker collisions, and applies the complete migration batch transactionally. Existing broker order IDs remain attached to their original lineage, old-ticker open sells can be recovered by asset ID, every observed ticker alias blocks duplicate buys, and replacement exits are submitted by validated asset ID rather than a ticker snapshot. Alpaca can continue displaying an existing protective order under its pre-rename ticker even though the current position uses the new ticker; matching asset IDs establish that the order protects the renamed position. Unchanged positions avoid historical-order lookups. A `symbol_migrated` row appears in reconciliation output only on the run that applies the change.
 - Resubmit expired GTC sells when renewal is enabled and the managed position is still open.
 - Require recurring runs with managed sell submission enabled for renewal and resubmission to occur; persisted state alone does not schedule broker requests.
-- Are not resubmitted automatically after a sell order is rejected or manually canceled.
+- Do not automatically resubmit manually canceled or generally rejected sells; a definitive
+  Alpaca wash-trade rejection is the narrow exception and is retried after the conflicting buy
+  clears.
 - Move an exact-quantity Alpaca paper position into the broker-retained inactive-holdings lane when
   both its deterministic sell is absent and Alpaca identifies the held asset as inactive and
   non-tradable. The active managed row continues to block new buys and is rechecked on recurring
