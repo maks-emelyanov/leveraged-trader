@@ -59,6 +59,7 @@ from leveraged_trader.alpaca import (
     _buy_submission_dispatch_authorization,
     _connect_alpaca_socket_before_write_deadline,
     _DeadlineAwareAlpacaHTTPSConnection,
+    _effective_managed_live_position_qty,
     _fetch_order_payload,
     _finite_float,
     _format_alpaca_limit_price,
@@ -81,6 +82,7 @@ from leveraged_trader.alpaca import (
     _record_active_historical_sell_fills,
     _record_observed_managed_sell_order,
     _record_replacement_chain_sell_fills,
+    _recover_corporate_action_canceled_sell,
     _recover_managed_sell_submission,
     _replacement_chain_broker_component_revisions,
     _replacement_chain_fill_metadata,
@@ -109,6 +111,7 @@ from leveraged_trader.storage import (
     active_alpaca_managed_symbols,
     adopt_alpaca_managed_position_asset_if_current,
     alpaca_exit_order_namespace,
+    alpaca_managed_position_asset_ids,
     alpaca_managed_sell_renewal_snapshot_if_current,
     attach_alpaca_managed_sell_order_if_current,
     claim_alpaca_managed_buy_intent,
@@ -21221,6 +21224,463 @@ class AlpacaTests(unittest.TestCase):
         self.assertIn("no automatic resubmission", result.loc[0, "Message"])
         mock_delete.assert_not_called()
         mock_post.assert_not_called()
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_reverse_split_cancellation_rejects_inconsistent_broker_accounting(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+    ) -> None:
+        with closing(sqlite3.connect(":memory:")) as conn, conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                alpaca_asset_id="asset-old",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+                buy_order_qty=4,
+                buy_order_limit_price=11,
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=4,
+                filled_avg_price=10,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=15,
+            )
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-before-split",
+                sell_submitted_at="2026-09-21T14:32:00Z",
+                sell_status="accepted",
+                sell_order_qty=4,
+                sell_order_limit_price=15,
+            )
+            canceled_sell = {
+                "id": "sell-before-split",
+                "client_order_id": "rsi-exit-TQQQ-1",
+                "asset_id": "asset-old",
+                "symbol": "TQQQ",
+                "status": "canceled",
+                "qty": "4",
+                "limit_price": "15",
+                "filled_qty": "0",
+                "submitted_at": "2026-09-21T14:32:00Z",
+                "updated_at": "2026-09-22T08:00:00Z",
+                "canceled_at": "2026-09-22T08:00:00Z",
+            }
+            unsettled_successor = {
+                "asset_id": "asset-new",
+                "symbol": "TQQQ",
+                "qty": "4",
+                "avg_entry_price": "11",
+            }
+            announcement = {
+                "id": "split-action-1",
+                "ca_type": "split",
+                "ca_sub_type": "reverse_split",
+                "target_symbol": "TQQQ",
+                "effective_date": "2026-09-22",
+                "ex_date": "2026-09-22",
+                "old_rate": "4",
+                "new_rate": "1",
+            }
+            mock_get.side_effect = [
+                response(200, canceled_sell),
+                response(200, [unsettled_successor]),
+                asset_response("TQQQ", id="asset-old", status="inactive", tradable=False),
+                asset_response("TQQQ", id="asset-new", status="active", tradable=True),
+                response(200, [announcement], complete_orders=False),
+            ]
+
+            with self.assertRaises(AlpacaReconciliationError) as raised:
+                reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn).iloc[0]
+
+        self.assertEqual(raised.exception.results.loc[0, "Status"], "corporate_action_pending")
+        self.assertIn("match neither", raised.exception.results.loc[0, "Message"])
+        self.assertEqual(managed["alpaca_asset_id"], "asset-old")
+        self.assertEqual(managed["filled_qty"], 4)
+        self.assertTrue(pd.isna(managed["last_corporate_action_id"]))
+        mock_post.assert_not_called()
+
+    @patch("leveraged_trader.alpaca.requests.post")
+    @patch("leveraged_trader.alpaca.requests.get")
+    def test_reverse_split_cancellation_rebases_and_restores_protection(
+        self,
+        mock_get: Mock,
+        mock_post: Mock,
+    ) -> None:
+        with closing(sqlite3.connect(":memory:")) as conn, conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                alpaca_asset_id="asset-old",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+                buy_order_qty=4,
+                buy_order_limit_price=11,
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=4,
+                filled_avg_price=10,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=15,
+            )
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-before-split",
+                sell_submitted_at="2026-09-21T14:32:00Z",
+                sell_status="accepted",
+                sell_order_qty=4,
+                sell_order_limit_price=15,
+            )
+            canceled_sell = {
+                "id": "sell-before-split",
+                "client_order_id": "rsi-exit-TQQQ-1",
+                "asset_id": "asset-old",
+                "symbol": "TQQQ",
+                "status": "canceled",
+                "qty": "4",
+                "limit_price": "15",
+                "filled_qty": "0",
+                "submitted_at": "2026-09-21T14:32:00Z",
+                "updated_at": "2026-09-22T08:00:00Z",
+                "canceled_at": "2026-09-22T08:00:00Z",
+            }
+            paper_unadjusted_successor = {
+                "asset_id": "asset-new",
+                "symbol": "TQQQ",
+                "qty": "4",
+                "avg_entry_price": "10",
+            }
+            announcement = {
+                "id": "split-action-1",
+                "ca_type": "split",
+                "ca_sub_type": "reverse_split",
+                "target_symbol": "TQQQ",
+                "effective_date": "2026-09-22",
+                "ex_date": "2026-09-22",
+                "old_rate": "4",
+                "new_rate": "1",
+            }
+            mock_get.side_effect = [
+                response(200, canceled_sell),
+                response(200, [paper_unadjusted_successor]),
+                asset_response("TQQQ", id="asset-old", status="inactive", tradable=False),
+                asset_response("TQQQ", id="asset-new", status="active", tradable=True),
+                response(200, [announcement], complete_orders=False),
+                *final_managed_sell_pre_submit_responses(
+                    qty=4,
+                    asset_id="asset-new",
+                    historical_orders=(canceled_sell,),
+                ),
+            ]
+            mock_post.return_value = response(
+                200,
+                {
+                    "id": "sell-after-split",
+                    "client_order_id": "rsi-exit-TQQQ-1-r1",
+                    "asset_id": "asset-new",
+                    "symbol": "TQQQ",
+                    "status": "accepted",
+                    "qty": "1",
+                    "limit_price": "60",
+                    "submitted_at": "2026-09-22T13:45:00Z",
+                },
+            )
+
+            result = reconcile_alpaca_managed_positions(conn, self.cfg(buy=True, sell=True))
+            managed = load_alpaca_managed_positions(conn).iloc[0]
+
+        self.assertEqual(result.loc[0, "Status"], "renewed")
+        self.assertIn("split-adjusted replacement", result.loc[0, "Message"])
+        self.assertEqual(managed["alpaca_asset_id"], "asset-new")
+        self.assertEqual(alpaca_managed_position_asset_ids(managed.to_dict()), ("asset-new", "asset-old"))
+        self.assertEqual(managed["filled_qty"], 1)
+        self.assertEqual(managed["filled_avg_price"], 40)
+        self.assertEqual(managed["target_sell_price"], 60)
+        self.assertEqual(managed["sell_client_order_id"], "rsi-exit-TQQQ-1-r1")
+        self.assertEqual(managed["sell_alpaca_order_id"], "sell-after-split")
+        self.assertEqual(managed["last_corporate_action_id"], "split-action-1")
+        self.assertEqual(managed["corporate_action_paper_excess_qty"], 3)
+        submitted = mock_post.call_args.kwargs["json"]
+        self.assertEqual(submitted["qty"], "1")
+        self.assertEqual(submitted["limit_price"], "60")
+        announcement_params = mock_get.call_args_list[4].kwargs["params"]
+        self.assertEqual(announcement_params["date_type"], "ex_date")
+        self.assertEqual(announcement_params["since"], "2026-09-22")
+        self.assertEqual(announcement_params["until"], "2026-09-22")
+        mock_post.assert_called_once()
+
+    def test_reverse_split_fractional_result_remains_quarantined(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as conn, conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                alpaca_asset_id="asset-old",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.5,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+                buy_order_qty=6,
+                buy_order_limit_price=8,
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=6,
+                filled_avg_price=7.64,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=12.99,
+            )
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-before-split",
+                sell_submitted_at="2026-09-21T14:32:00Z",
+                sell_status="canceled",
+                sell_order_qty=6,
+                sell_order_limit_price=12.99,
+            )
+            before = load_alpaca_managed_positions(conn).iloc[0]
+            client = Mock()
+            client.positions.return_value = [
+                {
+                    "asset_id": "asset-new",
+                    "asset_class": "us_equity",
+                    "symbol": "TQQQ",
+                    "side": "long",
+                    "qty": "6",
+                    "avg_entry_price": "7.64",
+                }
+            ]
+            client.asset.side_effect = [
+                {
+                    "id": "asset-old",
+                    "class": "us_equity",
+                    "symbol": "TQQQ",
+                    "status": "inactive",
+                    "tradable": False,
+                },
+                {
+                    "id": "asset-new",
+                    "class": "us_equity",
+                    "symbol": "TQQQ",
+                    "status": "active",
+                    "tradable": True,
+                },
+            ]
+            client.split_announcements.return_value = [
+                {
+                    "id": "split-action-1",
+                    "ca_type": "split",
+                    "ca_sub_type": "reverse_split",
+                    "target_symbol": "TQQQ",
+                    "effective_date": "2026-09-22",
+                    "old_rate": "4",
+                    "new_rate": "1",
+                }
+            ]
+            rows: list[dict] = []
+
+            handled = _recover_corporate_action_canceled_sell(
+                conn=conn,
+                client=client,
+                rows=rows,
+                position=before.to_dict(),
+                symbol="TQQQ",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                sell_order={
+                    "id": "sell-before-split",
+                    "status": "canceled",
+                    "canceled_at": "2026-09-22T08:00:00Z",
+                },
+                buy_is_open=False,
+                expected_state_revision=int(before["state_revision"]),
+            )
+            after = load_alpaca_managed_positions(conn).iloc[0]
+
+        self.assertTrue(handled)
+        self.assertEqual(rows[0]["Status"], "fractional_quantity")
+        self.assertTrue(rows[0]["_Required Failure"])
+        self.assertEqual(after["alpaca_asset_id"], "asset-old")
+        self.assertEqual(after["filled_qty"], 6)
+        self.assertTrue(pd.isna(after["last_corporate_action_id"]))
+
+    @patch("leveraged_trader.alpaca._submit_replacement_gtc_sell")
+    def test_reverse_split_nonfractionable_remainder_becomes_cash_in_lieu(
+        self,
+        mock_submit_replacement: Mock,
+    ) -> None:
+        with closing(sqlite3.connect(":memory:")) as conn, conn:
+            init_state_db(conn)
+            save_alpaca_managed_buy_order(
+                conn,
+                symbol="TQQQ",
+                alpaca_asset_id="asset-old",
+                signal_symbol="QQQ",
+                buy_rsi=30,
+                profit_target_multiple=1.7,
+                buy_signal_date="2026-01-02",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                buy_alpaca_order_id="buy-1",
+                buy_submitted_at="2026-01-02T14:30:00Z",
+                buy_status="filled",
+                buy_order_qty=6,
+                buy_order_limit_price=8,
+            )
+            mark_alpaca_managed_buy_filled(
+                conn,
+                1,
+                buy_status="filled",
+                filled_qty=6,
+                filled_avg_price=7.64,
+                filled_at="2026-01-02T14:31:00Z",
+                target_sell_price=12.99,
+            )
+            record_alpaca_managed_sell_order(
+                conn,
+                1,
+                sell_client_order_id="rsi-exit-TQQQ-1",
+                sell_alpaca_order_id="sell-before-split",
+                sell_submitted_at="2026-09-21T14:32:00Z",
+                sell_status="canceled",
+                sell_order_qty=6,
+                sell_order_limit_price=12.99,
+            )
+            before = load_alpaca_managed_positions(conn).iloc[0]
+            client = Mock()
+            client.cfg = self.cfg(buy=True, sell=True)
+            client.positions.return_value = [
+                {
+                    "asset_id": "asset-new",
+                    "asset_class": "us_equity",
+                    "symbol": "TQQQ",
+                    "side": "long",
+                    "qty": "6",
+                    "avg_entry_price": "7.64",
+                }
+            ]
+            client.asset.side_effect = [
+                {
+                    "id": "asset-old",
+                    "class": "us_equity",
+                    "symbol": "TQQQ",
+                    "status": "inactive",
+                    "tradable": False,
+                },
+                {
+                    "id": "asset-new",
+                    "class": "us_equity",
+                    "symbol": "TQQQ",
+                    "status": "active",
+                    "tradable": True,
+                    "fractionable": False,
+                },
+            ]
+            client.split_announcements.return_value = [
+                {
+                    "id": "split-action-1",
+                    "ca_type": "split",
+                    "ca_sub_type": "reverse_split",
+                    "target_symbol": "TQQQ",
+                    "effective_date": "2026-09-22",
+                    "old_rate": "4",
+                    "new_rate": "1",
+                }
+            ]
+            rows: list[dict] = []
+
+            handled = _recover_corporate_action_canceled_sell(
+                conn=conn,
+                client=client,
+                rows=rows,
+                position=before.to_dict(),
+                symbol="TQQQ",
+                buy_client_order_id="rsi-buy-TQQQ-20260102",
+                sell_order={
+                    "id": "sell-before-split",
+                    "status": "canceled",
+                    "canceled_at": "2026-09-22T08:00:00Z",
+                },
+                buy_is_open=False,
+                expected_state_revision=int(before["state_revision"]),
+            )
+            after = load_alpaca_managed_positions(conn).iloc[0]
+
+        self.assertTrue(handled)
+        self.assertEqual(after["alpaca_asset_id"], "asset-new")
+        self.assertEqual(after["filled_qty"], 1)
+        self.assertEqual(after["filled_avg_price"], 30.56)
+        self.assertEqual(after["target_sell_price"], 51.96)
+        self.assertEqual(after["corporate_action_paper_excess_qty"], 5)
+        self.assertEqual(after["corporate_action_cash_in_lieu_qty"], 0.5)
+        mock_submit_replacement.assert_called_once()
+        self.assertEqual(mock_submit_replacement.call_args.kwargs["filled_qty"], 1)
+        self.assertEqual(mock_submit_replacement.call_args.kwargs["live_position_qty"], 1)
+
+    def test_paper_reverse_split_excess_offset_is_exact_and_fill_aware(self) -> None:
+        position = {"corporate_action_paper_excess_qty": 9}
+
+        self.assertEqual(
+            _effective_managed_live_position_qty(
+                position,
+                11,
+                expected_managed_qty=2,
+                mark_price=20,
+            ),
+            2,
+        )
+        self.assertEqual(
+            _effective_managed_live_position_qty(
+                position,
+                2,
+                expected_managed_qty=2,
+                mark_price=20,
+            ),
+            2,
+        )
+        self.assertEqual(
+            _effective_managed_live_position_qty(
+                position,
+                10,
+                expected_managed_qty=2,
+                mark_price=20,
+            ),
+            10,
+        )
 
     @patch("leveraged_trader.alpaca.requests.post")
     @patch("leveraged_trader.alpaca.requests.get")

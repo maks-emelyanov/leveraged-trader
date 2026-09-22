@@ -120,6 +120,7 @@ def _validate_alpaca_request_target(
                 "/v2/account",
                 "/v2/calendar",
                 "/v2/clock",
+                "/v2/corporate_actions/announcements",
                 "/v2/orders",
                 "/v2/orders:by_client_order_id",
                 "/v2/positions",

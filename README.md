@@ -702,7 +702,20 @@ Managed sell orders:
   required reconciliation failures, so the current run exits nonzero and a later recurring run
   retries after the conflict clears.
 - Sell the remaining managed quantity with a GTC limit order; cumulative partial fills remain active until the full buy quantity is closed.
-- Require the live Alpaca holding to exactly match the managed remaining quantity before submitting a fresh or replacement protective order, so splits, corporate actions, and discretionary quantity changes fail closed instead of creating incorrect coverage.
+- Require the live Alpaca holding to exactly match the managed remaining quantity before submitting
+  fresh or replacement protection, so discretionary changes and unrecognized corporate actions fail
+  closed instead of creating incorrect coverage.
+- Recover a reverse-split cancellation only when Alpaca's ex-date announcement, the inactive old
+  asset, the tradable successor asset, and the successor quantity and cost basis agree. Reconciliation
+  then atomically rekeys and rebases the unsold position, scales its frozen target, and restores
+  whole-share GTC protection. Completed whole-share exits retain complete realized-P/L reporting in
+  the rebased units.
+- Preserve a fixed excess-quantity offset only for Alpaca paper's exact pre-split quantity and cost
+  basis artifact. Later live-quantity fences accept only the adjusted remainder, with or without that
+  exact offset. Fractional results remain fail-closed unless Alpaca explicitly marks the successor
+  non-fractionable; then the fractional entitlement is persisted for cash-in-lieu settlement while
+  only whole shares receive GTC protection. A result with no whole shares remains quarantined, and an
+  unresolved cash-in-lieu entitlement keeps a later closed position out of complete realized P/L.
 - Persist a deterministic, buy-specific sell client order ID before broker submission. Its durable
   namespace is derived from the account-wide buy client order ID rather than a database-local row
   number. Ambiguous sell POST outcomes are recovered only after identity and intent chronology

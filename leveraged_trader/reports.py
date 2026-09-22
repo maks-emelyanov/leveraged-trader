@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 
 import numpy as np
 import pandas as pd
@@ -42,6 +43,19 @@ REALIZED_PNL_WORKFLOW_COLUMNS = ["Workflow", *REALIZED_PNL_COLUMNS]
 _StrategyReportCacheKey = tuple[str, str, str]
 _StrategyReportCacheValue = tuple[dict[str, object], pd.DataFrame, dict[str, object], str]
 _StrategyReportCache = dict[_StrategyReportCacheKey, _StrategyReportCacheValue]
+
+
+def _alpaca_broker_timestamp_is_canonical(value: object) -> bool:
+    """Return whether a report input is one canonical persisted broker time."""
+    if type(value) is not str:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, OverflowError):
+        return False
+    if parsed.tzinfo is None:
+        return False
+    return parsed.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z") == value
 
 
 def _close_after_snapshot_rollback_failure(
@@ -578,6 +592,8 @@ def _build_alpaca_realized_pnl_summary_snapshot(
                positions.sell_filled_avg_price, positions.sold_qty,
                positions.sold_value, positions.remaining_qty, positions.closed_at,
                positions.target_sell_price, positions.sell_order_limit_price,
+               positions.last_corporate_action_id, positions.corporate_action_adjusted_at,
+               positions.corporate_action_cash_in_lieu_qty,
                CASE
                    WHEN (positions.buy_order_qty IS NULL
                          OR (TYPEOF(positions.buy_order_qty) IN ('integer', 'real')
@@ -620,6 +636,12 @@ def _build_alpaca_realized_pnl_summary_snapshot(
                          OR (TYPEOF(positions.remaining_qty) IN ('integer', 'real')
                              AND positions.remaining_qty
                                  - positions.remaining_qty IS NOT NULL))
+                    AND (positions.corporate_action_cash_in_lieu_qty IS NULL
+                         OR (TYPEOF(positions.corporate_action_cash_in_lieu_qty) IN ('integer', 'real')
+                             AND positions.corporate_action_cash_in_lieu_qty
+                                 - positions.corporate_action_cash_in_lieu_qty IS NOT NULL
+                             AND positions.corporate_action_cash_in_lieu_qty > 0
+                             AND positions.corporate_action_cash_in_lieu_qty < 1))
                    THEN 1 ELSE 0
                END AS parent_numeric_types_valid,
                COUNT(fills.managed_position_id) AS ledger_fill_count,
@@ -744,6 +766,7 @@ def _build_alpaca_realized_pnl_summary_snapshot(
         "sold_qty",
         "sold_value",
         "remaining_qty",
+        "corporate_action_cash_in_lieu_qty",
         "parent_numeric_types_valid",
         "ledger_fill_count",
         "ledger_sold_qty",
@@ -779,6 +802,12 @@ def _build_alpaca_realized_pnl_summary_snapshot(
         ledger_value_tolerance = ledger_value_scale.map(
             managed_value_reconciliation_tolerance,
         )
+        adjusted_buy_cost = positions["filled_qty"] * positions["filled_avg_price"]
+        buy_intent_value = positions["buy_order_qty"] * positions["buy_order_limit_price"]
+        adjusted_buy_cost_tolerance = pd.concat(
+            [adjusted_buy_cost.abs(), buy_intent_value.abs()],
+            axis=1,
+        ).max(axis=1).map(managed_value_reconciliation_tolerance)
         buy_quantity_scale = positions[["buy_order_qty", "filled_qty"]].abs().max(axis=1)
         buy_quantity_tolerance = buy_quantity_scale.map(managed_quantity_tolerance)
         buy_price_tolerance = np.where(
@@ -857,7 +886,33 @@ def _build_alpaca_realized_pnl_summary_snapshot(
         & ~buy_has_causality_quarantine
         & positions["filled_avg_price"].le(positions["buy_order_limit_price"] + buy_price_tolerance)
     )
-    positions["buy_intent_reconciles"] = (legacy_buy_intent | complete_buy_intent) & ~buy_has_causality_quarantine
+    corporate_action_identity_is_valid = (
+        positions["last_corporate_action_id"].map(alpaca_order_id_is_canonical)
+        & positions["corporate_action_adjusted_at"].map(_alpaca_broker_timestamp_is_canonical)
+    )
+    corporate_action_buy_intent = (
+        corporate_action_identity_is_valid
+        & positions["buy_order_qty"].notna()
+        & positions["buy_order_limit_price"].notna()
+        & np.isfinite(
+            positions[
+                [
+                    "buy_order_qty",
+                    "buy_order_limit_price",
+                    "filled_qty",
+                    "filled_avg_price",
+                ]
+            ]
+        ).all(axis=1)
+        & positions["buy_order_qty"].gt(0)
+        & positions["buy_order_limit_price"].gt(0)
+        & positions["filled_qty"].gt(0)
+        & positions["filled_avg_price"].gt(0)
+        & adjusted_buy_cost.le(buy_intent_value + adjusted_buy_cost_tolerance)
+    )
+    positions["buy_intent_reconciles"] = (
+        legacy_buy_intent | complete_buy_intent | corporate_action_buy_intent
+    ) & ~buy_has_causality_quarantine
     with np.errstate(over="ignore", invalid="ignore"):
         positions["effective_remaining_qty"] = positions["remaining_qty"].where(
             positions["remaining_qty"].notna(),
@@ -953,6 +1008,7 @@ def _build_alpaca_realized_pnl_summary_snapshot(
         & complete_quantity_reconciles_notional
         & complete["effective_remaining_qty"].abs().le(complete_quantity_tolerance)
         & complete_remaining_is_negligible
+        & complete["corporate_action_cash_in_lieu_qty"].isna()
     ]
 
     if include_workflow:

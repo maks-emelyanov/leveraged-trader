@@ -82,6 +82,7 @@ from .storage import (
     alpaca_managed_sell_renewal_snapshot_if_current,
     alpaca_managed_sell_sticky_status_if_current,
     apply_alpaca_closed_position_broker_correction,
+    apply_alpaca_managed_reverse_split_if_current,
     attach_alpaca_managed_sell_order_if_current,
     claim_alpaca_managed_buy_intent,
     claim_alpaca_managed_initial_sell_submission,
@@ -1573,6 +1574,70 @@ def _managed_live_position_qty(
     )[1]
 
 
+def _same_symbol_successor_position(
+    positions: list[dict],
+    *,
+    symbol: str,
+    prior_alpaca_asset_id: str,
+) -> dict | None:
+    """Return one same-symbol holding whose stable asset replaced the prior ID."""
+    matches = [
+        position
+        for position in positions
+        if _optional_alpaca_equity_symbol(position.get("symbol")) == symbol.upper()
+        and _optional_alpaca_broker_identifier(position.get("asset_id")) not in {None, prior_alpaca_asset_id}
+    ]
+    if len(matches) > 1:
+        raise ValueError("Alpaca returned multiple successor holdings for one managed symbol")
+    return matches[0] if matches else None
+
+
+def _matching_reverse_split_announcement(
+    announcements: list[dict],
+    *,
+    symbol: str,
+    effective_date: date,
+) -> tuple[str, float, float] | None:
+    """Return one exact broker reverse-split identity and its old/new rates."""
+    matches: dict[str, tuple[float, float]] = {}
+    for announcement in announcements:
+        if str(announcement.get("ca_type") or "").lower() != "split":
+            continue
+        if str(announcement.get("ca_sub_type") or "").lower() != "reverse_split":
+            continue
+        target_symbol = _optional_alpaca_equity_symbol(announcement.get("target_symbol"))
+        if target_symbol is None or target_symbol.upper() != symbol.upper():
+            continue
+        action_dates: set[date] = set()
+        for field in ("effective_date", "ex_date"):
+            raw_date = announcement.get(field)
+            if type(raw_date) is not str or len(raw_date) != 10:
+                continue
+            try:
+                parsed_date = date.fromisoformat(raw_date)
+            except ValueError:
+                continue
+            if parsed_date.isoformat() == raw_date:
+                action_dates.add(parsed_date)
+        if effective_date not in action_dates:
+            continue
+        action_id = _optional_alpaca_broker_identifier(announcement.get("id"))
+        old_rate = _optional_positive_float(announcement.get("old_rate"))
+        new_rate = _optional_positive_float(announcement.get("new_rate"))
+        if action_id is None or old_rate is None or new_rate is None or new_rate >= old_rate:
+            raise ValueError("Alpaca returned invalid reverse-split announcement economics")
+        prior = matches.get(action_id)
+        if prior is not None and prior != (old_rate, new_rate):
+            raise ValueError("Alpaca returned conflicting reverse-split announcement economics")
+        matches[action_id] = (old_rate, new_rate)
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise ValueError("Alpaca returned multiple reverse splits for the same symbol and effective date")
+    action_id, (old_rate, new_rate) = next(iter(matches.items()))
+    return action_id, old_rate, new_rate
+
+
 def _alpaca_account_asset_class(payload: dict, *, label: str) -> str | None:
     """Decode an optional canonical asset class from an account-wide row."""
     raw_asset_class = payload.get("asset_class")
@@ -2485,6 +2550,30 @@ def _managed_sell_quantities_match(
         *quantity_scales,
         mark_price=mark_price,
     )
+
+
+def _effective_managed_live_position_qty(
+    position: dict,
+    raw_live_qty: float,
+    *,
+    expected_managed_qty: float,
+    mark_price: float,
+) -> float:
+    """Remove only a proven Alpaca-paper reverse-split quantity artifact."""
+    paper_excess_qty = _optional_positive_float(position.get("corporate_action_paper_excess_qty"))
+    if paper_excess_qty is None:
+        return raw_live_qty
+    if _managed_sell_quantities_match(
+        raw_live_qty,
+        expected_managed_qty,
+        mark_price=mark_price,
+    ) or _managed_sell_quantities_match(
+        raw_live_qty,
+        expected_managed_qty + paper_excess_qty,
+        mark_price=mark_price,
+    ):
+        return expected_managed_qty
+    return raw_live_qty
 
 
 def _managed_sell_is_overfilled(
@@ -4608,6 +4697,30 @@ class AlpacaClient:
 
     def asset(self, symbol: str) -> dict:
         return _alpaca_asset(symbol, self.cfg, self.headers)
+
+    def split_announcements(self, since: date, until: date) -> list[dict]:
+        """Return broker corporate-action announcements for a bounded date range."""
+        if not isinstance(since, date) or not isinstance(until, date) or since > until:
+            raise ValueError("Alpaca split-announcement dates are invalid.")
+        response = _alpaca_http_request(
+            "GET",
+            f"{self.base_url}/v2/corporate_actions/announcements",
+            cfg=self.cfg,
+            headers=self.headers,
+            params={
+                "ca_types": "Split",
+                "since": since.isoformat(),
+                "until": until.isoformat(),
+                "date_type": "ex_date",
+            },
+            timeout=self.cfg.timeout_seconds,
+            allow_redirects=False,
+        )
+        _require_2xx_response(response)
+        payload = _strict_alpaca_response_json(response)
+        if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
+            raise ValueError("Alpaca split announcements returned an invalid response")
+        return payload
 
     def has_open_order(self, symbol: str, side: str) -> bool:
         return _orders_have_open_order(self.open_orders(), symbol, side)
@@ -9781,6 +9894,12 @@ def _final_managed_sell_submission_exposure_fence(
             expected_alpaca_asset_id=expected_alpaca_asset_id,
             symbol_aliases=position_aliases,
         )
+        live_position_qty = _effective_managed_live_position_qty(
+            current_position,
+            live_position_qty,
+            expected_managed_qty=filled_qty,
+            mark_price=effective_quantity_mark_price,
+        )
         if not _managed_sell_quantities_match(
             filled_qty,
             live_position_qty,
@@ -12761,6 +12880,12 @@ def _request_gtc_sell_renewal(
                 expected_alpaca_asset_id=_optional_str(position.get("alpaca_asset_id")),
                 symbol_aliases=alpaca_managed_position_aliases(conn, position_id),
             )
+            refreshed_live_position_qty = _effective_managed_live_position_qty(
+                position,
+                refreshed_live_position_qty,
+                expected_managed_qty=remaining_qty,
+                mark_price=sell_residual_mark_price,
+            )
         _submit_replacement_gtc_sell(
             conn=conn,
             client=client,
@@ -13180,6 +13305,11 @@ def _fence_attached_sell_after_unproven_buy(
 
 def _active_filled_buy_correction_audit_due(position: dict) -> bool:
     """Keep authoritative rechecks bounded to Alpaca's practical correction window."""
+    # Historical buy orders remain in pre-action units.  Once a broker-proven
+    # corporate action has rebased the active accounting, replaying those raw
+    # fills would incorrectly restore the pre-split quantity and cost basis.
+    if _optional_str(position.get("corporate_action_adjusted_at")) is not None:
+        return False
     persisted_filled_qty = _optional_float(position.get("filled_qty"))
     if persisted_filled_qty is None or persisted_filled_qty <= 0.0:
         return False
@@ -14303,6 +14433,315 @@ def _audit_recently_closed_managed_position(
             )
         ),
     )
+
+
+def _recover_corporate_action_canceled_sell(
+    *,
+    conn: sqlite3.Connection,
+    client: AlpacaClient,
+    rows: list[dict],
+    position: dict,
+    symbol: str,
+    buy_client_order_id: str,
+    sell_order: dict,
+    buy_is_open: bool,
+    expected_state_revision: int,
+) -> bool:
+    """Recover a broker-proven reverse split, including Alpaca paper's stale units."""
+    if _broker_order_status(sell_order, default="unknown") != "canceled" or buy_is_open:
+        return False
+    prior_asset_id = _optional_alpaca_broker_identifier(position.get("alpaca_asset_id"))
+    sell_order_id = _optional_alpaca_broker_identifier(sell_order.get("id"))
+    canceled_at = _parse_alpaca_broker_datetime(sell_order.get("canceled_at"))
+    if prior_asset_id is None or sell_order_id is None or canceled_at is None:
+        return False
+
+    live_positions = client.positions()
+    successor_position = _same_symbol_successor_position(
+        live_positions,
+        symbol=symbol,
+        prior_alpaca_asset_id=prior_asset_id,
+    )
+    if successor_position is None:
+        return False
+    successor_asset_id = _optional_alpaca_broker_identifier(successor_position.get("asset_id"))
+    if successor_asset_id is None:
+        raise ValueError("Alpaca reverse-split successor position has no stable asset identity")
+
+    prior_asset = client.asset(prior_asset_id)
+    successor_asset = client.asset(successor_asset_id)
+    if (
+        _validated_alpaca_asset_id(prior_asset, expected_symbol=symbol) != prior_asset_id
+        or prior_asset.get("status") != "inactive"
+        or prior_asset.get("tradable") is not False
+        or _validated_alpaca_asset_id(successor_asset, expected_symbol=symbol) != successor_asset_id
+        or successor_asset.get("status") != "active"
+        or successor_asset.get("tradable") is not True
+    ):
+        return False
+
+    action_date = canceled_at.astimezone(_NEW_YORK).date()
+    split = _matching_reverse_split_announcement(
+        client.split_announcements(action_date, action_date),
+        symbol=symbol,
+        effective_date=action_date,
+    )
+    if split is None:
+        return False
+    corporate_action_id, old_rate, new_rate = split
+    filled_qty = _optional_positive_float(position.get("filled_qty"))
+    filled_avg_price = _optional_positive_float(position.get("filled_avg_price"))
+    persisted_target = _optional_positive_float(position.get("target_sell_price"))
+    live_qty = _validated_alpaca_position_qty(
+        successor_position,
+        label="Alpaca reverse-split successor position",
+    )
+    live_avg_price = _optional_positive_float(successor_position.get("avg_entry_price"))
+    if filled_qty is None or filled_avg_price is None or persisted_target is None or live_avg_price is None:
+        raise ValueError("Managed reverse-split recovery requires complete broker cost-basis metadata")
+
+    expected_live_qty = float(
+        Decimal(str(filled_qty)) * Decimal(str(new_rate)) / Decimal(str(old_rate))
+    )
+    old_cost = filled_qty * filled_avg_price
+    live_cost = live_qty * live_avg_price
+    adjusted_qty = expected_live_qty
+    cash_in_lieu_qty: float | None = None
+    if not _is_whole_share_qty(expected_live_qty):
+        if successor_asset.get("fractionable") is not False:
+            _append_reconciliation_result(
+                rows,
+                position_id=int(position["id"]),
+                symbol=symbol,
+                action="sell",
+                status="fractional_quantity",
+                buy_client_order_id=buy_client_order_id,
+                sell_client_order_id=_optional_str(position.get("sell_client_order_id")),
+                qty=expected_live_qty,
+                limit_price=float(
+                    _quantize_alpaca_limit_price(
+                        Decimal(str(persisted_target)) * Decimal(str(old_rate)) / Decimal(str(new_rate)),
+                        rounding=ROUND_CEILING,
+                    )
+                ),
+                alpaca_order_id=sell_order_id,
+                message=(
+                    "Reverse-split successor holding is fractional and cannot be protected by the managed "
+                    "whole-share GTC limit-sell workflow; no order was submitted"
+                ),
+                required_failure=True,
+            )
+            return True
+        adjusted_qty = float(floor(expected_live_qty))
+        cash_in_lieu_qty = expected_live_qty - adjusted_qty
+        if adjusted_qty <= 0.0:
+            _append_reconciliation_result(
+                rows,
+                position_id=int(position["id"]),
+                symbol=symbol,
+                action="sell",
+                status="cash_in_lieu_pending",
+                buy_client_order_id=buy_client_order_id,
+                sell_client_order_id=_optional_str(position.get("sell_client_order_id")),
+                qty=0.0,
+                limit_price=None,
+                alpaca_order_id=sell_order_id,
+                message=(
+                    "Reverse split leaves no whole tradable shares in the non-fractionable successor; "
+                    "cash-in-lieu settlement requires broker confirmation"
+                ),
+                required_failure=True,
+            )
+            return True
+    expected_adjusted_avg_price = old_cost / expected_live_qty
+    broker_quantity_settled = _managed_sell_quantities_match(
+        adjusted_qty,
+        live_qty,
+        mark_price=max(filled_avg_price, live_avg_price),
+    )
+    settled_cost = expected_live_qty * live_avg_price
+    settled_cost_conserved = abs(old_cost - settled_cost) <= managed_value_reconciliation_tolerance(
+        max(abs(old_cost), abs(settled_cost))
+    )
+    paper_cost_conserved = abs(old_cost - live_cost) <= managed_value_reconciliation_tolerance(
+        max(abs(old_cost), abs(live_cost))
+    )
+    paper_quantity_unadjusted = _managed_sell_quantities_match(
+        filled_qty,
+        live_qty,
+        mark_price=max(filled_avg_price, live_avg_price),
+    )
+    broker_settled = broker_quantity_settled and settled_cost_conserved
+    paper_unadjusted = paper_quantity_unadjusted and paper_cost_conserved
+    sell_client_order_id = _optional_str(position.get("sell_client_order_id"))
+    if not broker_settled and not paper_unadjusted:
+        _append_reconciliation_result(
+            rows,
+            position_id=int(position["id"]),
+            symbol=symbol,
+            action="sell",
+            status="corporate_action_pending",
+            buy_client_order_id=buy_client_order_id,
+            sell_client_order_id=sell_client_order_id,
+            qty=adjusted_qty,
+            limit_price=float(
+                _quantize_alpaca_limit_price(
+                    Decimal(str(persisted_target)) * Decimal(str(old_rate)) / Decimal(str(new_rate)),
+                    rounding=ROUND_CEILING,
+                )
+            ),
+            alpaca_order_id=sell_order_id,
+            message=(
+                "Alpaca canceled the managed GTC sell for a reverse split, but the successor holding's "
+                "quantity and cost basis match neither settled split economics nor Alpaca paper's exact "
+                "pre-split accounting artifact; reconciliation will retry without submitting "
+                f"an order (expected_tradable_qty={adjusted_qty:g}, live_qty={live_qty:g})"
+            ),
+            required_failure=True,
+        )
+        return True
+    adjusted_avg_price = live_avg_price if broker_settled else expected_adjusted_avg_price
+    paper_excess_qty = live_qty - adjusted_qty if paper_unadjusted else None
+    adjusted_target = float(
+        _quantize_alpaca_limit_price(
+            Decimal(str(persisted_target)) * Decimal(str(old_rate)) / Decimal(str(new_rate)),
+            rounding=ROUND_CEILING,
+        )
+    )
+    if (_optional_float(position.get("sold_qty")) or 0.0) > 0.0:
+        _append_reconciliation_result(
+            rows,
+            position_id=int(position["id"]),
+            symbol=symbol,
+            action="sell",
+            status="corporate_action_review",
+            buy_client_order_id=buy_client_order_id,
+            sell_client_order_id=sell_client_order_id,
+            qty=adjusted_qty,
+            limit_price=adjusted_target,
+            alpaca_order_id=sell_order_id,
+            message=(
+                "Reverse-split recovery found prior realized sell quantity and requires manual accounting review; "
+                "no order was submitted"
+            ),
+            required_failure=True,
+        )
+        return True
+
+    adjusted_at = _utc_now().isoformat(timespec="microseconds").replace("+00:00", "Z")
+    durable_notes = _alpaca_durable_diagnostic_note(
+        (
+            f"applied Alpaca reverse split {corporate_action_id} ({old_rate:g}-for-{new_rate:g} old-to-new) "
+            "after the broker canceled the pre-split managed GTC sell"
+            + (
+                f"; retained a validated {paper_excess_qty:g}-share paper-simulator excess offset"
+                if paper_excess_qty is not None
+                else ""
+            )
+            + (
+                f"; recorded {cash_in_lieu_qty:g} non-fractionable share for broker cash-in-lieu settlement"
+                if cash_in_lieu_qty is not None
+                else ""
+            )
+        ),
+        cfg=client.cfg,
+        client=client,
+    )
+    assert durable_notes is not None
+    new_revision = apply_alpaca_managed_reverse_split_if_current(
+        conn,
+        int(position["id"]),
+        expected_state_revision=expected_state_revision,
+        expected_symbol=symbol,
+        expected_alpaca_asset_id=prior_asset_id,
+        successor_alpaca_asset_id=successor_asset_id,
+        corporate_action_id=corporate_action_id,
+        old_rate=old_rate,
+        new_rate=new_rate,
+        live_qty=adjusted_qty,
+        live_avg_price=adjusted_avg_price,
+        adjusted_target_sell_price=adjusted_target,
+        expected_buy_status=str(position.get("buy_status") or ""),
+        expected_sell_status="canceled",
+        expected_sell_alpaca_order_id=sell_order_id,
+        adjusted_at=adjusted_at,
+        notes=durable_notes,
+        corporate_action_paper_excess_qty=paper_excess_qty,
+        corporate_action_cash_in_lieu_qty=cash_in_lieu_qty,
+    )
+    if new_revision is None:
+        _append_reconciliation_result(
+            rows,
+            position_id=int(position["id"]),
+            symbol=symbol,
+            action="sell",
+            status="superseded",
+            buy_client_order_id=buy_client_order_id,
+            sell_client_order_id=sell_client_order_id,
+            qty=adjusted_qty,
+            limit_price=adjusted_target,
+            alpaca_order_id=sell_order_id,
+            message="reverse-split recovery was superseded or its accounting premise changed",
+        )
+        return True
+
+    position.update(
+        {
+            "state_revision": new_revision,
+            "alpaca_asset_id": successor_asset_id,
+            "filled_qty": adjusted_qty,
+            "filled_avg_price": adjusted_avg_price,
+            "target_sell_price": adjusted_target,
+            "remaining_qty": adjusted_qty,
+            "sell_renewal_requested_at": adjusted_at,
+            "last_corporate_action_id": corporate_action_id,
+            "corporate_action_adjusted_at": adjusted_at,
+            "corporate_action_paper_excess_qty": paper_excess_qty,
+            "corporate_action_cash_in_lieu_qty": cash_in_lieu_qty,
+            "notes": durable_notes,
+        }
+    )
+    recovery_snapshot = alpaca_managed_sell_renewal_snapshot_if_current(
+        conn,
+        int(position["id"]),
+        expected_sell_client_order_id=sell_client_order_id,
+        expected_sell_alpaca_order_id=sell_order_id,
+        expected_sell_renewal_requested_at=adjusted_at,
+    )
+    if recovery_snapshot is None:
+        _append_reconciliation_result(
+            rows,
+            position_id=int(position["id"]),
+            symbol=symbol,
+            action="sell",
+            status="superseded",
+            buy_client_order_id=buy_client_order_id,
+            sell_client_order_id=sell_client_order_id,
+            qty=adjusted_qty,
+            limit_price=adjusted_target,
+            alpaca_order_id=sell_order_id,
+            message="reverse-split recovery lost its exact managed-state snapshot before replacement",
+        )
+        return True
+    _submit_replacement_gtc_sell(
+        conn=conn,
+        client=client,
+        rows=rows,
+        position=position,
+        symbol=symbol,
+        buy_client_order_id=buy_client_order_id,
+        filled_qty=adjusted_qty,
+        target_sell_price=adjusted_target,
+        quantity_mark_price=max(adjusted_avg_price, adjusted_target),
+        replacement_message=(
+            "Alpaca canceled the pre-split GTC sell; submitted split-adjusted replacement protection"
+        ),
+        check_open_order=True,
+        live_position_qty=adjusted_qty,
+        close_on_complete=True,
+        expected_renewal_snapshot=recovery_snapshot,
+    )
+    return True
 
 
 def _reconcile_alpaca_managed_positions_pass(
@@ -15771,15 +16210,26 @@ def _reconcile_alpaca_managed_positions_pass(
             position_aliases = alpaca_managed_position_aliases(conn, position_id)
 
             def load_live_position_qty(
+                expected_managed_qty: float,
                 managed_symbol: str = symbol,
                 expected_asset_id: str | None = _optional_str(position.get("alpaca_asset_id")),
                 aliases: set[str] = position_aliases,
+                managed_position: dict = position,
             ) -> float:
-                return _managed_live_position_qty(
+                raw_live_qty = _managed_live_position_qty(
                     client.positions(),
                     symbol=managed_symbol,
                     expected_alpaca_asset_id=expected_asset_id,
                     symbol_aliases=aliases,
+                )
+                return _effective_managed_live_position_qty(
+                    managed_position,
+                    raw_live_qty,
+                    expected_managed_qty=expected_managed_qty,
+                    mark_price=_managed_sell_residual_mark_price(
+                        managed_position.get("filled_avg_price"),
+                        managed_position.get("target_sell_price"),
+                    ),
                 )
 
             if sell_client_order_id:
@@ -16122,6 +16572,12 @@ def _reconcile_alpaca_managed_positions_pass(
                             symbol=symbol,
                             expected_alpaca_asset_id=_optional_str(position.get("alpaca_asset_id")),
                             symbol_aliases=position_aliases,
+                        )
+                        live_position_qty = _effective_managed_live_position_qty(
+                            position,
+                            live_position_qty,
+                            expected_managed_qty=recovery_qty,
+                            mark_price=recovery_target_sell_price,
                         )
                         open_order_asset_ids = tuple(
                             asset_id
@@ -17169,7 +17625,7 @@ def _reconcile_alpaca_managed_positions_pass(
                             "submitted replacement protection for the uncovered shares"
                         ),
                         check_open_order=True,
-                        live_position_qty=load_live_position_qty(),
+                        live_position_qty=load_live_position_qty(remaining_qty),
                         close_on_complete=not buy_is_open,
                         expected_renewal_snapshot=replacement_snapshot,
                     )
@@ -17417,7 +17873,7 @@ def _reconcile_alpaca_managed_positions_pass(
                                 "submitted a replacement for the remaining shares"
                             ),
                             check_open_order=True,
-                            live_position_qty=load_live_position_qty(),
+                            live_position_qty=load_live_position_qty(remaining_qty),
                             close_on_complete=not buy_is_open,
                             expected_renewal_snapshot=replacement_snapshot,
                         )
@@ -17531,9 +17987,25 @@ def _reconcile_alpaca_managed_positions_pass(
                         pending_message=(
                             "managed GTC sell replacement requested; awaiting Alpaca cancellation confirmation"
                         ),
-                        live_position_qty=load_live_position_qty(),
+                        live_position_qty=load_live_position_qty(remaining_qty),
                         close_on_complete=not buy_is_open,
                     )
+                    continue
+                if sell_status == "canceled" and _recover_corporate_action_canceled_sell(
+                    conn=conn,
+                    client=client,
+                    rows=rows,
+                    position=position,
+                    symbol=symbol,
+                    buy_client_order_id=buy_client_order_id,
+                    sell_order=sell_order,
+                    buy_is_open=buy_is_open,
+                    expected_state_revision=(
+                        int(position["state_revision"])
+                        if replacement_snapshot is None
+                        else replacement_snapshot.state_revision
+                    ),
+                ):
                     continue
                 renewal_was_requested = _optional_str(position.get("sell_renewal_requested_at")) is not None
                 if sell_status in SELL_INACTIVE_STATUSES:
@@ -17572,7 +18044,7 @@ def _reconcile_alpaca_managed_positions_pass(
                                 else "renewed managed GTC limit sell after Alpaca confirmed cancellation"
                             ),
                             check_open_order=True,
-                            live_position_qty=load_live_position_qty(),
+                            live_position_qty=load_live_position_qty(remaining_qty),
                             close_on_complete=not buy_is_open,
                             expected_renewal_snapshot=replacement_snapshot,
                         )
@@ -17609,7 +18081,7 @@ def _reconcile_alpaca_managed_positions_pass(
                             target_sell_price=float(target_sell_price),
                             sell_alpaca_order_id=sell_alpaca_order_id,
                             replacement_chain=sell_replacement_chain,
-                            live_position_qty=load_live_position_qty(),
+                            live_position_qty=load_live_position_qty(remaining_qty),
                             pending_message=(
                                 "managed GTC sell cancellation is still pending after retry; "
                                 "replacement not submitted yet"
@@ -17668,7 +18140,7 @@ def _reconcile_alpaca_managed_positions_pass(
                         target_sell_price=float(target_sell_price),
                         sell_alpaca_order_id=sell_alpaca_order_id,
                         replacement_chain=sell_replacement_chain,
-                        live_position_qty=load_live_position_qty(),
+                        live_position_qty=load_live_position_qty(remaining_qty),
                         close_on_complete=not buy_is_open,
                     )
                     continue
@@ -17836,7 +18308,7 @@ def _reconcile_alpaca_managed_positions_pass(
                 target_sell_price=float(target_sell_price),
                 increment_renewal_count=False,
                 replacement_message="submitted managed GTC limit sell at frozen target price",
-                live_position_qty=load_live_position_qty(),
+                live_position_qty=load_live_position_qty(float(filled_qty)),
                 close_on_complete=not buy_is_open,
                 sell_order_namespace=sell_order_namespace,
                 intent_not_before=_optional_str(position.get("created_at")),

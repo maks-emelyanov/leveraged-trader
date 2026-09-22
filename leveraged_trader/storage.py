@@ -226,6 +226,10 @@ ALPACA_MANAGED_POSITION_COLUMNS = {
     "buy_cancellation_alpaca_order_ids": "TEXT",
     "closed_correction_audited_at": "TEXT",
     "closed_sell_shortfall_reopen_pending": "INTEGER NOT NULL DEFAULT 0",
+    "last_corporate_action_id": "TEXT",
+    "corporate_action_adjusted_at": "TEXT",
+    "corporate_action_paper_excess_qty": "REAL",
+    "corporate_action_cash_in_lieu_qty": "REAL",
     "workflow": "TEXT",
     "sell_order_namespace": "TEXT",
     "sell_client_order_id": "TEXT",
@@ -1610,6 +1614,10 @@ _STATE_DB_TABLE_SCHEMA = """
         closed_at TEXT,
         closed_correction_audited_at TEXT,
         closed_sell_shortfall_reopen_pending INTEGER NOT NULL DEFAULT 0,
+        last_corporate_action_id TEXT,
+        corporate_action_adjusted_at TEXT,
+        corporate_action_paper_excess_qty REAL,
+        corporate_action_cash_in_lieu_qty REAL,
         notes TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -8128,6 +8136,10 @@ def _validate_loaded_managed_position_intents(frame: pd.DataFrame) -> pd.DataFra
         "notes",
         "buy_causality_quarantine",
         "closed_sell_shortfall_reopen_pending",
+        "last_corporate_action_id",
+        "corporate_action_adjusted_at",
+        "corporate_action_paper_excess_qty",
+        "corporate_action_cash_in_lieu_qty",
     ]
     for (
         position_id,
@@ -8143,6 +8155,10 @@ def _validate_loaded_managed_position_intents(frame: pd.DataFrame) -> pd.DataFra
         notes,
         buy_causality_quarantine,
         closed_sell_shortfall_reopen_pending,
+        last_corporate_action_id,
+        corporate_action_adjusted_at,
+        corporate_action_paper_excess_qty,
+        corporate_action_cash_in_lieu_qty,
     ) in frame[intent_columns].itertuples(index=False, name=None):
         normalized_sell_status = _optional_loaded_managed_value(sell_status)
         if type(buy_status) is not str or (
@@ -8171,15 +8187,61 @@ def _validate_loaded_managed_position_intents(frame: pd.DataFrame) -> pd.DataFra
                 _optional_loaded_managed_value(sell_order_qty),  # type: ignore[arg-type]
                 _optional_loaded_managed_value(sell_order_limit_price),  # type: ignore[arg-type]
             )
-            _validate_managed_buy_causality_quarantine(
-                buy_order_qty=_optional_loaded_managed_value(buy_order_qty),  # type: ignore[arg-type]
-                buy_order_limit_price=_optional_loaded_managed_value(buy_order_limit_price),  # type: ignore[arg-type]
-                buy_status=buy_status,
-                filled_qty=_optional_loaded_managed_value(filled_qty),
-                filled_avg_price=_optional_loaded_managed_value(filled_avg_price),
-                notes=_optional_loaded_managed_value(notes),
-                quarantine_marker=_optional_loaded_managed_value(buy_causality_quarantine),
-            )
+            normalized_action_id = _optional_loaded_managed_value(last_corporate_action_id)
+            normalized_action_at = _optional_loaded_managed_value(corporate_action_adjusted_at)
+            if (normalized_action_id is None) != (normalized_action_at is None):
+                raise ValueError("Managed corporate-action identity and timestamp must be stored together.")
+            if normalized_action_id is not None:
+                _canonical_alpaca_order_id(
+                    normalized_action_id,
+                    field_name="Managed Alpaca corporate-action ID",
+                )
+                if _normalize_alpaca_broker_timestamp(normalized_action_at) is None:
+                    raise ValueError("Managed Alpaca corporate-action timestamp is invalid.")
+                _normalize_optional_managed_buy_fill_economics(
+                    _optional_loaded_managed_value(filled_qty),
+                    _optional_loaded_managed_value(filled_avg_price),
+                )
+                normalized_paper_excess = _optional_loaded_managed_value(
+                    corporate_action_paper_excess_qty
+                )
+                if normalized_paper_excess is not None:
+                    if isinstance(normalized_paper_excess, bool) or not isinstance(
+                        normalized_paper_excess,
+                        Number,
+                    ):
+                        raise ValueError("Managed paper corporate-action excess quantity must be numeric.")
+                    paper_excess_value = float(normalized_paper_excess)
+                    if not math.isfinite(paper_excess_value) or paper_excess_value <= 0.0:
+                        raise ValueError("Managed paper corporate-action excess quantity must be positive and finite.")
+                normalized_cash_in_lieu = _optional_loaded_managed_value(
+                    corporate_action_cash_in_lieu_qty
+                )
+                if normalized_cash_in_lieu is not None:
+                    if isinstance(normalized_cash_in_lieu, bool) or not isinstance(
+                        normalized_cash_in_lieu,
+                        Number,
+                    ):
+                        raise ValueError("Managed corporate-action cash-in-lieu quantity must be numeric.")
+                    cash_in_lieu_value = float(normalized_cash_in_lieu)
+                    if not math.isfinite(cash_in_lieu_value) or not 0.0 < cash_in_lieu_value < 1.0:
+                        raise ValueError(
+                            "Managed corporate-action cash-in-lieu quantity must be finite and less than one share."
+                        )
+            else:
+                if _optional_loaded_managed_value(corporate_action_paper_excess_qty) is not None:
+                    raise ValueError("Managed paper corporate-action excess requires a corporate-action identity.")
+                if _optional_loaded_managed_value(corporate_action_cash_in_lieu_qty) is not None:
+                    raise ValueError("Managed corporate-action cash-in-lieu requires a corporate-action identity.")
+                _validate_managed_buy_causality_quarantine(
+                    buy_order_qty=_optional_loaded_managed_value(buy_order_qty),  # type: ignore[arg-type]
+                    buy_order_limit_price=_optional_loaded_managed_value(buy_order_limit_price),  # type: ignore[arg-type]
+                    buy_status=buy_status,
+                    filled_qty=_optional_loaded_managed_value(filled_qty),
+                    filled_avg_price=_optional_loaded_managed_value(filled_avg_price),
+                    notes=_optional_loaded_managed_value(notes),
+                    quarantine_marker=_optional_loaded_managed_value(buy_causality_quarantine),
+                )
         except ValueError as exc:
             raise ValueError(
                 f"Managed Alpaca position {int(position_id)} contains invalid durable broker intent economics."
@@ -8213,6 +8275,8 @@ def load_alpaca_managed_positions(conn: sqlite3.Connection, *, active_only: bool
                realized_pl, realized_pl_pct, sold_qty, sold_value, remaining_qty,
                closed_at, closed_correction_audited_at,
                closed_sell_shortfall_reopen_pending,
+               last_corporate_action_id, corporate_action_adjusted_at,
+               corporate_action_paper_excess_qty, corporate_action_cash_in_lieu_qty,
                notes, created_at, updated_at
         FROM alpaca_managed_positions
         {where}
@@ -8258,6 +8322,8 @@ def load_recently_closed_alpaca_managed_positions(
                realized_pl, realized_pl_pct, sold_qty, sold_value, remaining_qty,
                closed_at, closed_correction_audited_at,
                closed_sell_shortfall_reopen_pending,
+               last_corporate_action_id, corporate_action_adjusted_at,
+               corporate_action_paper_excess_qty, corporate_action_cash_in_lieu_qty,
                notes, created_at, updated_at
         FROM alpaca_managed_positions
         WHERE closed_at IS NOT NULL
@@ -8276,6 +8342,7 @@ def load_recently_closed_alpaca_managed_positions(
                             AND LOWER(buy_status) IN ('canceled', 'done_for_day', 'expired', 'rejected')
                         )
                     )
+                    AND corporate_action_adjusted_at IS NULL
                     AND datetime(closed_at) >= datetime('now', ?)
                 )
               )
@@ -10740,6 +10807,260 @@ def rekey_alpaca_managed_position_asset_if_current(
                             (successor_asset_id, normalized_symbol),
                         ),
                     )
+    if commit:
+        _commit_owned_transaction(conn)
+    return new_revision
+
+
+def apply_alpaca_managed_reverse_split_if_current(
+    conn: sqlite3.Connection,
+    position_id: int,
+    *,
+    expected_state_revision: int,
+    expected_symbol: str,
+    expected_alpaca_asset_id: str,
+    successor_alpaca_asset_id: str,
+    corporate_action_id: str,
+    old_rate: float,
+    new_rate: float,
+    live_qty: float,
+    live_avg_price: float,
+    adjusted_target_sell_price: float,
+    expected_buy_status: str,
+    expected_sell_status: str,
+    expected_sell_alpaca_order_id: str,
+    adjusted_at: str,
+    notes: str,
+    corporate_action_paper_excess_qty: float | None = None,
+    corporate_action_cash_in_lieu_qty: float | None = None,
+    commit: bool = True,
+) -> int | None:
+    """Atomically rebase an unsold managed holding after a proven reverse split.
+
+    The historical buy and canceled sell orders remain in their original share
+    units.  Consequently this narrow recovery is intentionally limited to a
+    position with no realized sell fills; post-action cost basis comes from the
+    broker's live position, while future fills use the rebased live units.
+    """
+    normalized_symbol = _canonical_managed_symbol(
+        expected_symbol,
+        field_name="Managed Alpaca reverse-split symbol",
+    )
+    prior_asset_id = _canonical_alpaca_asset_id(
+        expected_alpaca_asset_id,
+        field_name="Managed Alpaca reverse-split prior asset ID",
+    )
+    successor_asset_id = _canonical_alpaca_asset_id(
+        successor_alpaca_asset_id,
+        field_name="Managed Alpaca reverse-split successor asset ID",
+    )
+    normalized_action_id = _canonical_alpaca_order_id(
+        corporate_action_id,
+        field_name="Managed Alpaca corporate-action ID",
+    )
+    normalized_sell_order_id = _canonical_alpaca_order_id(
+        expected_sell_alpaca_order_id,
+        field_name="Managed Alpaca reverse-split sell order ID",
+    )
+    normalized_adjusted_at = _normalize_alpaca_broker_timestamp(adjusted_at)
+    if normalized_adjusted_at is None:
+        raise ValueError("Managed Alpaca reverse-split adjustment requires a timestamp.")
+    if type(notes) is not str or not notes:
+        raise ValueError("Managed Alpaca reverse-split adjustment requires durable notes.")
+    if expected_state_revision < 0:
+        raise ValueError("Managed Alpaca reverse-split adjustment requires a non-negative state revision.")
+    numeric_values = (old_rate, new_rate, live_qty, live_avg_price, adjusted_target_sell_price)
+    if any(isinstance(value, bool) or not isinstance(value, Number) for value in numeric_values):
+        raise ValueError("Managed Alpaca reverse-split economics must be numeric.")
+    old_rate_value, new_rate_value, live_qty_value, live_avg_value, target_value = map(float, numeric_values)
+    if not all(math.isfinite(value) and value > 0.0 for value in numeric_values):
+        raise ValueError("Managed Alpaca reverse-split economics must be positive and finite.")
+    if new_rate_value >= old_rate_value:
+        raise ValueError("Managed Alpaca reverse-split rates do not describe a reverse split.")
+    paper_excess_value: float | None = None
+    if corporate_action_paper_excess_qty is not None:
+        if isinstance(corporate_action_paper_excess_qty, bool) or not isinstance(
+            corporate_action_paper_excess_qty,
+            Number,
+        ):
+            raise ValueError("Managed Alpaca paper reverse-split excess quantity must be numeric.")
+        paper_excess_value = float(corporate_action_paper_excess_qty)
+        if not math.isfinite(paper_excess_value) or paper_excess_value <= 0.0:
+            raise ValueError("Managed Alpaca paper reverse-split excess quantity must be positive and finite.")
+    cash_in_lieu_value: float | None = None
+    if corporate_action_cash_in_lieu_qty is not None:
+        if isinstance(corporate_action_cash_in_lieu_qty, bool) or not isinstance(
+            corporate_action_cash_in_lieu_qty,
+            Number,
+        ):
+            raise ValueError("Managed Alpaca reverse-split cash-in-lieu quantity must be numeric.")
+        cash_in_lieu_value = float(corporate_action_cash_in_lieu_qty)
+        if not math.isfinite(cash_in_lieu_value) or not 0.0 < cash_in_lieu_value < 1.0:
+            raise ValueError(
+                "Managed Alpaca reverse-split cash-in-lieu quantity must be finite and less than one share."
+            )
+
+    new_revision: int | None = None
+    with _managed_accounting_composite_savepoint(
+        conn,
+        "apply_alpaca_managed_reverse_split_if_current",
+    ):
+        row = conn.execute(
+            """
+            SELECT symbol, alpaca_asset_id, buy_status, sell_status,
+                   sell_alpaca_order_id, filled_qty, filled_avg_price,
+                   target_sell_price, sold_qty, sold_value, remaining_qty,
+                   last_corporate_action_id
+            FROM alpaca_managed_positions
+            WHERE id = ? AND state_revision = ? AND closed_at IS NULL
+            """,
+            (position_id, expected_state_revision),
+        ).fetchone()
+        if row is not None:
+            (
+                persisted_symbol,
+                persisted_asset_id,
+                persisted_buy_status,
+                persisted_sell_status,
+                persisted_sell_order_id,
+                persisted_qty,
+                persisted_avg_price,
+                persisted_target_sell_price,
+                persisted_sold_qty,
+                persisted_sold_value,
+                persisted_remaining_qty,
+                last_action_id,
+            ) = row
+            premise_matches = bool(
+                persisted_symbol == normalized_symbol
+                and persisted_asset_id == prior_asset_id
+                and persisted_buy_status == expected_buy_status
+                and persisted_sell_status == expected_sell_status
+                and persisted_sell_order_id == normalized_sell_order_id
+                and last_action_id != normalized_action_id
+                and persisted_qty is not None
+                and persisted_avg_price is not None
+                and persisted_target_sell_price is not None
+                and float(persisted_sold_qty or 0.0) == 0.0
+                and float(persisted_sold_value or 0.0) == 0.0
+                and not conn.execute(
+                    """
+                    SELECT 1
+                    FROM alpaca_managed_sell_fills
+                    WHERE managed_position_id = ? AND filled_qty > 0
+                    LIMIT 1
+                    """,
+                    (position_id,),
+                ).fetchone()
+            )
+            if premise_matches:
+                persisted_qty_value = float(persisted_qty)
+                persisted_avg_value = float(persisted_avg_price)
+                expected_economic_qty = persisted_qty_value * new_rate_value / old_rate_value
+                expected_live_qty = expected_economic_qty - (cash_in_lieu_value or 0.0)
+                old_cost = persisted_qty_value * persisted_avg_value
+                live_cost = expected_economic_qty * live_avg_value
+                quantity_matches = _managed_accounting_quantities_match(
+                    live_qty_value,
+                    expected_live_qty,
+                    mark_prices=(live_avg_value, persisted_avg_value),
+                    value_scale=max(abs(old_cost), abs(live_cost)),
+                )
+                cost_matches = abs(old_cost - live_cost) <= managed_value_reconciliation_tolerance(
+                    max(abs(old_cost), abs(live_cost))
+                )
+                remaining_matches = persisted_remaining_qty is None or _managed_accounting_quantities_match(
+                    float(persisted_remaining_qty),
+                    persisted_qty_value,
+                    mark_prices=(persisted_avg_value,),
+                    value_scale=abs(old_cost),
+                )
+                expected_target = float(persisted_target_sell_price) * old_rate_value / new_rate_value
+                target_matches = abs(target_value - expected_target) <= max(
+                    0.0100001,
+                    abs(expected_target) * 1e-12,
+                )
+                expected_paper_excess = persisted_qty_value - expected_live_qty
+                paper_excess_matches = paper_excess_value is None or (
+                    expected_paper_excess > 0.0
+                    and _managed_accounting_quantities_match(
+                        paper_excess_value,
+                        expected_paper_excess,
+                        mark_prices=(live_avg_value, persisted_avg_value),
+                        value_scale=abs(old_cost),
+                    )
+                )
+                cash_in_lieu_matches = cash_in_lieu_value is None or (
+                    _managed_accounting_quantities_match(
+                        live_qty_value,
+                        float(math.floor(expected_economic_qty)),
+                        mark_prices=(live_avg_value, persisted_avg_value),
+                        value_scale=abs(old_cost),
+                    )
+                )
+                premise_matches = bool(
+                    quantity_matches
+                    and cost_matches
+                    and remaining_matches
+                    and target_matches
+                    and paper_excess_matches
+                    and cash_in_lieu_matches
+                )
+
+            if premise_matches:
+                rekeyed_revision = rekey_alpaca_managed_position_asset_if_current(
+                    conn,
+                    position_id,
+                    expected_state_revision=expected_state_revision,
+                    expected_symbol=normalized_symbol,
+                    expected_alpaca_asset_id=prior_asset_id,
+                    successor_alpaca_asset_id=successor_asset_id,
+                    commit=False,
+                )
+                if rekeyed_revision is not None:
+                    cursor = conn.execute(
+                        """
+                        UPDATE alpaca_managed_positions
+                        SET state_revision = state_revision + 1,
+                            filled_qty = ?,
+                            filled_avg_price = ?,
+                            target_sell_price = ?,
+                            remaining_qty = ?,
+                            sell_renewal_requested_at = ?,
+                            last_corporate_action_id = ?,
+                            corporate_action_adjusted_at = ?,
+                            corporate_action_paper_excess_qty = ?,
+                            corporate_action_cash_in_lieu_qty = ?,
+                            notes = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND state_revision = ? AND closed_at IS NULL
+                          AND alpaca_asset_id = ?
+                          AND buy_status = ? AND sell_status = ?
+                          AND sell_alpaca_order_id = ?
+                        RETURNING state_revision
+                        """,
+                        (
+                            live_qty_value,
+                            live_avg_value,
+                            target_value,
+                            live_qty_value,
+                            normalized_adjusted_at,
+                            normalized_action_id,
+                            normalized_adjusted_at,
+                            paper_excess_value,
+                            cash_in_lieu_value,
+                            notes,
+                            position_id,
+                            rekeyed_revision,
+                            successor_asset_id,
+                            expected_buy_status,
+                            expected_sell_status,
+                            normalized_sell_order_id,
+                        ),
+                    )
+                    updated = cursor.fetchone()
+                    if updated is not None:
+                        new_revision = int(updated[0])
     if commit:
         _commit_owned_transaction(conn)
     return new_revision

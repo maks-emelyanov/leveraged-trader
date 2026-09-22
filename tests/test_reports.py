@@ -2271,6 +2271,70 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(summary.loc[0, "Realized P/L"], 50.0)
         self.assertEqual(summary.loc[0, "Realized P/L %"], 25.0)
 
+    def test_realized_pnl_summary_keeps_cash_in_lieu_position_incomplete(self) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO alpaca_managed_positions
+            (symbol, signal_symbol, buy_rsi, profit_target_multiple, buy_signal_date,
+             buy_client_order_id, buy_status, buy_order_qty, buy_order_limit_price,
+             filled_qty, filled_avg_price,
+             sold_qty, sold_value, remaining_qty, closed_at,
+             last_corporate_action_id, corporate_action_adjusted_at,
+             corporate_action_cash_in_lieu_qty)
+            VALUES ('CRMX', 'CRML', 30, 1.7, '2026-07-13',
+                    'rsi-buy-CRMX-cash-in-lieu-report', 'filled', 6, 8, 1, 30.56,
+                    1, 51.96, 0, '2026-09-23T15:00:00Z',
+                    'split-action-1', '2026-09-22T14:20:37.000000Z', 0.5)
+            """
+        )
+
+        summary = build_alpaca_realized_pnl_summary(self.conn)
+
+        self.assertEqual(summary.loc[0, "Closed Positions"], 1)
+        self.assertEqual(summary.loc[0, "Complete Closed Positions"], 0)
+        self.assertEqual(summary.loc[0, "Incomplete Closed Positions"], 1)
+        self.assertEqual(summary.loc[0, "Realized P/L"], 0.0)
+
+    def test_realized_pnl_summary_accepts_complete_reverse_split_rebase(self) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO alpaca_managed_positions
+            (symbol, signal_symbol, buy_rsi, profit_target_multiple, buy_signal_date,
+             buy_client_order_id, buy_status, buy_order_qty, buy_order_limit_price,
+             filled_qty, filled_avg_price, sold_qty, sold_value, remaining_qty,
+             closed_at, last_corporate_action_id, corporate_action_adjusted_at)
+            VALUES ('TQQQ', 'QQQ', 30, 1.5, '2026-01-02',
+                    'rsi-buy-TQQQ-reverse-split-report', 'filled', 4, 11,
+                    1, 40, 1, 60, 0, '2026-09-23T15:00:00Z',
+                    'split-action-1', '2026-09-22T14:20:37.000000Z')
+            """
+        )
+
+        summary = build_alpaca_realized_pnl_summary(self.conn)
+
+        self.assertEqual(summary.loc[0, "Closed Positions"], 1)
+        self.assertEqual(summary.loc[0, "Complete Closed Positions"], 1)
+        self.assertEqual(summary.loc[0, "Incomplete Closed Positions"], 0)
+        self.assertEqual(summary.loc[0, "Total Buy Cost"], 40.0)
+        self.assertEqual(summary.loc[0, "Total Sell Value"], 60.0)
+        self.assertEqual(summary.loc[0, "Realized P/L"], 20.0)
+
+        self.conn.execute(
+            "UPDATE alpaca_managed_positions SET corporate_action_adjusted_at = 'not-a-timestamp'"
+        )
+        malformed_identity = build_alpaca_realized_pnl_summary(self.conn)
+        self.assertEqual(malformed_identity.loc[0, "Complete Closed Positions"], 0)
+
+        self.conn.execute(
+            """
+            UPDATE alpaca_managed_positions
+            SET corporate_action_adjusted_at = '2026-09-22T14:20:37.000000Z',
+                filled_avg_price = 45
+            """
+        )
+        excessive_rebased_cost = build_alpaca_realized_pnl_summary(self.conn)
+        self.assertEqual(excessive_rebased_cost.loc[0, "Complete Closed Positions"], 0)
+
     def test_realized_pnl_summary_classifies_legacy_null_workflow_as_long_after_initialization(self) -> None:
         cursor = self.conn.execute(
             """
