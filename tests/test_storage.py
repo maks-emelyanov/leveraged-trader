@@ -20494,6 +20494,88 @@ class AlpacaManagedStorageTests(unittest.TestCase):
             ).fetchone()[0]
         )
 
+    def test_closed_audit_loader_applies_rolling_minimum_reaudit_interval(self) -> None:
+        position_ids: list[int] = []
+        for index in range(3):
+            position_id = self.save_position(
+                symbol=f"RA{index}",
+                client_order_id=f"rsi-buy-RA{index}-20260102",
+                alpaca_asset_id=f"asset-reaudit-{index}",
+            )
+            self.close_position(position_id)
+            position_ids.append(position_id)
+        self.conn.execute(
+            "UPDATE alpaca_managed_positions "
+            "SET closed_correction_audited_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-14 minutes') "
+            "WHERE id = ?",
+            (position_ids[0],),
+        )
+        self.conn.execute(
+            "UPDATE alpaca_managed_positions "
+            "SET closed_correction_audited_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-15 minutes') "
+            "WHERE id = ?",
+            (position_ids[1],),
+        )
+        self.conn.commit()
+
+        throttled = load_recently_closed_alpaca_managed_positions(
+            self.conn,
+            min_reaudit_interval_minutes=15,
+        )
+        unthrottled = load_recently_closed_alpaca_managed_positions(self.conn)
+
+        self.assertEqual(throttled["id"].tolist(), [position_ids[2], position_ids[1]])
+        self.assertEqual(set(unthrottled["id"].tolist()), set(position_ids))
+
+    def test_closed_audit_loader_never_throttles_unresolved_closed_state(self) -> None:
+        cases = (
+            ("sell_submission_retry_claimed_at", "2026-01-02T15:00:00Z"),
+            ("sell_status", "pending_cancel"),
+            ("buy_status", "submission_unknown"),
+            ("buy_status", "pending_cancel"),
+            ("buy_status", "incomplete_fill_metadata"),
+            ("buy_status", "identity_mismatch"),
+        )
+        position_ids: list[int] = []
+        for index, (column, value) in enumerate(cases):
+            position_id = self.save_position(
+                symbol=f"UR{index}",
+                client_order_id=f"rsi-buy-UR{index}-20260102",
+                alpaca_asset_id=f"asset-unresolved-{index}",
+            )
+            self.close_position(position_id)
+            self.conn.execute(
+                f"""
+                UPDATE alpaca_managed_positions
+                SET {column} = ?,
+                    closed_at = '2020-01-01T00:00:00Z',
+                    closed_correction_audited_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE id = ?
+                """,
+                (value, position_id),
+            )
+            position_ids.append(position_id)
+        self.conn.commit()
+
+        candidates = load_recently_closed_alpaca_managed_positions(
+            self.conn,
+            audit_days=1,
+            min_reaudit_interval_minutes=15,
+        )
+
+        self.assertEqual(set(candidates["id"].tolist()), set(position_ids))
+
+    def test_closed_audit_loader_validates_minimum_reaudit_interval(self) -> None:
+        for invalid_interval in (0, -1, True):
+            with (
+                self.subTest(invalid_interval=invalid_interval),
+                self.assertRaisesRegex(ValueError, "at least one minute"),
+            ):
+                load_recently_closed_alpaca_managed_positions(
+                    self.conn,
+                    min_reaudit_interval_minutes=invalid_interval,
+                )
+
     def test_closed_audit_loader_never_bounds_or_marks_retained_sell_retries(self) -> None:
         position_ids: list[int] = []
         for index in range(3):

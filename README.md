@@ -248,8 +248,16 @@ due even when validation finishes during 8:46. The gate runs:
   workflow with Alpaca paper buy and managed sell submission. The authenticated clock snapshot also
   supplies an absolute 9:20 a.m. Eastern analytics deadline; expiry rolls back the active asset and
   prevents buy submission.
-- Every minute from 9:30 a.m. through 4:00 p.m. Monday-Friday: run the lightweight managed-position
-  reconciliation path with sell submission enabled and buy submission disabled.
+- Every minute from 9:30 a.m. through 4:00 p.m. Monday-Friday: check whether managed-position
+  reconciliation is due, with sell submission enabled and buy submission disabled. Active positions,
+  unresolved broker states, newly closed positions, and failed closed-position audits remain due every
+  minute. After a closed position completes an audit successfully, its routine correction audit uses a
+  rolling 15-minute cadence. Settled off-cadence invocations exit after a locked read-only state check,
+  preserving the latest reports without initializing the database or contacting Alpaca. The cron
+  launcher and its authenticated environment preflight still run every minute.
+
+After updating an existing scheduled installation, rerun `./scripts/cron/install-crontab` to
+publish the updated authenticated launcher before relying on the new cadence.
 
 In full and reconciliation-only workflows, historical-sell cancellations receive one retry after
 10 seconds when they are the only failures requiring protection or fill-accounting correction.
@@ -410,8 +418,10 @@ premarket after the signal day has settled.
 - During the regular session, run
   `uv run leveraged-trader --reconcile-only --alpaca-submit-sell-orders` to attach or renew managed
   GTC limit sells without downloading universes, refreshing market data, or placing new buy orders.
-  The installed scheduler does this every minute from 9:30 a.m. through 4:00 p.m. ET so a newly
-  filled buy receives protection promptly.
+  The installed scheduler checks every minute from 9:30 a.m. through 4:00 p.m. ET so a newly filled
+  buy receives protection promptly. Once every position is settled and has completed a successful
+  closed-position audit, broker correction audits use a rolling 15-minute cadence while off-cadence
+  checks exit without replacing the last published reports.
 - If a limit buy never fills, no sell is submitted. A later reconciliation records the terminal buy
   status and closes the managed intent without a position.
 - Extra reconciliation runs are intended to be idempotent: deterministic client order IDs, active

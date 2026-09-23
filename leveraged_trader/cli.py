@@ -81,6 +81,10 @@ def _workflow_concurrency(value: str | int) -> int:
     return _bounded_int(value, name="workflow concurrency", minimum=1, maximum=64)
 
 
+def _scheduled_closed_audit_interval_minutes(value: str | int) -> int:
+    return _bounded_int(value, name="scheduled closed-audit interval minutes", minimum=1, maximum=1_440)
+
+
 def _workflow_deadline_epoch(value: str | int) -> int:
     return _bounded_int(
         value,
@@ -391,6 +395,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--scheduled-closed-audit-interval-minutes",
+        type=_scheduled_closed_audit_interval_minutes,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--workflow-deadline-epoch",
         type=_workflow_deadline_epoch,
         default=None,
@@ -428,6 +438,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--reconcile-only cannot be combined with --alpaca-submit-buy-orders.")
     if args.reconcile_only and not args.alpaca_submit_sell_orders:
         parser.error("--reconcile-only requires --alpaca-submit-sell-orders.")
+    if args.scheduled_closed_audit_interval_minutes is not None and not args.reconcile_only:
+        parser.error(
+            "--scheduled-closed-audit-interval-minutes requires --reconcile-only."
+        )
     try:
         alpaca_cfg = _alpaca_config_from_args(args)
         if args.reconcile_only:
@@ -464,6 +478,7 @@ def main() -> None:
             alpaca_cfg=alpaca_cfg,
             output_dir=args.output_dir,
             no_color=args.no_color,
+            closed_audit_min_interval_minutes=args.scheduled_closed_audit_interval_minutes,
         )
         return
 

@@ -14749,6 +14749,7 @@ def _reconcile_alpaca_managed_positions_pass(
     cfg: AlpacaOrderConfig,
     *,
     audit_closed: bool,
+    closed_audit_min_interval_minutes: int | None = None,
     skip_active_position_ids: frozenset[int] = frozenset(),
     order_snapshot: _ReconciliationOrderSnapshot | None = None,
 ) -> pd.DataFrame:
@@ -14777,6 +14778,7 @@ def _reconcile_alpaca_managed_positions_pass(
             conn,
             audit_days=_CLOSED_POSITION_CORRECTION_AUDIT_DAYS,
             audit_limit=_CLOSED_POSITION_CORRECTION_AUDIT_LIMIT,
+            min_reaudit_interval_minutes=closed_audit_min_interval_minutes,
         )
         if audit_closed
         else pd.DataFrame()
@@ -18392,6 +18394,7 @@ def _reconcile_alpaca_managed_positions_impl(
     cfg: AlpacaOrderConfig,
     *,
     migrate_closed_symbols: bool = False,
+    closed_audit_min_interval_minutes: int | None = None,
 ) -> pd.DataFrame:
     """Reconcile active exposure before performing any closed-position audit.
 
@@ -18469,6 +18472,7 @@ def _reconcile_alpaca_managed_positions_impl(
                     include_active=False,
                     include_closed=True,
                     exclude_position_ids=initial_active_position_ids,
+                    closed_audit_min_interval_minutes=closed_audit_min_interval_minutes,
                 )
                 closed_migration_applied = bool(closed_migrations)
                 if closed_migration_applied:
@@ -18492,6 +18496,7 @@ def _reconcile_alpaca_managed_positions_impl(
                         conn,
                         audit_days=_CLOSED_POSITION_CORRECTION_AUDIT_DAYS,
                         audit_limit=_CLOSED_POSITION_CORRECTION_AUDIT_LIMIT,
+                        min_reaudit_interval_minutes=closed_audit_min_interval_minutes,
                     )
                     if initial_active_position_ids and not closed_positions.empty:
                         closed_positions = closed_positions.loc[
@@ -18573,6 +18578,7 @@ def _reconcile_alpaca_managed_positions_impl(
                         conn,
                         cfg,
                         audit_closed=True,
+                        closed_audit_min_interval_minutes=closed_audit_min_interval_minutes,
                         skip_active_position_ids=initial_active_position_ids,
                         order_snapshot=order_snapshot,
                     )
@@ -18636,6 +18642,7 @@ def reconcile_alpaca_managed_positions(
     cfg: AlpacaOrderConfig,
     *,
     migrate_closed_symbols: bool = False,
+    closed_audit_min_interval_minutes: int | None = None,
 ) -> pd.DataFrame:
     """Publish credential-safe managed-position reconciliation diagnostics."""
     boundary_sensitive_values: tuple[str, ...] = ()
@@ -18651,6 +18658,7 @@ def reconcile_alpaca_managed_positions(
                     conn,
                     cfg,
                     migrate_closed_symbols=migrate_closed_symbols,
+                    closed_audit_min_interval_minutes=closed_audit_min_interval_minutes,
                 )
             finally:
                 publication_sensitive_values = _merged_alpaca_sensitive_values(
@@ -18765,6 +18773,7 @@ def _migrate_alpaca_managed_position_symbols_impl(
     include_active: bool = True,
     include_closed: bool = True,
     exclude_position_ids: frozenset[int] = frozenset(),
+    closed_audit_min_interval_minutes: int | None = None,
 ) -> dict[str, str]:
     """Migrate selected managed tickers using stable asset IDs.
 
@@ -18782,6 +18791,7 @@ def _migrate_alpaca_managed_position_symbols_impl(
             conn,
             audit_days=_CLOSED_POSITION_CORRECTION_AUDIT_DAYS,
             audit_limit=_CLOSED_POSITION_CORRECTION_AUDIT_LIMIT,
+            min_reaudit_interval_minutes=closed_audit_min_interval_minutes,
         )
         if include_closed
         else pd.DataFrame()
@@ -19085,6 +19095,7 @@ def migrate_alpaca_managed_position_symbols(
     include_active: bool = True,
     include_closed: bool = True,
     exclude_position_ids: frozenset[int] = frozenset(),
+    closed_audit_min_interval_minutes: int | None = None,
 ) -> dict[str, str]:
     """Publish credential-safe symbol-migration failures."""
     boundary_sensitive_values: tuple[str, ...] = ()
@@ -19101,6 +19112,7 @@ def migrate_alpaca_managed_position_symbols(
                     include_active=include_active,
                     include_closed=include_closed,
                     exclude_position_ids=exclude_position_ids,
+                    closed_audit_min_interval_minutes=closed_audit_min_interval_minutes,
                 )
             finally:
                 publication_sensitive_values = _merged_alpaca_sensitive_values(

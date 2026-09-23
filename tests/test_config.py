@@ -481,6 +481,56 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("--reconcile-only requires --alpaca-submit-sell-orders", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
 
+    def test_scheduled_closed_audit_interval_is_reconciliation_only_and_hidden(self) -> None:
+        stderr = StringIO()
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(
+                sys,
+                "argv",
+                ["leveraged-trader", "--scheduled-closed-audit-interval-minutes", "15"],
+            ),
+            patch("sys.stderr", stderr),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            parse_args()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("requires --reconcile-only", stderr.getvalue())
+
+        environment = {
+            "ALPACA_API_KEY_ID": "paper-key",
+            "ALPACA_API_SECRET_KEY": "paper-secret",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "leveraged-trader",
+                    "--reconcile-only",
+                    "--alpaca-submit-sell-orders",
+                    "--scheduled-closed-audit-interval-minutes",
+                    "15",
+                ],
+            ),
+        ):
+            scheduled_args = parse_args()
+        with patch.dict(os.environ, {}, clear=True), patch.object(sys, "argv", ["leveraged-trader"]):
+            manual_args = parse_args()
+
+        self.assertEqual(scheduled_args.scheduled_closed_audit_interval_minutes, 15)
+        self.assertIsNone(manual_args.scheduled_closed_audit_interval_minutes)
+        stdout = StringIO()
+        with (
+            patch.object(sys, "argv", ["leveraged-trader", "--help"]),
+            patch("sys.stdout", stdout),
+            self.assertRaises(SystemExit) as help_exit,
+        ):
+            parse_args()
+        self.assertEqual(help_exit.exception.code, 0)
+        self.assertNotIn("--scheduled-closed-audit-interval-minutes", stdout.getvalue())
+
     def test_reconcile_only_does_not_accept_an_abbreviated_mode_flag(self) -> None:
         with (
             patch.dict(os.environ, {}, clear=True),
@@ -651,6 +701,38 @@ class ConfigTests(unittest.TestCase):
             main()
 
         mock_reconcile.assert_called_once()
+
+    @patch("leveraged_trader.cli.run_alpaca_reconciliation")
+    @patch("leveraged_trader.cli.load_dotenv")
+    def test_scheduled_closed_audit_interval_is_forwarded_to_reconciliation(
+        self,
+        _mock_load_dotenv: object,
+        mock_reconcile: object,
+    ) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "ALPACA_API_KEY_ID": "paper-key",
+                    "ALPACA_API_SECRET_KEY": "paper-secret",
+                },
+                clear=True,
+            ),
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "leveraged-trader",
+                    "--reconcile-only",
+                    "--alpaca-submit-sell-orders",
+                    "--scheduled-closed-audit-interval-minutes",
+                    "15",
+                ],
+            ),
+        ):
+            main()
+
+        self.assertEqual(mock_reconcile.call_args.kwargs["closed_audit_min_interval_minutes"], 15)
 
     def test_enabled_alpaca_submission_requires_environment_credentials(self) -> None:
         for submission_flag in ("--alpaca-submit-buy-orders", "--alpaca-submit-sell-orders"):

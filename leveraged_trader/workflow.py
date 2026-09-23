@@ -99,6 +99,7 @@ from .storage import (
     load_alpaca_managed_positions,
     load_best_strategy_summary,
     load_complete_strategy_equity_curve,
+    load_recently_closed_alpaca_managed_positions,
     process_asset_grid,
     save_workflow_assets,
     strategy_config_fingerprint,
@@ -2076,6 +2077,69 @@ def _state_connection(
         conn.close()
 
 
+@contextmanager
+def _read_only_state_connection(db_path: str) -> sqlite3.Connection:
+    """Read the workflow-pinned SQLite state without creating or mutating it."""
+    runtime_guard = revalidate_active_sqlite_runtime_file(db_path)
+    runtime_db_path = runtime_guard.database_path if runtime_guard is not None else db_path
+    database_uri = f"{Path(runtime_db_path).absolute().as_uri()}?mode=ro"
+    conn = sqlite3.connect(
+        database_uri,
+        uri=True,
+        timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+    )
+    operation_failure: BaseException | None = None
+    try:
+        conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA query_only = ON")
+        revalidate_active_sqlite_runtime_file(db_path, runtime_guard)
+        yield conn
+        revalidate_active_sqlite_runtime_file(db_path, runtime_guard)
+    except BaseException as exc:
+        operation_failure = exc
+        raise
+    finally:
+        try:
+            conn.close()
+        except BaseException as close_failure:
+            if operation_failure is not None:
+                operation_failure.add_note(
+                    f"Failed to close the scheduled reconciliation read-only state probe: {close_failure}"
+                )
+            else:
+                raise
+
+
+def _scheduled_alpaca_reconciliation_is_due(
+    db_path: str,
+    *,
+    closed_audit_min_interval_minutes: int,
+) -> bool:
+    """Return false only when pinned state proves scheduled broker work is not due."""
+    if isinstance(closed_audit_min_interval_minutes, bool) or closed_audit_min_interval_minutes < 1:
+        raise ValueError("Scheduled closed-position audit interval must be at least one minute.")
+    try:
+        with _read_only_state_connection(db_path) as conn:
+            managed_positions = load_alpaca_managed_positions(conn)
+            if not managed_positions.empty and managed_positions["closed_at"].isna().any():
+                return True
+            return not load_recently_closed_alpaca_managed_positions(
+                conn,
+                min_reaudit_interval_minutes=closed_audit_min_interval_minutes,
+            ).empty
+    except pd.errors.DatabaseError:
+        # Pandas wraps recoverable SQLite schema/query failures in DatabaseError,
+        # which is also an OSError subclass. Let the normal initialization path
+        # upgrade or diagnose that state.
+        return True
+    except OSError:
+        raise
+    except Exception:
+        # Missing, legacy, or malformed state must enter the normal initialization
+        # and validation path instead of being optimistically treated as idle.
+        return True
+
+
 def _initialize_state_db(db_path: str) -> None:
     with _state_connection(db_path) as conn:
         conn.execute("PRAGMA journal_mode = WAL")
@@ -2895,9 +2959,14 @@ def _persist_alpaca_reconciliation_failure(
 def _reconcile_alpaca_managed_positions_for_db(
     db_path: str,
     alpaca_cfg: AlpacaOrderConfig,
+    closed_audit_min_interval_minutes: int | None = None,
 ) -> pd.DataFrame:
     return _run_alpaca_workflow_diagnostic_boundary(
-        lambda: _reconcile_alpaca_managed_positions_with_cancellation_retry(db_path, alpaca_cfg),
+        lambda: _reconcile_alpaca_managed_positions_with_cancellation_retry(
+            db_path,
+            alpaca_cfg,
+            closed_audit_min_interval_minutes,
+        ),
         alpaca_cfg=alpaca_cfg,
     )
 
@@ -2905,9 +2974,14 @@ def _reconcile_alpaca_managed_positions_for_db(
 def _reconcile_alpaca_managed_positions_with_cancellation_retry(
     db_path: str,
     alpaca_cfg: AlpacaOrderConfig,
+    closed_audit_min_interval_minutes: int | None = None,
 ) -> pd.DataFrame:
     try:
-        return _reconcile_alpaca_managed_positions_for_db_impl(db_path, alpaca_cfg)
+        return _reconcile_alpaca_managed_positions_for_db_impl(
+            db_path,
+            alpaca_cfg,
+            closed_audit_min_interval_minutes,
+        )
     except AlpacaReconciliationError as exc:
         if not exc.retryable_historical_cancellation:
             raise
@@ -2923,7 +2997,11 @@ def _reconcile_alpaca_managed_positions_with_cancellation_retry(
     # so an unresolved cancellation still produces the usual failure audit.
     try:
         time.sleep(10)
-        retry_results = _reconcile_alpaca_managed_positions_for_db_impl(db_path, alpaca_cfg)
+        retry_results = _reconcile_alpaca_managed_positions_for_db_impl(
+            db_path,
+            alpaca_cfg,
+            closed_audit_min_interval_minutes,
+        )
     except AlpacaReconciliationError as exc:
         exc.results = _safe_alpaca_workflow_result_messages(
             pd.concat([initial_results, exc.results], ignore_index=True),
@@ -2952,6 +3030,7 @@ def _reconcile_alpaca_managed_positions_with_cancellation_retry(
 def _reconcile_alpaca_managed_positions_for_db_impl(
     db_path: str,
     alpaca_cfg: AlpacaOrderConfig,
+    closed_audit_min_interval_minutes: int | None = None,
 ) -> pd.DataFrame:
     broker_results: pd.DataFrame | None = None
     completed_results: pd.DataFrame | None = None
@@ -3113,6 +3192,7 @@ def _reconcile_alpaca_managed_positions_for_db_impl(
                     conn,
                     alpaca_cfg,
                     migrate_closed_symbols=True,
+                    closed_audit_min_interval_minutes=closed_audit_min_interval_minutes,
                 )
             except AlpacaReconciliationError as exc:
                 if migration_results.empty:
@@ -6440,6 +6520,7 @@ def run_alpaca_reconciliation(
     alpaca_cfg: AlpacaOrderConfig,
     output_dir: str,
     no_color: bool = False,
+    closed_audit_min_interval_minutes: int | None = None,
 ) -> None:
     _run_alpaca_workflow_diagnostic_boundary(
         lambda: _run_alpaca_reconciliation_impl(
@@ -6447,6 +6528,7 @@ def run_alpaca_reconciliation(
             alpaca_cfg=alpaca_cfg,
             output_dir=output_dir,
             no_color=no_color,
+            closed_audit_min_interval_minutes=closed_audit_min_interval_minutes,
         ),
         alpaca_cfg=alpaca_cfg,
     )
@@ -6458,6 +6540,7 @@ def _run_alpaca_reconciliation_impl(
     alpaca_cfg: AlpacaOrderConfig,
     output_dir: str,
     no_color: bool = False,
+    closed_audit_min_interval_minutes: int | None = None,
 ) -> None:
     """Quickly reconcile managed positions without rerunning market-data research."""
     _validate_database_path(db_path)
@@ -6474,6 +6557,12 @@ def _run_alpaca_reconciliation_impl(
         serialize_alpaca_account=True,
     ) as locked_output_dir:
         locked_db_path = locked_output_dir.database_path
+        if closed_audit_min_interval_minutes is not None and not _scheduled_alpaca_reconciliation_is_due(
+            locked_db_path,
+            closed_audit_min_interval_minutes=closed_audit_min_interval_minutes,
+        ):
+            return
+
         # Initialization performs managed-state migrations, so retire the old
         # report generation before it can change any snapshot-covered row.
         reconciliation_publication = _begin_alpaca_snapshot_publication(
@@ -6490,6 +6579,7 @@ def _run_alpaca_reconciliation_impl(
                         reconciliation_results = _reconcile_alpaca_managed_positions_for_db(
                             locked_db_path,
                             alpaca_cfg,
+                            closed_audit_min_interval_minutes,
                         )
                         reconciliation_results = _safe_alpaca_workflow_result_messages(
                             reconciliation_results,

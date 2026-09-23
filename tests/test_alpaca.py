@@ -33948,6 +33948,41 @@ class AlpacaTests(unittest.TestCase):
         retry_audit.assert_called_once()
         self.assertFalse(pd.isna(retried.loc[0, "closed_correction_audited_at"]))
 
+    @patch("leveraged_trader.alpaca.migrate_alpaca_managed_position_symbols")
+    @patch("leveraged_trader.alpaca._reconcile_alpaca_managed_positions_pass")
+    def test_closed_audit_interval_reaches_migration_and_audit_pass(
+        self,
+        mock_reconcile_pass: Mock,
+        mock_migrate: Mock,
+    ) -> None:
+        mock_reconcile_pass.return_value = pd.DataFrame()
+        mock_migrate.return_value = {}
+        with closing(sqlite3.connect(":memory:")) as conn, conn:
+            init_state_db(conn)
+            reconcile_alpaca_managed_positions(
+                conn,
+                self.cfg(buy=True, sell=True),
+                migrate_closed_symbols=True,
+                closed_audit_min_interval_minutes=15,
+            )
+
+        self.assertEqual(
+            mock_migrate.call_args.kwargs,
+            {
+                "include_active": False,
+                "include_closed": True,
+                "exclude_position_ids": frozenset(),
+                "closed_audit_min_interval_minutes": 15,
+            },
+        )
+        self.assertEqual(mock_reconcile_pass.call_count, 2)
+        self.assertFalse(mock_reconcile_pass.call_args_list[0].kwargs["audit_closed"])
+        self.assertTrue(mock_reconcile_pass.call_args_list[1].kwargs["audit_closed"])
+        self.assertEqual(
+            mock_reconcile_pass.call_args_list[1].kwargs["closed_audit_min_interval_minutes"],
+            15,
+        )
+
     def test_late_reconciliation_failures_preserve_active_phase_results(self) -> None:
         active_result = pd.DataFrame(
             [
@@ -40080,11 +40115,16 @@ class AlpacaTests(unittest.TestCase):
             result = reconcile_alpaca_managed_positions(
                 conn,
                 AlpacaOrderConfig(api_key_id="paper-key", api_secret_key=credential),
+                closed_audit_min_interval_minutes=15,
             )
 
         self.assertEqual(result.columns.tolist(), expected.columns.tolist())
         self.assertEqual(result.loc[0, "Status"], credential)
         self.assertEqual(result.loc[0, "Action"], "reconciliation")
+        self.assertEqual(
+            mock_reconcile_impl.call_args.kwargs["closed_audit_min_interval_minutes"],
+            15,
+        )
         self.assertNotIn(credential, result.loc[0, "Message"])
         self.assertIn("[redacted credential]", result.loc[0, "Message"])
 

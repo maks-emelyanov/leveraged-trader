@@ -8292,12 +8292,29 @@ def load_recently_closed_alpaca_managed_positions(
     *,
     audit_days: int = 30,
     audit_limit: int = 100,
+    min_reaudit_interval_minutes: int | None = None,
 ) -> pd.DataFrame:
     """Load a rotating bounded set of closed positions eligible for broker re-audit."""
     if audit_days < 1:
         raise ValueError("Managed Alpaca closed-position audit window must be at least one day.")
     if audit_limit < 1:
         raise ValueError("Managed Alpaca closed-position audit limit must be at least one.")
+    if min_reaudit_interval_minutes is not None and (
+        isinstance(min_reaudit_interval_minutes, bool) or min_reaudit_interval_minutes < 1
+    ):
+        raise ValueError("Managed Alpaca closed-position re-audit interval must be at least one minute.")
+    re_audit_due_sql = ""
+    query_params: list[object] = [f"-{audit_days} days"]
+    if min_reaudit_interval_minutes is not None:
+        re_audit_due_sql = """
+                    AND (
+                        closed_correction_audited_at IS NULL
+                        OR datetime(closed_correction_audited_at) IS NULL
+                        OR datetime(closed_correction_audited_at) <= datetime('now', ?)
+                    )
+        """
+        query_params.append(f"-{min_reaudit_interval_minutes} minutes")
+    query_params.append(audit_limit)
     frame = pd.read_sql_query(
         f"""
         SELECT id, state_revision, workflow, symbol, alpaca_asset_id,
@@ -8344,6 +8361,7 @@ def load_recently_closed_alpaca_managed_positions(
                     )
                     AND corporate_action_adjusted_at IS NULL
                     AND datetime(closed_at) >= datetime('now', ?)
+                    {re_audit_due_sql}
                 )
               )
         ORDER BY (
@@ -8368,7 +8386,7 @@ def load_recently_closed_alpaca_managed_positions(
         )
         """,
         conn,
-        params=(f"-{audit_days} days", audit_limit),
+        params=tuple(query_params),
     )
     return _validate_loaded_managed_position_intents(frame)
 

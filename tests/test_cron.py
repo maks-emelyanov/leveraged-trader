@@ -19,6 +19,10 @@ INSTALLER = ROOT / "scripts" / "cron" / "install-crontab"
 RUNNER = ROOT / "scripts" / "cron" / "run-leveraged-trader"
 INSTALLER_TEST_MODE_ENV = "LEVERAGED_TRADER_INSTALLER_TEST_ONLY_MODE"
 INSTALLER_TEST_HOME_ENV = "LEVERAGED_TRADER_INSTALLER_TEST_ONLY_ACCOUNT_HOME"
+SCHEDULED_RECONCILIATION_ARGUMENTS = (
+    "--reconcile-only --alpaca-submit-sell-orders "
+    "--scheduled-closed-audit-interval-minutes 15"
+)
 CRON_BOUNDARY_ENVIRONMENT_NAMES = (
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
@@ -363,7 +367,7 @@ printf '3 09:30'
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "--reconcile-only --alpaca-submit-sell-orders"
+    assert result.stdout.strip() == SCHEDULED_RECONCILIATION_ARGUMENTS
     assert uv_verified.is_file()
     invoked_code = python_code.read_text(encoding="utf-8")
     assert "reset_tzpath(())" in invoked_code
@@ -1186,7 +1190,7 @@ def test_scheduled_market_session_runs_reconciliation(time: str) -> None:
     result = _run_scheduler(f"3 {time}")
 
     assert result.returncode == 0
-    assert result.stdout.strip() == "--reconcile-only --alpaca-submit-sell-orders"
+    assert result.stdout.strip() == SCHEDULED_RECONCILIATION_ARGUMENTS
 
 
 @pytest.mark.parametrize("now", ["3 08:44", "3 08:46", "3 09:29", "3 16:01", "3 23:59"])
@@ -3875,6 +3879,8 @@ def test_scheduler_invokes_production_runner_with_absolute_bash_outside_path(tmp
         "leveraged_trader",
         "--reconcile-only",
         "--alpaca-submit-sell-orders",
+        "--scheduled-closed-audit-interval-minutes",
+        "15",
     ]
 
 
@@ -3901,7 +3907,7 @@ def test_scheduler_rotates_log_at_size_limit_before_appending(tmp_path: Path) ->
     assert result.returncode == 0
     assert result.stdout == ""
     assert backup_file.read_text(encoding="utf-8") == "0123456789"
-    assert log_file.read_text(encoding="utf-8") == "--reconcile-only --alpaca-submit-sell-orders\n"
+    assert log_file.read_text(encoding="utf-8") == f"{SCHEDULED_RECONCILIATION_ARGUMENTS}\n"
     assert not (tmp_path / "cron log.txt.2").exists()
     assert not (tmp_path / "cron log.txt.rotate.lock").exists()
     assert (tmp_path / "cron log.txt.lock").stat().st_mode & 0o777 == 0o600
@@ -4220,7 +4226,7 @@ esac
 
     assert result.returncode == 0, result.stderr
     assert f"%u %p {shared_directory}" in bsd_calls.read_text(encoding="utf-8")
-    assert log_file.read_text(encoding="utf-8") == "--reconcile-only --alpaca-submit-sell-orders\n"
+    assert log_file.read_text(encoding="utf-8") == f"{SCHEDULED_RECONCILIATION_ARGUMENTS}\n"
 
 
 @pytest.mark.parametrize(
@@ -4471,7 +4477,7 @@ exit 99
     assert not unexpected_call.exists()
     assert not Path(f"{log_file}.lock").exists()
     assert Path(f"{log_file}.lock.d").is_dir()
-    assert log_file.read_text(encoding="utf-8") == "--reconcile-only --alpaca-submit-sell-orders\n"
+    assert log_file.read_text(encoding="utf-8") == f"{SCHEDULED_RECONCILIATION_ARGUMENTS}\n"
 
 
 def test_stale_legacy_rotation_directory_cannot_disable_rotation(tmp_path: Path) -> None:
@@ -4495,7 +4501,7 @@ def test_stale_legacy_rotation_directory_cannot_disable_rotation(tmp_path: Path)
 
     assert result.returncode == 0
     assert (tmp_path / "cron.log.1").read_text(encoding="utf-8") == "0123456789"
-    assert log_file.read_text(encoding="utf-8") == "--reconcile-only --alpaca-submit-sell-orders\n"
+    assert log_file.read_text(encoding="utf-8") == f"{SCHEDULED_RECONCILIATION_ARGUMENTS}\n"
 
 
 def test_scheduler_lock_skips_overlap_and_releases_automatically(tmp_path: Path) -> None:
@@ -4606,7 +4612,7 @@ def test_scheduler_recovers_abandoned_pid_lock_without_flock(tmp_path: Path) -> 
     assert (stale_lock / "owner").is_file()
     assert not (stale_lock / "pid").exists()
     assert (tmp_path / "cron.log.1").read_text(encoding="utf-8") == "0123456789"
-    assert log_file.read_text(encoding="utf-8") == "--reconcile-only --alpaca-submit-sell-orders\n"
+    assert log_file.read_text(encoding="utf-8") == f"{SCHEDULED_RECONCILIATION_ARGUMENTS}\n"
 
 
 def test_scheduler_recovers_old_ownerless_fallback_lock_without_flock(tmp_path: Path) -> None:
@@ -4646,7 +4652,7 @@ def test_scheduler_recovers_old_ownerless_fallback_lock_without_flock(tmp_path: 
 
     assert result.returncode == 0, result.stderr
     assert (stale_lock / "owner").is_file()
-    assert log_file.read_text(encoding="utf-8") == "--reconcile-only --alpaca-submit-sell-orders\n"
+    assert log_file.read_text(encoding="utf-8") == f"{SCHEDULED_RECONCILIATION_ARGUMENTS}\n"
 
 
 def test_scheduler_stale_recovery_blocks_path_replacement_and_third_contender(tmp_path: Path) -> None:
@@ -4822,7 +4828,7 @@ def test_scheduler_recovers_abandoned_acquisition_gate(
     assert not gate_dir.exists()
     assert not abandoned_dir.exists()
     assert (tmp_path / "cron.log.lock.d" / "owner").is_file()
-    assert log_file.read_text(encoding="utf-8") == ("--reconcile-only --alpaca-submit-sell-orders\n")
+    assert log_file.read_text(encoding="utf-8") == (f"{SCHEDULED_RECONCILIATION_ARGUMENTS}\n")
 
 
 def test_scheduler_recovers_reused_live_pid_when_process_start_identity_differs(tmp_path: Path) -> None:
@@ -4854,7 +4860,7 @@ def test_scheduler_recovers_reused_live_pid_when_process_start_identity_differs(
 
     assert result.returncode == 0
     assert (stale_lock / "owner").is_file()
-    assert log_file.read_text(encoding="utf-8") == "--reconcile-only --alpaca-submit-sell-orders\n"
+    assert log_file.read_text(encoding="utf-8") == f"{SCHEDULED_RECONCILIATION_ARGUMENTS}\n"
 
 
 def test_scheduler_fallback_owner_execs_runner_and_prevents_orphaned_overlap(tmp_path: Path) -> None:
@@ -4943,7 +4949,7 @@ done
             timeout=2,
         )
         assert retry.returncode == 23, retry.stderr
-        assert log_file.read_text(encoding="utf-8") == "--reconcile-only --alpaca-submit-sell-orders\n"
+        assert log_file.read_text(encoding="utf-8") == f"{SCHEDULED_RECONCILIATION_ARGUMENTS}\n"
     finally:
         block_file.unlink(missing_ok=True)
         _terminate_and_reap(first)
@@ -5122,7 +5128,7 @@ done
             timeout=2,
         )
         assert retry.returncode == 23, retry.stderr
-        assert log_file.read_text(encoding="utf-8") == "--reconcile-only --alpaca-submit-sell-orders\n"
+        assert log_file.read_text(encoding="utf-8") == f"{SCHEDULED_RECONCILIATION_ARGUMENTS}\n"
     finally:
         uv_child_block.unlink(missing_ok=True)
         trader_block.unlink(missing_ok=True)

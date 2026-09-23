@@ -48,6 +48,8 @@ from leveraged_trader.storage import (
     clear_asset_state,
     init_state_db,
     load_aligned_rsi_for_asset_session,
+    load_alpaca_managed_positions,
+    mark_alpaca_closed_correction_audited,
     mark_alpaca_managed_buy_filled,
     save_alpaca_managed_buy_order,
     strategy_config_fingerprint,
@@ -80,6 +82,7 @@ from leveraged_trader.workflow import (
     _reconcile_alpaca_managed_positions_with_cancellation_retry,
     _run_asset_pipeline,
     _run_blocking,
+    _scheduled_alpaca_reconciliation_is_due,
     _state_connection,
     _strategy_data_from_authoritative_histories,
     _terminal_alpaca_display_results,
@@ -1380,6 +1383,195 @@ publish("new")
                     "Generation\nprior-research\n",
                 )
 
+    def test_scheduled_reconciliation_idle_gate_preserves_reports_and_skips_workflow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.sqlite"
+            output_dir = Path(tmp) / "outputs"
+            output_dir.mkdir()
+            sentinel = output_dir / "alpaca_reconciliation_results.csv"
+            sentinel.write_text("Status\nprior-success\n", encoding="utf-8")
+            with closing(sqlite3.connect(db_path)) as conn, conn:
+                init_state_db(conn)
+                position_id = save_alpaca_managed_buy_order(
+                    conn,
+                    symbol="TQQQ",
+                    alpaca_asset_id="asset-tqqq",
+                    signal_symbol="QQQ",
+                    buy_rsi=30,
+                    profit_target_multiple=1.5,
+                    buy_signal_date="2026-01-02",
+                    buy_client_order_id="rsi-buy-TQQQ-idle",
+                    buy_alpaca_order_id="buy-idle",
+                    buy_submitted_at="2026-01-02T14:30:00Z",
+                    buy_status="filled",
+                    buy_order_qty=1,
+                    buy_order_limit_price=100,
+                )
+                mark_alpaca_managed_buy_filled(
+                    conn,
+                    position_id,
+                    buy_status="filled",
+                    filled_qty=1,
+                    filled_avg_price=100,
+                    filled_at="2026-01-02T14:31:00Z",
+                    target_sell_price=150,
+                )
+                conn.execute(
+                    "UPDATE alpaca_managed_positions SET closed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (position_id,),
+                )
+                position = load_alpaca_managed_positions(conn).iloc[0]
+                self.assertTrue(
+                    mark_alpaca_closed_correction_audited(
+                        conn,
+                        position_id,
+                        expected_state_revision=int(position["state_revision"]),
+                    )
+                )
+
+            with (
+                patch("leveraged_trader.workflow._initialize_state_db") as initialize,
+                patch("leveraged_trader.workflow._begin_alpaca_snapshot_publication") as begin_publication,
+                patch("leveraged_trader.workflow._reconcile_alpaca_managed_positions_for_db") as reconcile,
+                patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            ):
+                run_alpaca_reconciliation(
+                    db_path=str(db_path),
+                    alpaca_cfg=AlpacaOrderConfig(
+                        sell_enabled=True,
+                        api_key_id="paper-key",
+                        api_secret_key="paper-secret",
+                    ),
+                    output_dir=str(output_dir),
+                    no_color=True,
+                    closed_audit_min_interval_minutes=15,
+                )
+
+            initialize.assert_not_called()
+            begin_publication.assert_not_called()
+            reconcile.assert_not_called()
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "Status\nprior-success\n")
+
+    def test_scheduled_reconciliation_due_gate_tracks_active_unresolved_and_audit_age(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        init_state_db(conn)
+        position_id = save_alpaca_managed_buy_order(
+            conn,
+            symbol="TQQQ",
+            alpaca_asset_id="asset-tqqq",
+            signal_symbol="QQQ",
+            buy_rsi=30,
+            profit_target_multiple=1.5,
+            buy_signal_date="2026-01-02",
+            buy_client_order_id="rsi-buy-TQQQ-due-gate",
+            buy_alpaca_order_id="buy-due-gate",
+            buy_submitted_at="2026-01-02T14:30:00Z",
+            buy_status="filled",
+            buy_order_qty=1,
+            buy_order_limit_price=100,
+        )
+        mark_alpaca_managed_buy_filled(
+            conn,
+            position_id,
+            buy_status="filled",
+            filled_qty=1,
+            filled_avg_price=100,
+            filled_at="2026-01-02T14:31:00Z",
+            target_sell_price=150,
+        )
+
+        @contextmanager
+        def in_memory_probe(_db_path: str):
+            yield conn
+
+        with patch("leveraged_trader.workflow._read_only_state_connection", new=in_memory_probe):
+            self.assertTrue(
+                _scheduled_alpaca_reconciliation_is_due(
+                    "unused.sqlite",
+                    closed_audit_min_interval_minutes=15,
+                )
+            )
+            conn.execute(
+                "UPDATE alpaca_managed_positions SET closed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (position_id,),
+            )
+            conn.commit()
+            self.assertTrue(
+                _scheduled_alpaca_reconciliation_is_due(
+                    "unused.sqlite",
+                    closed_audit_min_interval_minutes=15,
+                )
+            )
+            position = load_alpaca_managed_positions(conn).iloc[0]
+            self.assertTrue(
+                mark_alpaca_closed_correction_audited(
+                    conn,
+                    position_id,
+                    expected_state_revision=int(position["state_revision"]),
+                )
+            )
+            self.assertFalse(
+                _scheduled_alpaca_reconciliation_is_due(
+                    "unused.sqlite",
+                    closed_audit_min_interval_minutes=15,
+                )
+            )
+            conn.execute(
+                "UPDATE alpaca_managed_positions "
+                "SET closed_correction_audited_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-15 minutes') "
+                "WHERE id = ?",
+                (position_id,),
+            )
+            conn.commit()
+            self.assertTrue(
+                _scheduled_alpaca_reconciliation_is_due(
+                    "unused.sqlite",
+                    closed_audit_min_interval_minutes=15,
+                )
+            )
+            conn.execute(
+                "UPDATE alpaca_managed_positions "
+                "SET buy_status = 'pending_cancel', "
+                "closed_correction_audited_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+                (position_id,),
+            )
+            conn.commit()
+            self.assertTrue(
+                _scheduled_alpaca_reconciliation_is_due(
+                    "unused.sqlite",
+                    closed_audit_min_interval_minutes=15,
+                )
+            )
+
+    def test_scheduled_reconciliation_due_gate_never_skips_unknown_state(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+
+        @contextmanager
+        def incomplete_probe(_db_path: str):
+            yield conn
+
+        with patch("leveraged_trader.workflow._read_only_state_connection", new=incomplete_probe):
+            self.assertTrue(
+                _scheduled_alpaca_reconciliation_is_due(
+                    "unused.sqlite",
+                    closed_audit_min_interval_minutes=15,
+                )
+            )
+        with (
+            patch(
+                "leveraged_trader.workflow._read_only_state_connection",
+                side_effect=OSError("database identity changed"),
+            ),
+            self.assertRaisesRegex(OSError, "identity changed"),
+        ):
+            _scheduled_alpaca_reconciliation_is_due(
+                "unused.sqlite",
+                closed_audit_min_interval_minutes=15,
+            )
+
     def test_historical_sell_cancellation_is_rechecked_once_after_broker_confirmation_delay(self) -> None:
         pending = pd.DataFrame(
             [
@@ -1404,10 +1596,13 @@ publish("new")
             ) as reconcile,
             patch("leveraged_trader.workflow.time.sleep") as sleep,
         ):
-            result = _reconcile_alpaca_managed_positions_with_cancellation_retry("state.sqlite", AlpacaOrderConfig())
+            result = _reconcile_alpaca_managed_positions_with_cancellation_retry(
+                "state.sqlite", AlpacaOrderConfig(), 15
+            )
 
         self.assertIs(result, recovered)
         self.assertEqual(reconcile.call_count, 2)
+        self.assertEqual([call.args[2] for call in reconcile.call_args_list], [15, 15])
         sleep.assert_called_once_with(10)
 
     def test_historical_sell_cancellation_retry_retains_unresolved_failure(self) -> None:
@@ -5415,7 +5610,13 @@ publish("new")
             self.assertEqual(result["Status"].tolist(), ["symbol_migrated"])
             self.assertIn("SATG to ECHX", result.loc[0, "Message"])
             self.assertEqual(mock_migrate.call_args.kwargs, {"include_closed": False})
-            self.assertEqual(mock_reconcile.call_args.kwargs, {"migrate_closed_symbols": True})
+            self.assertEqual(
+                mock_reconcile.call_args.kwargs,
+                {
+                    "migrate_closed_symbols": True,
+                    "closed_audit_min_interval_minutes": None,
+                },
+            )
 
             mock_migrate.side_effect = None
             mock_migrate.return_value = {}
