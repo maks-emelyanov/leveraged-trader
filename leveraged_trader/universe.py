@@ -176,6 +176,7 @@ _NASDAQ_ETF_MINIMUM_RAW_ROWS = 1_200
 _NASDAQ_ETF_MINIMUM_USABLE_ROWS = 1_000
 _NASDAQ_ETF_SCHEMA_CANDIDATE_MIN_ROWS = 100
 _LEVERAGE_SHARES_MINIMUM_PRODUCTS = 100
+_YIELDMAX_MINIMUM_PRODUCTS = 50
 _CLASSIC_JAVASCRIPT_MIME_TYPES = frozenset(
     {
         "application/ecmascript",
@@ -958,7 +959,7 @@ WORKFLOW_ISSUER_SOURCES = [
     ),
     UniverseSource(
         "YieldMax",
-        "https://yieldmaxetfs.com/our-etfs/",
+        "https://yieldmaxetfs.com/",
         "issuer_etf",
         parser="yieldmax_html",
     ),
@@ -7844,6 +7845,102 @@ def _linked_issuer_html_to_universe(
     return out.drop_duplicates(dedupe_columns).reset_index(drop=True)
 
 
+def _yieldmax_html_to_universe(
+    html: str,
+    source: UniverseSource,
+    *,
+    require_leveraged: bool,
+) -> pd.DataFrame:
+    """Parse YieldMax's complete linked tables or homepage fund cards."""
+    table_rows = _linked_issuer_html_to_universe(
+        html,
+        source,
+        require_leveraged=False,
+    )
+
+    try:
+        document = lxml_html.fromstring(html)
+    except (lxml_html.ParserError, TypeError, ValueError):
+        document = None
+
+    cards = []
+    source_rows: list[tuple[str, object, object]] = []
+    if document is not None:
+        class_token = './/*[contains(concat(" ", normalize-space(@class), " "), " {class_name} ")]'
+        cards = document.xpath(
+            'self::*[contains(concat(" ", normalize-space(@class), " "), " ym-fslider-card ")] | '
+            + class_token.format(class_name="ym-fslider-card")
+        )
+        for card_number, card in enumerate(cards):
+            row_label = f"homepage card {card_number}"
+            ticker_nodes = card.xpath(class_token.format(class_name="ym-fslider-ticker"))
+            name_nodes = card.xpath(class_token.format(class_name="ym-fslider-name"))
+            if len(ticker_nodes) != 1 or len(name_nodes) != 1:
+                raise ValueError(f"YieldMax issuer {row_label} must contain exactly one ticker and product name.")
+
+            fund_page_hrefs = []
+            for raw_href in card.xpath(".//a[@href]/@href"):
+                if not isinstance(raw_href, str):
+                    continue
+                try:
+                    path_parts = tuple(part for part in urlsplit(urljoin(source.url, raw_href)).path.split("/") if part)
+                except ValueError:
+                    continue
+                if len(path_parts) == 2 and path_parts[0] == "our-etfs":
+                    fund_page_hrefs.append(raw_href)
+            if len(fund_page_hrefs) != 1:
+                raise ValueError(f"YieldMax issuer {row_label} must contain exactly one product link.")
+
+            raw_symbol = _html_text(" ".join(ticker_nodes[0].itertext()))
+            product_href = fund_page_hrefs[0]
+            canonical_symbol = _canonical_linked_issuer_ticker(
+                raw_symbol,
+                product_href,
+                source,
+                row_label=row_label,
+            )
+            linked_symbol = _issuer_product_link_slug(
+                product_href,
+                source,
+                expected_path_prefix=("our-etfs",),
+                row_label=row_label,
+            )
+            if not isinstance(canonical_symbol, str) or linked_symbol.casefold() != canonical_symbol.casefold():
+                raise ValueError(f"YieldMax issuer {row_label} product link contradicted its displayed ticker.")
+            source_rows.append(
+                (
+                    row_label,
+                    canonical_symbol,
+                    _html_text(" ".join(name_nodes[0].itertext())),
+                )
+            )
+
+    validated_card_rows = _validated_structured_fund_rows(
+        source_rows,
+        source_description="YieldMax issuer homepage",
+    )
+    if cards and len(validated_card_rows) < _YIELDMAX_MINIMUM_PRODUCTS:
+        raise ValueError(
+            f"{source.name} complete product inventory exposed only {len(validated_card_rows)} homepage products; "
+            f"at least {_YIELDMAX_MINIMUM_PRODUCTS} are required."
+        )
+    card_rows = _fund_rows_to_universe(
+        validated_card_rows,
+        source.name,
+        source_label=f"{source.name} issuer table",
+        require_leveraged=False,
+    )
+    frames = [frame for frame in (table_rows, card_rows) if not frame.empty]
+    if not frames:
+        return pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+
+    out = pd.concat(frames, ignore_index=True, sort=False)
+    if require_leveraged:
+        out = out.loc[out["name"].map(leveraged_name_filter).astype(bool)].copy()
+    dedupe_columns = "symbol" if require_leveraged else ["symbol", "name"]
+    return out.drop_duplicates(dedupe_columns).reset_index(drop=True)
+
+
 def _workflow_issuer_source_to_universe(
     content: str,
     source: UniverseSource,
@@ -7866,7 +7963,9 @@ def _workflow_issuer_source_to_universe(
         return _tradr_html_to_universe(content, source, require_leveraged=require_leveraged)
     if source.parser == "volatilityshares_html":
         return _volatilityshares_html_to_universe(content, source, require_leveraged=require_leveraged)
-    if source.parser in {"innovator_html", "yieldmax_html"}:
+    if source.parser == "yieldmax_html":
+        return _yieldmax_html_to_universe(content, source, require_leveraged=require_leveraged)
+    if source.parser == "innovator_html":
         return _linked_issuer_html_to_universe(content, source, require_leveraged=require_leveraged)
     return _html_source_to_universe(
         content,

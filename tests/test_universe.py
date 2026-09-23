@@ -55,6 +55,7 @@ from leveraged_trader.universe import (
     _with_audit_metadata,
     _workflow_candidates,
     _workflow_issuer_source_to_universe,
+    _yieldmax_html_to_universe,
     build_nasdaq_universe_table,
     build_universe_audit_report,
     determine_workflow_asset_groups,
@@ -2586,7 +2587,7 @@ class UniverseTests(unittest.TestCase):
         self.assertEqual(issuer_sources["Leverage Shares"].parser, "leverage_shares_html")
         self.assertIn("/all-etfs/", issuer_sources["Leverage Shares"].url)
         self.assertEqual(issuer_sources["YieldMax"].parser, "yieldmax_html")
-        self.assertEqual(issuer_sources["YieldMax"].url, "https://yieldmaxetfs.com/our-etfs/")
+        self.assertEqual(issuer_sources["YieldMax"].url, "https://yieldmaxetfs.com/")
         self.assertIn("cboe.com", issuer_sources["REX Shares"].url)
 
     def test_etn_sources_are_registered(self) -> None:
@@ -3945,6 +3946,111 @@ class UniverseTests(unittest.TestCase):
             """
             with self.subTest(ticker_cell=ticker_cell), self.assertRaises(ValueError):
                 _workflow_issuer_source_to_universe(html, source, require_leveraged=False)
+
+    def test_yieldmax_parser_reads_link_verified_homepage_cards(self) -> None:
+        source = UniverseSource(
+            "YieldMax",
+            "https://yieldmaxetfs.com/",
+            source_type="issuer_etf",
+            parser="yieldmax_html",
+        )
+        html = """
+            <div class="ym-fslider-card">
+                <div class="ym-fslider-front-text">
+                    <span class="ym-fslider-ticker">YMAX</span>
+                    <span class="ym-fslider-name">YieldMax Universe Fund of Option Income ETFs</span>
+                </div>
+                <a href="https://yieldmaxetfs.com/our-etfs/ymax/">FUND PAGE</a>
+                <a href="/ymax/prospectus">PROSPECTUS</a>
+            </div>
+            <div class="ym-fslider-card">
+                <div class="ym-fslider-front-text">
+                    <span class="ym-fslider-ticker">NVDY</span>
+                    <span class="ym-fslider-name">YieldMax NVDA Option Income Strategy ETF</span>
+                </div>
+                <a href="/our-etfs/nvdy/">FUND PAGE</a>
+            </div>
+        """
+
+        with patch("leveraged_trader.universe._YIELDMAX_MINIMUM_PRODUCTS", 2):
+            out = _yieldmax_html_to_universe(html, source, require_leveraged=False)
+
+        self.assertEqual(out["symbol"].tolist(), ["YMAX", "NVDY"])
+        self.assertEqual(
+            out["name"].tolist(),
+            [
+                "YieldMax Universe Fund of Option Income ETFs",
+                "YieldMax NVDA Option Income Strategy ETF",
+            ],
+        )
+
+    def test_yieldmax_homepage_parser_rejects_partial_product_inventory(self) -> None:
+        source = UniverseSource(
+            "YieldMax",
+            "https://yieldmaxetfs.com/",
+            source_type="issuer_etf",
+            parser="yieldmax_html",
+        )
+        html = """
+            <div class="ym-fslider-card">
+                <span class="ym-fslider-ticker">YMAX</span>
+                <span class="ym-fslider-name">YieldMax Universe Fund of Option Income ETFs</span>
+                <a href="/our-etfs/ymax/">FUND PAGE</a>
+            </div>
+        """
+
+        with self.assertRaisesRegex(ValueError, "complete product inventory"):
+            _yieldmax_html_to_universe(html, source, require_leveraged=False)
+
+    def test_yieldmax_homepage_parser_rejects_ticker_link_mismatch(self) -> None:
+        source = UniverseSource(
+            "YieldMax",
+            "https://yieldmaxetfs.com/",
+            source_type="issuer_etf",
+            parser="yieldmax_html",
+        )
+        html = """
+            <div class="ym-fslider-card">
+                <div class="ym-fslider-front-text">
+                    <span class="ym-fslider-ticker">YMAX</span>
+                    <span class="ym-fslider-name">YieldMax Universe Fund of Option Income ETFs</span>
+                </div>
+                <a href="https://yieldmaxetfs.com/our-etfs/nvdy/">FUND PAGE</a>
+            </div>
+        """
+
+        with self.assertRaisesRegex(ValueError, "contradicted its displayed ticker"):
+            _yieldmax_html_to_universe(html, source, require_leveraged=False)
+
+    def test_yieldmax_homepage_parser_rejects_missing_or_external_product_link(self) -> None:
+        source = UniverseSource(
+            "YieldMax",
+            "https://yieldmaxetfs.com/",
+            source_type="issuer_etf",
+            parser="yieldmax_html",
+        )
+        invalid_links = (
+            "",
+            '<a href="https://attacker.test/our-etfs/ymax/">FUND PAGE</a>',
+        )
+        for product_link in invalid_links:
+            html = f"""
+                <div class="ym-fslider-card">
+                    <div class="ym-fslider-front-text">
+                        <span class="ym-fslider-ticker">YMAX</span>
+                        <span class="ym-fslider-name">YieldMax Universe Fund of Option Income ETFs</span>
+                    </div>
+                    {product_link}
+                </div>
+            """
+            with (
+                self.subTest(product_link=product_link),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "product link",
+                ),
+            ):
+                _yieldmax_html_to_universe(html, source, require_leveraged=False)
 
     def test_defiance_json_parser_rejects_any_malformed_structured_record(self) -> None:
         source = UniverseSource(
