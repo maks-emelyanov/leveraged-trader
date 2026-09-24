@@ -259,10 +259,11 @@ due even when validation finishes during 8:46. The gate runs:
 After updating an existing scheduled installation, rerun `./scripts/cron/install-crontab` to
 publish the updated authenticated launcher before relying on the new cadence.
 
-In full and reconciliation-only workflows, historical-sell cancellations receive one retry after
-10 seconds when they are the only failures requiring protection or fill-accounting correction.
-Successful actions for other positions do not prevent the retry, which repeats the complete
-protective check with fresh broker observations. The final audit retains completed first-pass actions
+In full and reconciliation-only workflows, managed-sell replacements and aged-order renewals whose
+only blocker is asynchronous broker cancellation receive one retry after 30 seconds. Successful actions
+for other positions do not prevent the retry, which repeats the complete protective check with fresh
+broker observations. The retry retains the scheduler execution lock, so a next-minute invocation skips
+instead of overlapping it. The final audit retains completed first-pass actions
 marked as initial reconciliation. An unresolved or interrupted retry still fails and publishes the
 initial observations alongside the failure diagnostics.
 

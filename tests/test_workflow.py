@@ -1603,7 +1603,7 @@ publish("new")
         self.assertIs(result, recovered)
         self.assertEqual(reconcile.call_count, 2)
         self.assertEqual([call.args[2] for call in reconcile.call_args_list], [15, 15])
-        sleep.assert_called_once_with(10)
+        sleep.assert_called_once_with(30)
 
     def test_historical_sell_cancellation_retry_retains_unresolved_failure(self) -> None:
         pending = pd.DataFrame(
@@ -1635,7 +1635,7 @@ publish("new")
         self.assertTrue(raised.exception.results.loc[0, "Message"].startswith("Initial reconciliation"))
         self.assertEqual(raised.exception.results.loc[1, "Message"], pending.loc[0, "Message"])
         self.assertEqual(reconcile.call_count, 2)
-        sleep.assert_called_once_with(10)
+        sleep.assert_called_once_with(30)
 
     def test_historical_cancellation_retry_retains_migration_and_completed_actions(self) -> None:
         pending = pd.DataFrame(
@@ -1686,7 +1686,7 @@ publish("new")
         self.assertTrue(result.iloc[:-1]["Message"].str.startswith("Initial reconciliation").all())
         self.assertEqual(result.iloc[-1]["Message"], "protected")
         self.assertEqual(reconcile.call_count, 2)
-        sleep.assert_called_once_with(10)
+        sleep.assert_called_once_with(30)
 
     def test_historical_cancellation_retry_preserves_first_audit_after_unexpected_failure(self) -> None:
         pending = pd.DataFrame(

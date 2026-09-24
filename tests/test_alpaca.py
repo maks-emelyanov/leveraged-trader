@@ -35418,15 +35418,50 @@ class AlpacaTests(unittest.TestCase):
         self.assertTrue(pd.isna(managed["closed_at"]))
         mock_post.assert_not_called()
 
-    def test_historical_cancellation_retry_uses_required_failures_before_public_redaction(self) -> None:
-        for filled_failure, systemic_failure in ((False, False), (True, False), (False, True)):
-            with self.subTest(filled_failure=filled_failure, systemic_failure=systemic_failure):
+    def test_sell_cancellation_retry_uses_required_failures_before_public_redaction(self) -> None:
+        historical_message = (
+            "final managed-sell submission blocked: historical managed sell exposure is still executable; "
+            "historical exposure cancellation requires confirmation: sell-old"
+        )
+        replacement_message = "managed GTC sell replacement requested; awaiting Alpaca cancellation confirmation"
+        cases = (
+            (historical_message, "historical", False, False),
+            (historical_message, "historical", True, False),
+            (historical_message, "historical", False, True),
+            (replacement_message, "awaiting", False, False),
+            (
+                "managed GTC sell expires soon; cancellation requested and replacement will be submitted after "
+                "Alpaca confirms cancellation",
+                "expires",
+                False,
+                False,
+            ),
+            (
+                "managed GTC sell cancellation is pending; replacement not submitted yet",
+                "pending",
+                False,
+                False,
+            ),
+            (
+                "managed GTC sell cancellation is still pending after retry; replacement not submitted yet",
+                "still",
+                False,
+                False,
+            ),
+        )
+        for cancellation_message, credential, filled_failure, systemic_failure in cases:
+            with self.subTest(
+                cancellation_message=cancellation_message,
+                filled_failure=filled_failure,
+                systemic_failure=systemic_failure,
+            ):
                 cfg = self.cfg(buy=True, sell=True)
-                cfg.api_secret_key = "historical"
+                cfg.api_secret_key = credential
 
                 def append_reconciliation_outcomes(
                     *,
                     rows: list[dict],
+                    cancellation_message: str = cancellation_message,
                     filled_failure: bool = filled_failure,
                     systemic_failure: bool = systemic_failure,
                     **_kwargs: object,
@@ -35435,8 +35470,7 @@ class AlpacaTests(unittest.TestCase):
                         (
                             "sell",
                             "pending_cancel",
-                            "final managed-sell submission blocked: historical managed sell exposure is still "
-                            "executable; historical exposure cancellation requires confirmation: sell-old",
+                            cancellation_message,
                             True,
                         ),
                         ("sell", "accepted_for_bidding", "managed sell already submitted", False),
@@ -35483,7 +35517,7 @@ class AlpacaTests(unittest.TestCase):
                     raised.exception.retryable_historical_cancellation,
                     not filled_failure and not systemic_failure,
                 )
-                self.assertNotIn("historical", raised.exception.results.loc[0, "Message"])
+                self.assertNotIn(credential, raised.exception.results.loc[0, "Message"])
                 self.assertIn("[redacted credential]", raised.exception.results.loc[0, "Message"])
 
     @patch("leveraged_trader.alpaca.requests.delete")

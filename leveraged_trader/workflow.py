@@ -113,6 +113,7 @@ DEFAULT_WORKFLOW_CONCURRENCY = 4
 MARKET_DATA_BATCH_SIZE = 32
 SIGNAL_HISTORY_RECOVERY_MIN_LOOKBACK_DAYS = 366
 SQLITE_BUSY_TIMEOUT_MS = 60_000
+_ALPACA_SELL_CANCELLATION_RETRY_DELAY_SECONDS = 30
 _MONOTONIC_CLOCK = time.monotonic
 _WALL_CLOCK = time.time
 LONG_WORKFLOW_LABEL = "Long"
@@ -2993,10 +2994,13 @@ def _reconcile_alpaca_managed_positions_with_cancellation_retry(
 
     # A broker cancellation is asynchronous. The first pass has durably fenced
     # the old sell, and the next pass repeats every identity, quantity, and
-    # exposure check before it can submit a replacement. Keep the wait bounded
-    # so an unresolved cancellation still produces the usual failure audit.
+    # exposure check before it can submit a replacement. Thirty seconds gives
+    # Alpaca ordinary cancellation latency time to settle while keeping the
+    # wait bounded so an unresolved cancellation still produces the usual
+    # failure audit. The scheduler lock makes the next minute a harmless skip
+    # when this retry spans that boundary.
     try:
-        time.sleep(10)
+        time.sleep(_ALPACA_SELL_CANCELLATION_RETRY_DELAY_SECONDS)
         retry_results = _reconcile_alpaca_managed_positions_for_db_impl(
             db_path,
             alpaca_cfg,

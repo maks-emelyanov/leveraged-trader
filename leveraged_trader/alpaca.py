@@ -151,6 +151,14 @@ _LEGACY_FINAL_SELL_HISTORICAL_CANCEL_DIAGNOSTIC = (
     "final managed-sell submission blocked: historical managed sell exposure is still executable; "
     "historical exposure cancellation requires confirmation:"
 )
+_RETRYABLE_SELL_CANCELLATION_DIAGNOSTIC_PREFIXES = (
+    _LEGACY_FINAL_SELL_HISTORICAL_CANCEL_DIAGNOSTIC,
+    "managed GTC sell replacement requested; awaiting Alpaca cancellation confirmation",
+    "managed GTC sell expires soon; cancellation requested and replacement will be submitted after Alpaca "
+    "confirms cancellation",
+    "managed GTC sell cancellation is pending; replacement not submitted yet",
+    "managed GTC sell cancellation is still pending after retry; replacement not submitted yet",
+)
 _ORDER_MAY_BE_ACTIVE_STATUSES = {
     *SELL_RENEWABLE_STATUSES,
     *SELL_CANCEL_PENDING_STATUSES,
@@ -18376,11 +18384,19 @@ def _reconcile_alpaca_managed_positions_pass(
         )
     if required_failure_rows.any():
         required_results = raw_result.loc[required_failure_rows]
-        retryable_historical_cancellation = not systemic_position_ids and (
-            required_results["Action"].eq("sell")
-            & required_results["Status"].eq("pending_cancel")
-            & required_results["Message"].str.startswith(_LEGACY_FINAL_SELL_HISTORICAL_CANCEL_DIAGNOSTIC)
-        ).all()
+        # Keep the historical public flag name for compatibility, but also
+        # use it for ordinary managed-sell replacement and renewal
+        # cancellations that are waiting only on Alpaca confirmation.
+        retryable_historical_cancellation = (
+            not systemic_position_ids
+            and (
+                required_results["Action"].eq("sell")
+                & required_results["Status"].eq("pending_cancel")
+                & required_results["Message"]
+                .fillna("")
+                .str.startswith(_RETRYABLE_SELL_CANCELLATION_DIAGNOSTIC_PREFIXES)
+            ).all()
+        )
         raise AlpacaReconciliationError(
             "one or more Alpaca managed positions could not confirm required protective reconciliation",
             result,
