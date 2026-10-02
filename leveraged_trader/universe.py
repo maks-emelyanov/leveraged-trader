@@ -12,7 +12,7 @@ import time
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from html import unescape
 from unittest.mock import Mock
 from urllib.parse import urljoin, urlsplit
@@ -27,6 +27,7 @@ from ._http_deadline_worker import response_from_http_worker_payload, run_http_r
 from .config import ETF_DEFS_URL, UniverseConfig
 from .output import safe_diagnostic_text
 from .storage import save_table_to_sqlite
+from .universe_lifecycle import split_closed_products
 
 NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
 OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
@@ -929,7 +930,7 @@ WORKFLOW_ISSUER_SOURCES = [
         parser="innovator_html",
     ),
     UniverseSource("Tuttle Capital", "https://www.tuttlecap.com/etfs", "issuer_etf"),
-    UniverseSource("Tradr", "https://www.tradretfs.com/", "issuer_etf", parser="tradr_html"),
+    UniverseSource("Tradr", "https://www.tradretfs.com/etfs", "issuer_etf", parser="tradr_html"),
     UniverseSource(
         "REX Shares",
         "https://www.cboe.com/us/equities/listings/listed_products/issuer_detail/TRXE/",
@@ -7316,7 +7317,27 @@ def _tradr_html_to_universe(
     *,
     require_leveraged: bool = True,
 ) -> pd.DataFrame:
-    """Parse Tradr's current product tables without accepting its stale legacy table."""
+    """Parse Tradr's current inventory without merging retired homepage modules."""
+    try:
+        document = lxml_html.fromstring(html)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Tradr issuer response was not parseable HTML.") from exc
+    current_inventories = document.xpath(
+        'descendant-or-self::*[contains(concat(" ", normalize-space(@class), " "), '
+        '" table_with_filter_global_section ")]'
+    )
+    if current_inventories:
+        if len(current_inventories) != 1:
+            raise ValueError("Tradr issuer response contained ambiguous current product inventories.")
+        # The homepage retains an obsolete set_you_trade_section with the same
+        # columns as the current inventory. Both modules can be hidden by CSS,
+        # so presentation visibility does not identify the authoritative feed.
+        # The dedicated /etfs page uses this same global inventory module.
+        html = lxml_html.tostring(current_inventories[0], encoding="unicode")
+    elif document.xpath(
+        'descendant-or-self::*[contains(concat(" ", normalize-space(@class), " "), " set_you_trade_section ")]'
+    ):
+        raise ValueError("Tradr issuer response omitted its current product inventory.")
     _validate_tradr_table_row_widths(html)
     source_rows: list[tuple[str, object, object]] = []
     references_by_symbol: dict[str, set[str]] = {}
@@ -7387,6 +7408,8 @@ def _tradr_html_to_universe(
                 raise ValueError(f"Tradr issuer table {row_label} Reset Period contradicted its product name.")
             source_rows.append((row_label, raw_symbol, name))
 
+    if current_inventories and not source_rows:
+        raise ValueError("Tradr current product inventory did not contain any authoritative product rows.")
     rows = _validated_structured_fund_rows(
         source_rows,
         source_description="Tradr issuer table",
@@ -7420,12 +7443,38 @@ def _volatilityshares_html_to_universe(
         full_name = name if name.upper().endswith(" ETF") else f"{name} ETF"
         rows.append({"symbol": match.group("symbol"), "name": full_name})
 
-    return _fund_rows_to_universe(
+    out = _fund_rows_to_universe(
         rows,
         source.name,
         source_label=f"{source.name} issuer table",
         require_leveraged=require_leveraged,
     )
+
+    # The issuer groups short names such as "2x Anthropic ETF" beneath
+    # "2x Single Stock" headings. The name alone cannot distinguish these
+    # products from baskets, so retain that category for RSI mapping review.
+    # Navigation and main content can repeat a product; enrich all occurrences
+    # from the category evidence rather than depending on their page order.
+    try:
+        document = lxml_html.fromstring(html)
+    except (lxml_html.ParserError, TypeError, ValueError):
+        return out
+    single_stock_symbols: set[str] = set()
+    for ticker_node in document.xpath("//h4"):
+        for ancestor in ticker_node.iterancestors():
+            category_headings = ancestor.xpath("./h3")
+            if not category_headings:
+                continue
+            if len(category_headings) == 1 and re.search(
+                r"\bSINGLE[\s-]+STOCK\b",
+                _normalized_fund_name(_html_text(category_headings[0].text_content())),
+            ):
+                symbol = normalize_yahoo_symbol(_html_text(ticker_node.text_content()))
+                if symbol is not None:
+                    single_stock_symbols.add(symbol)
+            break
+    out.loc[out["symbol"].isin(single_stock_symbols), "fund_type"] = "ETF (Single Stock)"
+    return out
 
 
 def _issuer_table_to_universe(table: pd.DataFrame, issuer: str) -> pd.DataFrame:
@@ -8174,7 +8223,27 @@ def _classification_conflict_error(conflicting_symbols: list[str]) -> str:
 
 _WORKFLOW_SYMBOL_SOURCES_ATTR = "workflow_symbol_sources"
 _WORKFLOW_CANONICAL_ROWS_ATTR = "workflow_canonical_product_rows"
+_WORKFLOW_CLOSED_ROWS_ATTR = "workflow_closed_product_rows"
 _WORKFLOW_SOURCE_STATUS_INDEX_COLUMN = "_workflow_source_status_index"
+
+
+def _split_closed_workflow_products(
+    products: pd.DataFrame,
+    *,
+    as_of: date,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Filter visible and canonical rows before cross-source identity checks."""
+    current, inactive = split_closed_products(products, as_of=as_of)
+    canonical_records = products.attrs.get(_WORKFLOW_CANONICAL_ROWS_ATTR)
+    if isinstance(canonical_records, list):
+        canonical = pd.DataFrame.from_records(canonical_records) if canonical_records else products.iloc[0:0].copy()
+        canonical, inactive = split_closed_products(canonical, as_of=as_of)
+        current.attrs[_WORKFLOW_CANONICAL_ROWS_ATTR] = canonical.to_dict("records")
+    previous_inactive = products.attrs.get(_WORKFLOW_CLOSED_ROWS_ATTR, [])
+    if previous_inactive:
+        inactive = pd.concat([pd.DataFrame.from_records(previous_inactive), inactive], ignore_index=True, sort=False)
+    current.attrs.pop(_WORKFLOW_CLOSED_ROWS_ATTR, None)
+    return current, inactive.drop_duplicates("symbol").reset_index(drop=True)
 
 
 def _cross_source_classification_conflict_error(conflicting_symbols: list[str]) -> str:
@@ -8337,6 +8406,8 @@ def _workflow_etn_source_to_universe(content: str, source: UniverseSource) -> pd
 def load_issuer_etf_universe(timeout: int = 30) -> pd.DataFrame:
     timeout = _validated_universe_request_timeout(timeout)
     rows: list[tuple[int, UniverseSource, pd.DataFrame]] = []
+    inactive_rows: list[pd.DataFrame] = []
+    lifecycle_as_of = _nasdaq_directory_now().date()
     status_rows = []
     sources = [_workflow_issuer_source(raw_source) for raw_source in ISSUER_UNIVERSE_SOURCES]
     fetch_results = _fetch_enabled_sources(sources, timeout)
@@ -8374,7 +8445,8 @@ def load_issuer_etf_universe(timeout: int = 30) -> pd.DataFrame:
                 source,
                 require_leveraged=False,
             )
-            issuer_rows, conflicting_symbols = _leveraged_product_rows(parsed_rows)
+            current_rows, inactive = split_closed_products(parsed_rows, as_of=lifecycle_as_of)
+            issuer_rows, conflicting_symbols = _leveraged_product_rows(current_rows)
         except Exception as exc:
             status_rows.append(
                 _workflow_source_status_row(
@@ -8391,8 +8463,9 @@ def load_issuer_etf_universe(timeout: int = 30) -> pd.DataFrame:
             status = "parse_error"
             error = _classification_conflict_error(conflicting_symbols)
         status_index = len(status_rows)
-        if not parsed_rows.empty:
-            rows.append((status_index, source, parsed_rows))
+        if not current_rows.empty:
+            rows.append((status_index, source, current_rows))
+        inactive_rows.append(inactive)
         status_rows.append(
             _workflow_source_status_row(
                 source=source.name,
@@ -8407,12 +8480,17 @@ def load_issuer_etf_universe(timeout: int = 30) -> pd.DataFrame:
 
     out = _resolve_workflow_source_product_rows(rows, status_rows)
     out.attrs["workflow_source_status"] = status_rows
+    out.attrs[_WORKFLOW_CLOSED_ROWS_ATTR] = (
+        pd.concat(inactive_rows, ignore_index=True, sort=False).to_dict("records") if inactive_rows else []
+    )
     return out
 
 
 def load_etn_universe(timeout: int = 30) -> pd.DataFrame:
     timeout = _validated_universe_request_timeout(timeout)
     rows: list[tuple[int, UniverseSource, pd.DataFrame]] = []
+    inactive_rows: list[pd.DataFrame] = []
+    lifecycle_as_of = _nasdaq_directory_now().date()
     status_rows = []
     sources = list(WORKFLOW_ETN_SOURCES)
     fetch_results = _fetch_enabled_sources(sources, timeout)
@@ -8443,7 +8521,8 @@ def load_etn_universe(timeout: int = 30) -> pd.DataFrame:
             continue
         try:
             parsed_rows = _workflow_etn_source_to_universe(fetch_result.text or "", source)
-            source_rows, conflicting_symbols = _leveraged_product_rows(parsed_rows)
+            current_rows, inactive = split_closed_products(parsed_rows, as_of=lifecycle_as_of)
+            source_rows, conflicting_symbols = _leveraged_product_rows(current_rows)
         except Exception as exc:
             status_rows.append(
                 _workflow_source_status_row(
@@ -8460,8 +8539,9 @@ def load_etn_universe(timeout: int = 30) -> pd.DataFrame:
             status = "parse_error"
             error = _classification_conflict_error(conflicting_symbols)
         status_index = len(status_rows)
-        if not parsed_rows.empty:
-            rows.append((status_index, source, parsed_rows))
+        if not current_rows.empty:
+            rows.append((status_index, source, current_rows))
+        inactive_rows.append(inactive)
         status_rows.append(
             _workflow_source_status_row(
                 source=source.name,
@@ -8476,6 +8556,9 @@ def load_etn_universe(timeout: int = 30) -> pd.DataFrame:
 
     out = _resolve_workflow_source_product_rows(rows, status_rows)
     out.attrs["workflow_source_status"] = status_rows
+    out.attrs[_WORKFLOW_CLOSED_ROWS_ATTR] = (
+        pd.concat(inactive_rows, ignore_index=True, sort=False).to_dict("records") if inactive_rows else []
+    )
     return out
 
 
@@ -9143,6 +9226,13 @@ def determine_workflow_asset_groups(cfg: UniverseConfig) -> dict[str, pd.DataFra
         [nasdaq_source_status, _workflow_source_status(issuer_df), _workflow_source_status(etn_df)],
         ignore_index=True,
     )
+    lifecycle_as_of = _nasdaq_directory_now().date()
+    nasdaq_df, inactive_primary = _split_closed_workflow_products(nasdaq_df, as_of=lifecycle_as_of)
+    issuer_df, inactive_issuer = _split_closed_workflow_products(issuer_df, as_of=lifecycle_as_of)
+    etn_df, inactive_etn = _split_closed_workflow_products(etn_df, as_of=lifecycle_as_of)
+    inactive_discovered = pd.concat([inactive_issuer, inactive_etn], ignore_index=True, sort=False).drop_duplicates(
+        "symbol"
+    )
     nasdaq_df, discovered_df, workflow_source_status = _resolve_discovered_product_rows(
         nasdaq_df,
         issuer_df,
@@ -9202,13 +9292,12 @@ def determine_workflow_asset_groups(cfg: UniverseConfig) -> dict[str, pd.DataFra
                 ignore_index=True,
             )
             active_listing_failures = active_listing_status[active_listing_status["status"].ne("loaded")].copy()
-    inactive_primary = pd.DataFrame(columns=[*nasdaq_df.columns, "inactive_source", "inactive_reason"])
-    inactive_discovered = pd.DataFrame(columns=[*discovered_df.columns, "inactive_source", "inactive_reason"])
     if active_symbol_set and active_listing_complete:
         primary_is_active = nasdaq_df["symbol"].astype(str).str.upper().isin(active_symbol_set)
-        inactive_primary = nasdaq_df.loc[~primary_is_active].copy()
-        inactive_primary["inactive_source"] = "primary_nasdaq"
-        inactive_primary["inactive_reason"] = "not present in active Nasdaq symbol files"
+        unlisted_primary = nasdaq_df.loc[~primary_is_active].copy()
+        unlisted_primary["inactive_source"] = "primary_nasdaq"
+        unlisted_primary["inactive_reason"] = "not present in active Nasdaq symbol files"
+        inactive_primary = pd.concat([inactive_primary, unlisted_primary], ignore_index=True)
         nasdaq_df = nasdaq_df.loc[primary_is_active].copy()
         # The active directories can corroborate discovered issuer products,
         # but their absence cannot prove an issuer-only symbol inactive. A

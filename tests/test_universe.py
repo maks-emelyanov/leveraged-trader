@@ -5858,6 +5858,73 @@ class UniverseTests(unittest.TestCase):
 
         self.assertEqual(out["symbol"].tolist(), ["BITX"])
 
+    def test_volatilityshares_single_stock_category_requires_resolved_rsi_mapping(self) -> None:
+        source = UniverseSource(
+            "Volatility Shares",
+            "https://example.test",
+            source_type="issuer_etf",
+            parser="volatilityshares_html",
+        )
+        html = """
+            <nav><li><a href="/athx"><h4>ATHX</h4><p>2x Anthropic ETF</p></a></li></nav>
+            <div class="row">
+                <div class="etf-categories">
+                    <h3><a href="/etf/category/2x-SingleStock">2x Single Stock</a></h3>
+                    <ul>
+                        <li><a href="/athx"><h4>ATHX</h4><p>2x Anthropic ETF</p></a></li>
+                        <li><a href="/aapz"><h4>AAPZ</h4><p>2x Long AAPL Daily ETF</p></a></li>
+                    </ul>
+                </div>
+                <div class="etf-categories">
+                    <h3>2x Crypto-Linked</h3>
+                    <ul><li><a href="/bitx"><h4>BITX</h4><p>2x Bitcoin ETF</p></a></li></ul>
+                </div>
+                <div class="etf-categories">
+                    <h3>Other</h3>
+                    <ul><li><a href="/bask"><h4>BASK</h4><p>2x Mixed Assets ETF</p></a></li></ul>
+                </div>
+            </div>
+        """
+        issuer_rows = _volatilityshares_html_to_universe(html, source)
+        self.assertEqual(issuer_rows["symbol"].tolist().count("ATHX"), 1)
+        fund_types = issuer_rows.set_index("symbol")["fund_type"].to_dict()
+        self.assertEqual(fund_types["ATHX"], "ETF (Single Stock)")
+        self.assertEqual(fund_types["AAPZ"], "ETF (Single Stock)")
+        self.assertEqual(fund_types["BITX"], "ETF (Volatility Shares)")
+        self.assertEqual(fund_types["BASK"], "ETF (Volatility Shares)")
+
+        nasdaq_rows = pd.DataFrame(
+            [{"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "fund_type": "ETF"}]
+        )
+        empty_rows = pd.DataFrame(columns=["symbol", "name", "fund_type", "source"])
+        with (
+            patch("leveraged_trader.universe.load_current_etf_universe", return_value=nasdaq_rows),
+            patch("leveraged_trader.universe.load_issuer_etf_universe", return_value=issuer_rows),
+            patch("leveraged_trader.universe.load_etn_universe", return_value=empty_rows),
+            patch(
+                "leveraged_trader.universe.load_active_listed_symbols",
+                return_value={"AAPL", "AAPZ", "ATHX", "BASK", "BITX", "QQQ", "TQQQ"},
+            ),
+            patch(
+                "leveraged_trader.universe.load_audit_universe_sources",
+                return_value=(pd.DataFrame(), pd.DataFrame()),
+            ),
+            patch("leveraged_trader.universe.save_table_to_sqlite") as mock_save_table,
+        ):
+            assets = determine_workflow_assets(UniverseConfig(sqlite_db_path="state.sqlite"))
+
+        self.assertEqual(assets["symbol"].tolist(), ["AAPZ", "BASK", "BITX", "TQQQ"])
+        self.assertEqual(assets.set_index("symbol").loc["AAPZ", "rsi_symbol"], "AAPL")
+        self.assertEqual(assets.set_index("symbol").loc["BITX", "rsi_symbol"], "BTC-USD")
+        self.assertEqual(assets.set_index("symbol").loc["BASK", "confidence"], "fallback_to_self")
+        review_call = next(
+            call for call in mock_save_table.call_args_list if call.args[2] == "universe_rsi_mapping_review"
+        )
+        review = review_call.args[0]
+        self.assertEqual(review["symbol"].tolist(), ["ATHX"])
+        self.assertEqual(review["mapping_source"].tolist(), ["unresolved_single_stock"])
+        self.assertEqual(review["confidence"].tolist(), ["needs_review"])
+
     def test_issuer_table_parser_rejects_entire_candidate_with_a_malformed_row(self) -> None:
         malformed_rows = [
             {"Ticker": float("nan"), "Fund Name": "Missing Symbol 2X Long ETF"},

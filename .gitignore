@@ -69,6 +69,13 @@ alpaca_reconciliation_results.csv
 alpaca_order_results.csv
 alpaca_sell_order_results.csv
 alpaca_snapshot_manifest.csv
+# Dashboard account exports, including browser duplicate downloads.
+alpaca-trades.csv
+alpaca-trades ([0-9]*).csv
+alpaca-positions.csv
+alpaca-positions ([0-9]*).csv
+alpaca-orders.csv
+alpaca-orders ([0-9]*).csv
 # Interrupted atomic report publications can retain complete broker/account CSV data.
 .*.csv.*.tmp
 .*.csv.*.tmp.anchor

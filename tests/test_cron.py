@@ -3295,6 +3295,84 @@ def test_import_validation_rejects_unsupported_pth_startup_code(
     assert expected_message in result.stderr
 
 
+@pytest.mark.parametrize(
+    ("hook_variant", "expected_message"),
+    [
+        ("stock", None),
+        ("appended-code", "unsupported executable directive"),
+        ("prepended-code", "unsupported executable directive"),
+        ("renamed-hook", "unsupported executable directive"),
+        ("extra-line", "unsupported executable directive"),
+        ("missing-package-init", "setuptools distutils import hook"),
+        ("writable-package-init", "project site-packages tree"),
+        ("writable-package-directory", "project site-packages tree"),
+        ("symlink-package-init", "project site-packages tree"),
+    ],
+)
+def test_import_validation_limits_setuptools_hook_without_executing_it(
+    tmp_path: Path,
+    hook_variant: str,
+    expected_message: str | None,
+) -> None:
+    repo_dir = tmp_path / "repo"
+    project_environment = repo_dir / ".venv"
+    site_packages = project_environment / "lib" / "python3.12" / "site-packages"
+    trader_package = site_packages / "leveraged_trader"
+    trader_package.mkdir(parents=True)
+    (trader_package / "__init__.py").write_text("", encoding="utf-8")
+    (project_environment / "pyvenv.cfg").write_text(
+        "include-system-site-packages = false\n",
+        encoding="utf-8",
+    )
+    hook_marker = tmp_path / "hook-executed"
+    hook_package = site_packages / "_distutils_hack"
+    hook_package.mkdir()
+    hook_init = hook_package / "__init__.py"
+    hook_init.write_text(
+        f"from pathlib import Path\nPath({str(hook_marker)!r}).touch()\n"
+        "raise RuntimeError('Validation must never import the setuptools hook')\n",
+        encoding="utf-8",
+    )
+    directive = (
+        "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; "
+        "enabled = os.environ.get(var, 'local') == 'local'; "
+        "enabled and __import__('_distutils_hack').add_shim(); "
+    )
+    pth_name = "distutils-precedence.pth"
+    unexpected_code = f"__import__('pathlib').Path({str(hook_marker)!r}).touch(); "
+    if hook_variant == "appended-code":
+        directive += unexpected_code
+    elif hook_variant == "prepended-code":
+        directive = "import os; " + unexpected_code + directive
+    elif hook_variant == "renamed-hook":
+        pth_name = "renamed-distutils.pth"
+    elif hook_variant == "extra-line":
+        directive += "\nimport os; " + unexpected_code
+    elif hook_variant == "missing-package-init":
+        hook_init.unlink()
+    elif hook_variant == "writable-package-init":
+        hook_init.chmod(0o664)
+    elif hook_variant == "writable-package-directory":
+        hook_package.chmod(0o775)
+    elif hook_variant == "symlink-package-init":
+        original_init = hook_package / "original.py"
+        hook_init.rename(original_init)
+        hook_init.symlink_to(original_init)
+    (site_packages / pth_name).write_text(f"{directive}\n", encoding="utf-8")
+
+    result = _validate_fixture_import_tree(
+        repo_dir=repo_dir,
+        project_environment=project_environment,
+    )
+
+    assert not hook_marker.exists()
+    if expected_message is None:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode == 2
+        assert expected_message in result.stderr
+
+
 def test_import_validation_rejects_editable_finder_outside_project(tmp_path: Path) -> None:
     repo_dir = tmp_path / "repo"
     package_dir = repo_dir / "leveraged_trader"

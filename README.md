@@ -81,6 +81,17 @@ cd /path/to/project
 
 The checkout can live anywhere. The cron setup derives its paths from the repository location.
 
+The dashboard dependency must be available in a sibling `alpaca-dashboard` checkout. If it is not
+already there, clone it from this project's root before installing dependencies:
+
+```bash
+git clone https://github.com/maks-emelyanov/alpaca-dashboard.git ../alpaca-dashboard
+git -C ../alpaca-dashboard checkout b3210dc1bc273be1126454c43cf8af2cf9bb73c3
+```
+
+This is the dashboard revision tested by CI. The lockfile records the sibling directory, so
+`uv sync --locked` checks dependency metadata but does not enforce that checkout's Git revision.
+
 ### 2. Install uv
 
 Install `uv` on Linux or macOS using its official standalone installer:
@@ -108,6 +119,10 @@ uv sync --locked
 
 `uv` installs a compatible Python version when necessary and creates the local `.venv` environment.
 The virtual environment does not need to be activated when commands are run through `uv run`.
+This includes the dashboard from `../alpaca-dashboard`, installed as a regular local dependency so
+scheduled-run validation does not traverse a separate checkout's development environment.
+When adding the dashboard to an existing cron installation, rerun `./scripts/cron/install-crontab`
+after syncing to refresh the authenticated runtime helper used by the schedule.
 
 ### 4. Configure API credentials
 
@@ -353,11 +368,15 @@ crontab affects only future launches.
 
 ### 7. Updating an existing installation
 
-After pulling any project changes, resynchronize the locked environment:
+After pulling any project changes, make sure the sibling dashboard checkout is available as
+described in [Setup](#1-get-the-project), then resynchronize the locked environment:
 
 ```bash
 uv sync --locked
 ```
+
+If the documented dashboard revision changes, update the sibling checkout to that revision and
+run `uv sync --locked --reinstall-package alpaca-dashboard`, then restart any running dashboard.
 
 If you installed the managed cron schedule, always reinstall its managed block after every project
 update so its authenticated `scripts/cron/run-scheduled-clean-environment` launcher snapshot and
@@ -439,6 +458,51 @@ scheduled operation never modifies the environment:
 ```bash
 ./scripts/cron/run-leveraged-trader --reconcile-only --alpaca-submit-sell-orders
 ```
+
+## Alpaca Account Dashboard
+
+Launch the dashboard from this project's root, in a separate terminal:
+
+```bash
+uv run --locked alpaca-dashboard
+```
+
+Open <http://127.0.0.1:8050> and stop it with `Ctrl+C`. The dashboard shows account value, completed
+trades, current positions, and orders for the entire Alpaca paper account. It makes GET-only broker
+requests and runs independently of the trader and cron schedule. Its data comes from Alpaca, without
+strategy attribution or reads of this project's strategy database and CSV reports.
+
+The existing `.env` settings `ALPACA_API_KEY_ID`, `ALPACA_API_SECRET_KEY`, and `ALPACA_BASE_URL` work
+without changes. The dashboard uses credentials from the selected file before shell variables;
+this differs from the trader's shell-first precedence. It falls back to a complete environment pair
+only when the file contains no Alpaca credential settings. A partial or empty file pair is an error,
+and credentials are never combined across sources. Only the paper API origin is accepted.
+
+Optional settings, shown with their defaults:
+
+```bash
+uv run --locked alpaca-dashboard \
+  --env-file .env \
+  --cache-db data/dashboard.sqlite \
+  --port 8050 \
+  --refresh-seconds 5
+```
+
+Paths are relative to the launch directory. The dashboard listens on `127.0.0.1`; ports must be
+1–65535, and refresh intervals must be finite and at least one second. Its account-specific cache
+at `data/dashboard.sqlite` is separate from the strategy database; use a distinct cache path for each
+account. The cache and exported `alpaca-trades.csv`, `alpaca-positions.csv`, and `alpaca-orders.csv`
+contain private account data and are ignored by Git. Initial history loading can take time for large
+accounts; the status banner reports progress and broker errors.
+
+After changing the sibling library's Python code or assets, reinstall it and restart the dashboard:
+
+```bash
+uv sync --locked --reinstall-package alpaca-dashboard
+```
+
+The sibling path is a `uv` source setting, not part of built distribution metadata. Installing this
+project's wheel elsewhere also requires supplying the dashboard checkout or its wheel to the installer.
 
 ## CLI Reference
 
@@ -580,6 +644,14 @@ Issuer/ETN discoveries are retained even when absent from the directories,
 because primary coverage cannot establish the completeness of issuer-only products. Excluded primary rows
 and their source/reason are retained in `universe_inactive_discovered_products`. A partial snapshot is
 audit-only and cannot exclude products.
+Issuer-confirmed closures in `leveraged_trader/universe_lifecycle.py` separately exclude products
+starting the day after their last trading date in `America/New_York`, matching both ticker and full
+product name (ignoring case and whitespace) to avoid excluding reused tickers. Closure filtering
+precedes cross-source identity checks, so a stale closed product cannot conflict with a new product
+using its ticker. These exclusions retain the issuer notice URL and last trading date in the same
+inactive-products table, even when active-listing sources are unavailable.
+Tradr discovery uses its current ETF directory and ignores obsolete homepage inventory modules.
+Volatility Shares single-stock categories are preserved so unresolved underlyings enter mapping review.
 Symbol-only Cboe and SEC mutual-fund
 feeds are recorded as inventory-only and are not counted as product-name leverage coverage. Leveraged workflow rows whose RSI
 symbol cannot be mapped confidently are excluded from the executable workflow and saved to
@@ -869,8 +941,17 @@ uv run pytest -q
 uv build
 ```
 
-The checked-in GitHub Actions workflow runs those lint, test, and build checks against the lockfile
-and audits the installed dependency set with `pip-audit` on every push and pull request.
+The checked-in GitHub Actions workflow checks out the documented dashboard revision beside the
+trader, validates the scheduled import environment, and runs lint, tests, distribution builds,
+installed CLI smoke tests, and `pip-audit` on every push and pull request. Compatibility jobs cover
+Python 3.13 and 3.14 on Linux and Python 3.12 on macOS in addition to the primary Python 3.12 Linux
+job. The dependency audit skips the editable trader and the local dashboard package, which is not
+published on PyPI; their registry dependencies are still audited.
+
+Maintain issuer-confirmed closures in `leveraged_trader/universe_lifecycle.py`. Each entry needs
+the ticker, complete product name, last trading date, and issuer notice URL. Verify the notice and
+add regression coverage for the trading-date boundary and ticker reuse. This registry records known
+closures; it is not a complete delisting feed.
 
 ## Project Layout
 

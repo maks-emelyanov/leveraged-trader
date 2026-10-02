@@ -12,6 +12,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 keywords = ["alpaca", "leveraged-etfs", "paper-trading", "rsi", "trading", "yfinance"]
 dependencies = [
+    "alpaca-dashboard",
     "idna>=3.10",
     "lxml>=6.0.2",
     "numba>=0.62.0",
@@ -29,6 +30,10 @@ leveraged-trader = "leveraged_trader.cli:main"
 
 [tool.uv]
 package = true
+
+[tool.uv.sources]
+# A regular install keeps the sibling checkout's .pth import path out of scheduled runs.
+alpaca-dashboard = { path = "../alpaca-dashboard", editable = false }
 
 [tool.setuptools.packages.find]
 include = ["leveraged_trader*"]

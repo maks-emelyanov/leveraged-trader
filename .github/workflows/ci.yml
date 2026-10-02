@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    working-directory: leveraged-trader
+
 jobs:
   quality:
     runs-on: ubuntu-latest
@@ -15,15 +19,32 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          path: leveraged-trader
+
+      - name: Check out dashboard dependency
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: maks-emelyanov/alpaca-dashboard
+          ref: b3210dc1bc273be1126454c43cf8af2cf9bb73c3
+          path: alpaca-dashboard
 
       - name: Install uv and Python
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           enable-cache: true
+          cache-dependency-glob: leveraged-trader/uv.lock
           python-version: "3.12"
 
       - name: Install locked dependencies
         run: uv sync --locked
+
+      - name: Validate scheduled import environment
+        shell: bash
+        run: |
+          source scripts/cron/runtime-security
+          runtime_security_validate_leveraged_trader_import_paths \
+            "$PWD" "$PWD/.venv" "$PWD/.venv/bin/python"
 
       - name: Lint
         run: uv run ruff check .
@@ -91,8 +112,14 @@ jobs:
             exit 1
           fi
           cd "$RUNNER_TEMP"
-          PYTHONTZPATH=/nonexistent uv run --isolated --with "$GITHUB_WORKSPACE/${wheel[0]}" leveraged-trader --help >/dev/null
-          PYTHONTZPATH=/nonexistent uv run --isolated --with "$GITHUB_WORKSPACE/${sdist[0]}" leveraged-trader --help >/dev/null
+          for artifact in "${wheel[0]}" "${sdist[0]}"; do
+            for command in leveraged-trader alpaca-dashboard; do
+              PYTHONTZPATH=/nonexistent uv run --isolated \
+                --with "$GITHUB_WORKSPACE/alpaca-dashboard" \
+                --with "$GITHUB_WORKSPACE/leveraged-trader/$artifact" \
+                "$command" --help >/dev/null
+            done
+          done
 
       - name: Audit dependencies
         run: >-
@@ -119,15 +146,32 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          path: leveraged-trader
+
+      - name: Check out dashboard dependency
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: maks-emelyanov/alpaca-dashboard
+          ref: b3210dc1bc273be1126454c43cf8af2cf9bb73c3
+          path: alpaca-dashboard
 
       - name: Install uv and Python
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           enable-cache: true
+          cache-dependency-glob: leveraged-trader/uv.lock
           python-version: ${{ matrix.python-version }}
 
       - name: Install locked dependencies
         run: uv sync --locked
+
+      - name: Validate scheduled import environment
+        shell: bash
+        run: |
+          source scripts/cron/runtime-security
+          runtime_security_validate_leveraged_trader_import_paths \
+            "$PWD" "$PWD/.venv" "$PWD/.venv/bin/python"
 
       - name: Check shell syntax
         run: |

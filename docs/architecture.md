@@ -8,12 +8,15 @@ Leveraged Trader is organized as a small package with IO-heavy boundaries kept s
 - `leveraged_trader.__main__` implements `python -m leveraged_trader` by delegating to the CLI.
 - `leveraged_trader.cli:main` is the package entry point.
 - The `leveraged-trader` console script is defined in `pyproject.toml`.
+- The `alpaca-dashboard` console script is supplied by the local `alpaca-dashboard` dependency and
+  runs as a separate process with `uv run --locked alpaca-dashboard`.
 
 ## Modules
 
 - `leveraged_trader.__init__`: package version metadata.
 - `leveraged_trader.config`: constants, dataclasses, and `.env` loading.
 - `leveraged_trader.universe`: multi-source leveraged ETF/ETN universe discovery, leverage/direction parsing, and RSI symbol inference.
+- `leveraged_trader.universe_lifecycle`: issuer-confirmed product closures, exact identity matching, and inactive-product audit rows.
 - `leveraged_trader.market_data`: Yahoo Finance daily OHLCV loading with guarded raw-price Tradier fallback for skipped symbols.
 - `leveraged_trader.indicators`: indicator calculations such as RSI.
 - `leveraged_trader.backtest`: shared strategy initial state and performance summary calculations.
@@ -55,7 +58,8 @@ so separate databases and output directories cannot race the same broker exposur
 
 1. Initialize the SQLite schema and, when managed-sell submission is explicitly enabled, reconcile active Alpaca managed positions before refreshing market data. This startup reconciliation can attach or renew managed GTC sells for buys that filled after a previous run. Multi-position reconciliation reuses one strictly validated, paginated account-order snapshot; exact ID lookups remain the fallback for absent orders and replacement links, and an unusable historical snapshot falls back to the validated open-order list before per-order reads.
 2. Load the current leveraged ETF/ETN universe from Nasdaq ETF definitions plus best-effort issuer ETF and ETN tables, then split executable products into long and inverse/short workflow groups. The primary Nasdaq feed and every issuer/ETN source are saved to `universe_workflow_source_status`; fetch failures and unparseable responses are surfaced as a degraded universe and can be made fatal with `--require-workflow-source-success`, which is enabled automatically for Alpaca buy submission unless explicitly disabled, while a successfully parsed issuer source with zero leveraged matches remains healthy. An empty or implausibly small Nasdaq ETF table is a parser failure, not an authoritative snapshot.
-   Issuer discovery includes ProShares, Direxion, Leverage Shares, GraniteShares, Defiance, AdvisorShares, AXS Investments, Kurv, Innovator, Tuttle Capital, Tradr, REX Shares, KraneShares, Volatility Shares, 21Shares, YieldMax, Tidal, Roundhill, Themes, Simplify, MicroSectors, and UBS ETRACS. REX products come from the official Cboe issuer listing because the issuer site blocks unattended requests, while Tradr uses only its current explicit target/exposure tables so legacy product tables cannot override current leverage. YieldMax uses the homepage's complete fund-card inventory because its directory route is intermittently unavailable; every card is validated against one canonical same-site product link, and an implausibly small inventory is a parser failure.
+   Issuer discovery includes ProShares, Direxion, Leverage Shares, GraniteShares, Defiance, AdvisorShares, AXS Investments, Kurv, Innovator, Tuttle Capital, Tradr, REX Shares, KraneShares, Volatility Shares, 21Shares, YieldMax, Tidal, Roundhill, Themes, Simplify, MicroSectors, and UBS ETRACS. REX products come from the official Cboe issuer listing because the issuer site blocks unattended requests, while Tradr uses its dedicated ETF directory and scopes parsing to the current global inventory module; obsolete homepage tables with the same schema cannot reintroduce closed funds. YieldMax uses the homepage's complete fund-card inventory because its directory route is intermittently unavailable; every card is validated against one canonical same-site product link, and an implausibly small inventory is a parser failure.
+   Issuer-confirmed closures are recorded in `universe_lifecycle.py` with full product identity, last trading date, and notice URL. Starting the following day in `America/New_York`, matching ticker/name pairs are excluded from both primary and issuer discoveries before cross-source identity checks and retained in `universe_inactive_discovered_products`. Name matching ignores case and whitespace; unrelated products reusing a ticker remain eligible. This filter applies independently of active-listing availability. Volatility Shares single-stock category metadata is preserved for mapping review even when its short fund names omit the underlying ticker.
 3. Merge universe sources by symbol, infer leverage/direction, and infer each leveraged asset's RSI signal symbol. RSI mappings use curated symbol/name proxies, validated generic ticker inference, and explicit self-RSI fallbacks where appropriate. Exact-ticker overrides must still match an expected exposure fingerprint in the current product name, protecting against stale metadata and ticker reuse; names matching multiple distinct curated proxies require review. Curated inverse mappings point to an unlevered ETF or spot-market proxy for the product's benchmark. Long-product self-RSI fallbacks remain executable; inverse products without an underlying RSI proxy require manual review because using the product's own RSI would invert the high-RSI entry rule. Review rows are saved to `universe_rsi_mapping_review` and excluded from the executable workflow. Leveraged-looking false positives, such as funds where "ultra-short" describes bond duration, are explicitly excluded, as are products with a changing basket and no stable single RSI proxy. An optional workflow `top_n` limit must be a positive integer; `None` selects every executable discovered asset.
    Usable symbols from each successfully loaded Nasdaq active-listing file may corroborate an inferred underlying, and rows marked `Test Issue=Y` are excluded from that positive evidence. Destructive filtering requires both files plus at least 99.5% coverage of a real-sized primary Nasdaq ETF inventory with no more than five primary symbols absent, and applies only to those absent primary rows, with every exclusion persisted alongside its source and reason. Issuer/ETN discoveries remain eligible when absent from the directories because primary coverage cannot prove an issuer-only inventory complete. A missing, duplicate, or unrecognized `Test Issue` field or a larger cross-source discrepancy makes the snapshot non-authoritative; it is recorded for audit but cannot exclude products.
 4. Write audit-only universe source tables for exchange directories, third-party ETF directories, and SEC EDGAR registry review. Sources with product names can flag missing long or inverse leveraged-looking candidates, but they do not override Nasdaq or issuer rows. The SEC exchange registry must expose one unambiguous ticker field and one unambiguous product-name field before it can claim product-name coverage. Symbol-only feeds such as Cboe's listed-products CSV and the SEC mutual-fund ticker registry are explicitly recorded as `loaded_inventory_only`; their rows are counted separately and are not presented as leveraged-product coverage. Dynamic directories without a stable machine-readable response, including the NYSE listings page, remain registered backstops and are not fetched by the static HTML parser. SEC requests require an explicitly configured `SEC_USER_AGENT` containing a truthful identity and monitored contact email; without one, SEC sources are recorded as `skipped_configuration` without making the executable universe degraded. An enabled, configured audit source that fails to fetch, cannot be parsed, or produces no product rows marks the reported universe as degraded and is shown in terminal source-health details. Audit failures remain non-fatal and are intentionally outside `--require-workflow-source-success` because they cannot remove rows from the executable source universe.
@@ -135,6 +139,35 @@ Strategy sell rows remain report outputs and include latest-session target exits
 the daily-bar simulation. They are not actionable live sell submissions, and direct Alpaca
 submissions from raw sell rows are disabled. Live exits for positions opened by the workflow are
 driven by managed-position reconciliation instead of the latest optimized parameter row.
+
+## Account Dashboard
+
+`alpaca-dashboard` is installed from the sibling `../alpaca-dashboard` checkout through
+`[tool.uv.sources]`. It is a regular local dependency, not an editable import path, so the cron
+runtime validator does not recurse through the library checkout and its development environment.
+Library changes require `uv sync --locked --reinstall-package alpaca-dashboard` and a dashboard
+restart. The source setting is not carried into built wheel dependency metadata.
+CI and the README pin the dashboard checkout to a tested commit; `uv.lock` records a local directory
+and does not validate its Git revision. Updating that revision requires updating both CI checkouts
+and the setup instructions, refreshing the lockfile if dependency metadata changes, and reinstalling
+the dashboard package.
+Dash also depends on setuptools. The cron validator recognizes its exact stock
+`distutils-precedence.pth` directive after validating the installed import tree and the shim package;
+other executable directives remain subject to the existing restrictions. CI validates this boundary
+against the actual locked environment.
+
+The library owns its Dash UI, GET-only Alpaca client, polling worker, and account-specific SQLite
+cache. Its console entry point serves `127.0.0.1:8050` by default and closes its worker on shutdown.
+The dashboard reads account-wide broker data independently of strategy execution; it does not import
+the trader workflow, consume strategy reports, or access the strategy database. Its default cache,
+`data/dashboard.sqlite`, must remain separate from the trader's database. Starting the trader or
+installing the cron schedule does not start the dashboard.
+
+The dashboard accepts this project's Alpaca credential names and paper API URL. It reads `.env`
+relative to the launch directory, or the file selected by `--env-file`. Unlike the trader, it gives
+file credentials precedence and falls back to a complete environment pair only if the file has no
+Alpaca credential settings. It never combines credentials across sources. The library manages its
+own configuration and cache lifecycle; the trader's runtime-file validation applies to trader files.
 
 ## Runtime Configuration
 

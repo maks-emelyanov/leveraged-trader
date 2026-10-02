@@ -730,6 +730,9 @@ runtime_security_validate_pth_effects() {
     local literal_python="$3"
     local pth_file pth_name line normalized_path_line control_check payload module_name target_path
     local install_call
+    local setuptools_pth_line="import os; var = 'SETUPTOOLS_USE_DISTUTILS'; "
+    setuptools_pth_line+="enabled = os.environ.get(var, 'local') == 'local'; "
+    setuptools_pth_line+="enabled and __import__('_distutils_hack').add_shim(); "
     local restore_dotglob=0
     local restore_nullglob=0
     local -a pth_files=()
@@ -788,6 +791,17 @@ runtime_security_validate_pth_effects() {
                 if runtime_security_contains_ascii_control "$control_check"; then
                     echo "Scheduler project .pth entries must not contain ASCII control characters." >&2
                     return 2
+                fi
+                # Dash requires setuptools at runtime. Its stock startup hook
+                # enables the bundled distutils shim. Accept only this exact
+                # filename and directive, after the complete site-packages
+                # trust scan, and verify that the imported package is present.
+                # Validation never imports or evaluates the hook itself.
+                if [[ "$pth_name" == "distutils-precedence.pth" && "$line" == "$setuptools_pth_line" ]]; then
+                    runtime_security_validate_trusted_regular_file \
+                        "$site_packages/_distutils_hack/__init__.py" \
+                        "setuptools distutils import hook" >/dev/null || return $?
+                    continue
                 fi
                 module_name="${payload%%;*}"
                 install_call=0
