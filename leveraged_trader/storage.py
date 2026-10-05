@@ -13014,6 +13014,7 @@ def update_alpaca_managed_sell_status_if_current(
     observed_sell_filled_qty: float | None | object = _UNSET,
     sell_broker_updated_at: str | None | object = _UNSET,
     sell_renewal_requested_at: str | None = None,
+    clear_sell_renewal_claim: bool = False,
     clear_sell_submission_retry_claim: bool = False,
     notes: str | None = None,
     expected_sell_status: str | None | object = _UNSET,
@@ -13242,7 +13243,10 @@ def update_alpaca_managed_sell_status_if_current(
                 END,
                 sell_observation_broker_updated_at = {broker_revision_assignment},
                 sell_observation_filled_qty = {broker_fill_qty_assignment},
-                sell_renewal_requested_at = COALESCE(?, sell_renewal_requested_at),
+                sell_renewal_requested_at = CASE
+                    WHEN ? AND sell_alpaca_order_id IS NULL THEN NULL
+                    ELSE COALESCE(?, sell_renewal_requested_at)
+                END,
                 sell_submission_retry_claimed_at = CASE WHEN ? THEN NULL ELSE sell_submission_retry_claimed_at END,
                 notes = COALESCE(?, notes),
                 updated_at = CURRENT_TIMESTAMP
@@ -13272,6 +13276,7 @@ def update_alpaca_managed_sell_status_if_current(
                 sell_order_limit_price,
                 *broker_revision_assignment_params,
                 *broker_fill_qty_assignment_params,
+                1 if clear_sell_renewal_claim else 0,
                 sell_renewal_requested_at,
                 1 if clear_sell_submission_retry_claim else 0,
                 notes,
@@ -13358,6 +13363,7 @@ def update_alpaca_managed_sell_status_if_current(
                   AND (? IS NULL OR sell_order_qty IS ?)
                   AND (? IS NULL OR sell_order_limit_price IS ?)
                   AND (? IS NULL OR sell_renewal_requested_at IS ?)
+                  AND (? = 0 OR sell_renewal_requested_at IS NULL)
                   AND (? = 0 OR sell_submission_retry_claimed_at IS NULL)
                 """,
                 (
@@ -13385,6 +13391,7 @@ def update_alpaca_managed_sell_status_if_current(
                     sell_order_limit_price,
                     sell_renewal_requested_at,
                     sell_renewal_requested_at,
+                    1 if clear_sell_renewal_claim else 0,
                     1 if clear_sell_submission_retry_claim else 0,
                 ),
                 owns_transaction=owns_transaction,

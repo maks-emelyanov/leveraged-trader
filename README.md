@@ -86,7 +86,7 @@ already there, clone it from this project's root before installing dependencies:
 
 ```bash
 git clone https://github.com/maks-emelyanov/alpaca-dashboard.git ../alpaca-dashboard
-git -C ../alpaca-dashboard checkout b3210dc1bc273be1126454c43cf8af2cf9bb73c3
+git -C ../alpaca-dashboard checkout a83ef7a4e05ef42e5bcf186d1c6ce2d43f271b66
 ```
 
 This is the dashboard revision tested by CI. The lockfile records the sibling directory, so
@@ -472,6 +472,11 @@ trades, current positions, and orders for the entire Alpaca paper account. It ma
 requests and runs independently of the trader and cron schedule. Its data comes from Alpaca, without
 strategy attribution or reads of this project's strategy database and CSV reports.
 
+The **Strategy analysis** tab includes win rate, Sharpe, CAGR, maximum drawdown, profit factor,
+expectancy, and other return and risk metrics for the selected activity timeframe. Results cover
+the entire account, including any other strategies using it. The view explains sample sizes and
+unavailable metrics; CAGR requires at least 365 days of observed performance.
+
 The existing `.env` settings `ALPACA_API_KEY_ID`, `ALPACA_API_SECRET_KEY`, and `ALPACA_BASE_URL` work
 without changes. The dashboard uses credentials from the selected file before shell variables;
 this differs from the trader's shell-first precedence. It falls back to a complete environment pair
@@ -807,6 +812,10 @@ Managed sell orders:
   treating the obsolete order ID as current.
 - Reconcile immediately after each submitted buy batch, so fills can receive their managed sell in the same workflow run.
 - Renew active GTC sells before Alpaca's aged-order expiration, using the remaining managed quantity and frozen target price. The renewal-cancel intent is persisted before requesting cancellation, so a timeout can still be completed after Alpaca later reports the order canceled.
+- Clear the completed cancellation lease when a validated active replacement is first attached to
+  its managed record. Further buy fills can then resize protection on the next reconciliation
+  without waiting for the old five-minute lease to expire. Attachment requires the current
+  submission claim and state revision, preserving protection against stale or concurrent updates.
 - Track managed holdings by Alpaca asset ID across ticker changes. Before changing a managed ticker, the workflow validates attached broker/client-order identity and Alpaca's asset response, rejects asset or ticker collisions, and applies the complete migration batch transactionally. Existing broker order IDs remain attached to their original lineage, old-ticker open sells can be recovered by asset ID, every observed ticker alias blocks duplicate buys, and replacement exits are submitted by validated asset ID rather than a ticker snapshot. Alpaca can continue displaying an existing protective order under its pre-rename ticker even though the current position uses the new ticker; matching asset IDs establish that the order protects the renamed position. Unchanged positions avoid historical-order lookups. A `symbol_migrated` row appears in reconciliation output only on the run that applies the change.
 - Resubmit expired GTC sells when renewal is enabled and the managed position is still open.
 - Require recurring runs with managed sell submission enabled for renewal and resubmission to occur; persisted state alone does not schedule broker requests.

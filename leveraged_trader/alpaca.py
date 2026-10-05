@@ -7627,6 +7627,16 @@ def _record_observed_managed_sell_order(
         sell_order_limit_price=submitted_limit_price,
         observed_sell_filled_qty=observed_filled_qty if fill_metadata_is_valid else _STORAGE_UNSET,
         sell_broker_updated_at=_optional_alpaca_datetime_str(sell_order.get("updated_at")),
+        # A successfully attached replacement finishes the old cancellation
+        # lease. Keeping it would block another resize when the parent buy
+        # fills again within five minutes. Clear only under this submission's
+        # exact token/revision; storage also requires a previously missing ID.
+        clear_sell_renewal_claim=(
+            sell_alpaca_order_id is not None
+            and sell_status in SELL_RENEWABLE_STATUSES
+            and isinstance(expected_sell_submission_retry_claimed_at, str)
+            and expected_sell_state_revision is not _STORAGE_UNSET
+        ),
         clear_sell_submission_retry_claim=True,
         expected_sell_submission_retry_claimed_at=expected_sell_submission_retry_claimed_at,
         expected_state_revision=expected_sell_state_revision,
