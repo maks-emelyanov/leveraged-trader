@@ -597,6 +597,7 @@ def _universe_request_exception_from_process(name: str, message: str) -> BaseExc
         "InvalidHeader": requests.exceptions.InvalidHeader,
         "InvalidURL": requests.exceptions.InvalidURL,
         "ReadTimeout": requests.exceptions.ReadTimeout,
+        "ReadTimeoutError": requests.exceptions.ReadTimeout,
         "SSLError": requests.exceptions.SSLError,
         "Timeout": requests.exceptions.Timeout,
         "TooManyRedirects": requests.exceptions.TooManyRedirects,
@@ -641,7 +642,9 @@ def _get_universe_response(url: str, timeout: int) -> requests.Response:
     """Return one bounded, decoded, closed response after safe redirects."""
     current_url = _validated_prepared_universe_url(url)
     deadline = time.monotonic() + timeout
-    for redirect_count in range(UNIVERSE_REDIRECT_LIMIT + 1):
+    redirect_count = 0
+    timeout_retry_available = True
+    while True:
         remaining_seconds = deadline - time.monotonic()
         if remaining_seconds <= 0:
             raise requests.exceptions.Timeout("Universe source exceeded its response deadline.")
@@ -658,11 +661,20 @@ def _get_universe_response(url: str, timeout: int) -> requests.Response:
             "allow_redirects": False,
             "stream": True,
         }
-        response = _get_universe_response_with_deadline(
-            current_url,
-            deadline=deadline,
-            request_kwargs=request_kwargs,
-        )
+        try:
+            response = _get_universe_response_with_deadline(
+                current_url,
+                deadline=deadline,
+                request_kwargs=request_kwargs,
+            )
+        except requests.exceptions.Timeout:
+            if not timeout_retry_available:
+                raise
+            # Retry one transient stall across the entire redirect chain. The
+            # worker has already cleaned up; reuse the original deadline and
+            # recompute the remaining request timeout before trying this hop.
+            timeout_retry_available = False
+            continue
         primary_failure: BaseException | None = None
         try:
             status_code = response.status_code
@@ -685,6 +697,7 @@ def _get_universe_response(url: str, timeout: int) -> requests.Response:
                 if _normalized_universe_origin(redirected_url) != _normalized_universe_origin(current_url):
                     raise requests.exceptions.InvalidURL("Universe source refused a cross-origin redirect.")
                 current_url = redirected_url
+                redirect_count += 1
                 continue
 
             if (
@@ -728,7 +741,6 @@ def _get_universe_response(url: str, timeout: int) -> requests.Response:
                     max_chars=_UNIVERSE_DIAGNOSTIC_MAX_CHARS,
                 )
                 primary_failure.add_note(f"Failed to close the universe HTTP response: {close_detail}")
-    raise AssertionError("unreachable")
 
 
 def _validated_universe_request_timeout(timeout: object) -> int:

@@ -680,6 +680,8 @@ A workflow discovery, active listing, or enabled audit-source failure leaves the
 degraded in terminal output. A workflow source that parses successfully but contains zero leveraged
 matches remains healthy. Conflicting leverage classifications for duplicate symbols are excluded and
 mark the source as a parser failure; unambiguous rows remain available in a non-strict degraded run.
+Universe downloads retry a transient timeout once within the original per-source deadline, shared
+across redirects. Persistent timeouts and invalid responses still fail the source checks.
 An enabled audit directory that produces no parseable product rows is treated as a parser failure
 because an empty exchange or registry directory is not a credible successful snapshot. Audit sources
 remain coverage checks and do not contribute executable rows. Use

@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
+from urllib3.exceptions import ReadTimeoutError
 
 from leveraged_trader import _http_deadline_worker as http_deadline_worker
 from leveraged_trader.config import UniverseConfig
@@ -255,6 +256,139 @@ class UniverseTests(unittest.TestCase):
             getattr(raised.exception, "__notes__", []),
         )
         response.close.assert_called_once()
+
+    def test_universe_retries_one_worker_timeout_with_the_original_deadline(self) -> None:
+        for error_type in ("ReadTimeout", "ConnectTimeout", "Timeout"):
+            clock = Mock(return_value=100.0)
+
+            def request(
+                url: str,
+                _request_kwargs: dict[str, object],
+                *,
+                timeout_error: str = error_type,
+                current_clock: Mock = clock,
+                **_kwargs: object,
+            ) -> object:
+                if current_clock.return_value == 100.0:
+                    current_clock.return_value = 127.0
+                    return ("error", timeout_error, "temporary timeout")
+                return ("response", 200, {}, "utf-8", b"complete source", url, "OK")
+
+            with (
+                self.subTest(error_type=error_type),
+                patch("leveraged_trader.universe.time.monotonic", new=clock),
+                patch("leveraged_trader.universe.run_http_request_with_deadline", side_effect=request) as worker,
+            ):
+                result = _fetch_source_text(UniverseSource("Issuer", "https://issuer.test/products", "issuer_etf"), 30)
+
+            self.assertEqual(result.text, "complete source")
+            self.assertEqual(result.error, "")
+            self.assertEqual(worker.call_count, 2)
+            self.assertEqual([call.kwargs["deadline"] for call in worker.call_args_list], [130.0, 130.0])
+            self.assertEqual([call.args[1]["timeout"] for call in worker.call_args_list], [(30.0, 5.0), (3.0, 3.0)])
+
+    def test_universe_timeout_retry_discards_partial_body_and_closes_each_worker_response(self) -> None:
+        first = _streaming_response()
+        first.raw.read1.side_effect = [b"partial source", ReadTimeoutError(None, first.url, "temporary timeout")]
+        final = _streaming_response(b"complete source")
+        sessions = [Mock(), Mock()]
+
+        def request(url: str, request_kwargs: dict[str, object], **_kwargs: object) -> object:
+            return http_deadline_worker._http_request_payload(
+                {"max_body_bytes": 1_024, "mode": "universe", "request_kwargs": request_kwargs, "url": url}
+            )
+
+        with (
+            patch.object(http_deadline_worker.requests, "Session", side_effect=sessions),
+            patch.object(http_deadline_worker, "_universe_session_get", side_effect=[first, final]),
+            patch("leveraged_trader.universe.run_http_request_with_deadline", side_effect=request),
+        ):
+            result = _fetch_source_text(UniverseSource("Issuer", first.url, "issuer_etf"), 30)
+
+        self.assertEqual(result.text, "complete source")
+        self.assertEqual(result.error, "")
+        for resource in (first, final, *sessions):
+            resource.close.assert_called_once()
+
+    def test_universe_does_not_retry_twice_after_worker_timeouts(self) -> None:
+        with patch(
+            "leveraged_trader.universe.run_http_request_with_deadline",
+            side_effect=[("error", "ReadTimeout", "first timeout"), ("error", "ReadTimeout", "second timeout")],
+        ) as worker:
+            result = _fetch_source_text(UniverseSource("Issuer", "https://issuer.test/products", "issuer_etf"), 30)
+
+        self.assertIsNone(result.text)
+        self.assertEqual(result.error, "ReadTimeout: second timeout")
+        self.assertEqual(worker.call_count, 2)
+
+    def test_universe_does_not_start_timeout_retry_after_the_original_deadline(self) -> None:
+        current_time = 100.0
+
+        def request(*_args: object, **_kwargs: object) -> object:
+            nonlocal current_time
+            current_time = 130.0
+            return ("error", "ReadTimeout", "temporary timeout")
+
+        with (
+            patch("leveraged_trader.universe.time.monotonic", side_effect=lambda: current_time),
+            patch("leveraged_trader.universe.run_http_request_with_deadline", side_effect=request) as worker,
+        ):
+            result = _fetch_source_text(UniverseSource("Issuer", "https://issuer.test/products", "issuer_etf"), 30)
+
+        self.assertIsNone(result.text)
+        self.assertIn("response deadline", result.error)
+        worker.assert_called_once()
+
+    def test_universe_does_not_retry_non_timeout_worker_errors(self) -> None:
+        error_types = (
+            "SSLError", "InvalidURL", "InvalidHeader", "ContentDecodingError", "ConnectionError", "ValueError",
+        )
+        for error_type in error_types:
+            with (
+                self.subTest(error_type=error_type),
+                patch(
+                    "leveraged_trader.universe.run_http_request_with_deadline",
+                    return_value=("error", error_type, "source failure"),
+                ) as worker,
+            ):
+                result = _fetch_source_text(UniverseSource("Issuer", "https://issuer.test/products", "issuer_etf"), 30)
+
+            self.assertIsNone(result.text)
+            self.assertEqual(result.error, f"{error_type}: source failure")
+            worker.assert_called_once()
+
+    @patch("leveraged_trader.universe.requests.get")
+    def test_universe_timeout_retry_preserves_current_hop_and_redirect_limit(self, mock_get: Mock) -> None:
+        first = _streaming_response(status_code=302, headers={"Location": "/redirected"})
+        final = _streaming_response(status_code=302, headers={"Location": "/beyond-limit"})
+        mock_get.side_effect = [first, requests.ReadTimeout("temporary timeout"), final]
+
+        with patch("leveraged_trader.universe.UNIVERSE_REDIRECT_LIMIT", 1):
+            result = _fetch_source_text(UniverseSource("Issuer", first.url, "issuer_etf"), 30)
+
+        self.assertIsNone(result.text)
+        self.assertIn("exceeded 1 redirects", result.error)
+        self.assertEqual(
+            [call.args[0] for call in mock_get.call_args_list],
+            [first.url, "https://issuer.test/redirected", "https://issuer.test/redirected"],
+        )
+        first.close.assert_called_once()
+        final.close.assert_called_once()
+
+    @patch("leveraged_trader.universe.requests.get")
+    def test_universe_timeout_retry_is_shared_across_redirects(self, mock_get: Mock) -> None:
+        redirect = _streaming_response(status_code=302, headers={"Location": "/redirected"})
+        mock_get.side_effect = [requests.ReadTimeout("first timeout"), redirect, requests.ReadTimeout("second timeout")]
+
+        result = _fetch_source_text(UniverseSource("Issuer", redirect.url, "issuer_etf"), 30)
+
+        self.assertIsNone(result.text)
+        self.assertEqual(result.error, "ReadTimeout: second timeout")
+        self.assertEqual(
+            [call.args[0] for call in mock_get.call_args_list],
+            [redirect.url, redirect.url, "https://issuer.test/redirected"],
+        )
+        redirect.close.assert_called_once()
 
     @patch("leveraged_trader.universe.requests.get")
     def test_universe_response_rejects_unhandled_3xx_before_reading_body(self, mock_get: Mock) -> None:
