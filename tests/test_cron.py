@@ -20,8 +20,7 @@ RUNNER = ROOT / "scripts" / "cron" / "run-leveraged-trader"
 INSTALLER_TEST_MODE_ENV = "LEVERAGED_TRADER_INSTALLER_TEST_ONLY_MODE"
 INSTALLER_TEST_HOME_ENV = "LEVERAGED_TRADER_INSTALLER_TEST_ONLY_ACCOUNT_HOME"
 SCHEDULED_RECONCILIATION_ARGUMENTS = (
-    "--reconcile-only --alpaca-submit-sell-orders "
-    "--scheduled-closed-audit-interval-minutes 15"
+    "--reconcile-only --alpaca-submit-sell-orders --scheduled-closed-audit-interval-minutes 15"
 )
 CRON_BOUNDARY_ENVIRONMENT_NAMES = (
     "LD_PRELOAD",
@@ -3189,6 +3188,109 @@ def test_import_validation_checks_pth_path_targets(
         assert "must not be group- or world-writable" in result.stderr
     else:
         assert ".pth targets must exist before validation" in result.stderr
+
+
+def _create_dashboard_editable_import_fixture(
+    parent: Path,
+) -> tuple[Path, Path, Path, Path]:
+    repo_dir = parent / "repo"
+    project_environment = repo_dir / ".venv"
+    site_packages = project_environment / "lib" / "python3.12" / "site-packages"
+    trader_package = site_packages / "leveraged_trader"
+    trader_package.mkdir(parents=True)
+    (trader_package / "__init__.py").write_text("", encoding="utf-8")
+    (project_environment / "pyvenv.cfg").write_text(
+        "include-system-site-packages = false\n",
+        encoding="utf-8",
+    )
+    dashboard_checkout = parent / "alpaca-dashboard"
+    dashboard_package = dashboard_checkout / "alpaca_dashboard"
+    dashboard_package.mkdir(parents=True)
+    (dashboard_package / "__init__.py").write_text("", encoding="utf-8")
+    dashboard_python = dashboard_checkout / ".venv" / "bin" / "python"
+    dashboard_python.parent.mkdir(parents=True)
+    dashboard_python.symlink_to(sys.executable)
+    editable_path = site_packages / "_editable_impl_alpaca_dashboard.pth"
+    editable_path.write_text(f"{dashboard_checkout}\n", encoding="utf-8")
+    return repo_dir, project_environment, dashboard_checkout, editable_path
+
+
+@pytest.mark.parametrize("parent_name", ["projects", "projects [literal]*?\\directory"])
+def test_import_validation_accepts_dashboard_editable_with_own_development_environment(
+    tmp_path: Path,
+    parent_name: str,
+) -> None:
+    repo_dir, project_environment, _, _ = _create_dashboard_editable_import_fixture(tmp_path / parent_name)
+
+    result = _validate_fixture_import_tree(
+        repo_dir=repo_dir,
+        project_environment=project_environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "unsafe_target",
+    [
+        "checkout-root",
+        "top-level-module",
+        "sitecustomize",
+        "package-module",
+        "package-symlink",
+        "nested-development-environment",
+        "other-dot-directory",
+        "symlink-development-environment",
+        "renamed-pth",
+        "different-checkout",
+    ],
+)
+def test_dashboard_editable_exemption_preserves_import_tree_validation(
+    tmp_path: Path,
+    unsafe_target: str,
+) -> None:
+    repo_dir, project_environment, dashboard_checkout, editable_path = _create_dashboard_editable_import_fixture(
+        tmp_path
+    )
+    dashboard_package = dashboard_checkout / "alpaca_dashboard"
+    if unsafe_target == "checkout-root":
+        dashboard_checkout.chmod(0o775)
+    elif unsafe_target in {"top-level-module", "sitecustomize", "package-module"}:
+        unsafe_module = {
+            "top-level-module": dashboard_checkout / "unexpected.py",
+            "sitecustomize": dashboard_checkout / "sitecustomize.py",
+            "package-module": dashboard_package / "__init__.py",
+        }[unsafe_target]
+        unsafe_module.write_text("VALUE = 1\n", encoding="utf-8")
+        unsafe_module.chmod(0o664)
+    elif unsafe_target == "package-symlink":
+        (dashboard_package / "linked.py").symlink_to(dashboard_package / "__init__.py")
+    elif unsafe_target in {"nested-development-environment", "other-dot-directory"}:
+        if unsafe_target == "nested-development-environment":
+            linked_directory = dashboard_package / ".venv"
+        else:
+            linked_directory = dashboard_checkout / ".other"
+        linked_directory.mkdir()
+        (linked_directory / "python").symlink_to(sys.executable)
+    elif unsafe_target == "symlink-development-environment":
+        development_environment = dashboard_checkout / ".venv"
+        moved_environment = tmp_path / "development-environment"
+        development_environment.rename(moved_environment)
+        development_environment.symlink_to(moved_environment, target_is_directory=True)
+    elif unsafe_target == "renamed-pth":
+        editable_path.rename(editable_path.with_name("unreviewed-editable.pth"))
+    elif unsafe_target == "different-checkout":
+        different_checkout = tmp_path / "different-dashboard-checkout"
+        dashboard_checkout.rename(different_checkout)
+        editable_path.write_text(f"{different_checkout}\n", encoding="utf-8")
+
+    result = _validate_fixture_import_tree(
+        repo_dir=repo_dir,
+        project_environment=project_environment,
+    )
+
+    assert result.returncode == 2
+    assert ".pth import target" in result.stderr
 
 
 @pytest.mark.parametrize("trailing_whitespace", [" ", "\t", "\u00a0", "\u2003"])

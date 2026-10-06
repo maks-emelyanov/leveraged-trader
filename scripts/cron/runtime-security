@@ -431,7 +431,8 @@ runtime_security_validate_trusted_regular_file() {
 runtime_security_validate_trusted_import_tree() {
     local requested_path="$1"
     local description="$2"
-    local path validated_find unsafe_entries
+    local skip_checkout_venv="${3:-0}"
+    local path validated_find unsafe_entries excluded_venv_pattern=""
 
     path="$(runtime_security_validate_trusted_directory "$requested_path" "$description")" || return $?
     if ! runtime_security_root_owner_uid="$(runtime_security_path_owner_uid_lstat /)"; then
@@ -442,11 +443,26 @@ runtime_security_validate_trusted_import_tree() {
         runtime_security_validate_trusted_executable "$runtime_security_find_bin" "find executable"
     )" || return $?
 
+    if (( skip_checkout_venv != 0 )); then
+        # The reviewed dashboard editable exposes its checkout root. Its own
+        # development environment is not importable through that root: Python
+        # separates module names at dots, so no module component names .venv.
+        # Prune only this top-level directory, never nested package content or
+        # a symlink in its place. Escape find's pattern syntax for literal paths.
+        excluded_venv_pattern="${path//\\/\\\\}"
+        excluded_venv_pattern="${excluded_venv_pattern//\*/\\*}"
+        excluded_venv_pattern="${excluded_venv_pattern//\?/\\?}"
+        excluded_venv_pattern="${excluded_venv_pattern//\[/\\[}"
+        excluded_venv_pattern="${excluded_venv_pattern//\]/\\]}"
+        excluded_venv_pattern="$excluded_venv_pattern/.venv"
+    fi
+
     # GNU and BSD find both support these predicates. Keep traversal and
     # classification inside one trusted process so whitespace and control
     # characters in entry names cannot be reinterpreted by the shell.
     if unsafe_entries="$(
         "$validated_find" "$path" \
+            \( -path "$excluded_venv_pattern" -type d \) -prune -o \
             \( \
                 ! \( -type f -o -type d \) \
                 -o ! \( \
@@ -729,7 +745,7 @@ runtime_security_validate_pth_effects() {
     local site_packages="$2"
     local literal_python="$3"
     local pth_file pth_name line normalized_path_line control_check payload module_name target_path
-    local install_call
+    local install_call editable_dashboard_checkout skip_checkout_venv
     local setuptools_pth_line="import os; var = 'SETUPTOOLS_USE_DISTUTILS'; "
     setuptools_pth_line+="enabled = os.environ.get(var, 'local') == 'local'; "
     setuptools_pth_line+="enabled and __import__('_distutils_hack').add_shim(); "
@@ -852,9 +868,20 @@ runtime_security_validate_pth_effects() {
                 return 2
             fi
             if [[ -d "$target_path" && ! -L "$target_path" ]]; then
+                skip_checkout_venv=0
+                if [[ "$pth_name" == "_editable_impl_alpaca_dashboard.pth" ]]; then
+                    editable_dashboard_checkout="$(
+                        runtime_security_absolute_lexical_path "$repo_dir"
+                    )" || return $?
+                    editable_dashboard_checkout="${editable_dashboard_checkout%/*}/alpaca-dashboard"
+                    if [[ "$target_path" == "$editable_dashboard_checkout" ]]; then
+                        skip_checkout_venv=1
+                    fi
+                fi
                 runtime_security_validate_trusted_import_tree \
                     "$target_path" \
-                    ".pth import target" >/dev/null || return $?
+                    ".pth import target" \
+                    "$skip_checkout_venv" >/dev/null || return $?
             elif [[ -f "$target_path" && ! -L "$target_path" ]]; then
                 runtime_security_validate_trusted_regular_file \
                     "$target_path" \

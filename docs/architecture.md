@@ -157,14 +157,18 @@ driven by managed-position reconciliation instead of the latest optimized parame
 ## Account Dashboard
 
 `alpaca-dashboard` is installed from the sibling `../alpaca-dashboard` checkout through
-`[tool.uv.sources]`. It is a regular local dependency, not an editable import path, so the cron
-runtime validator does not recurse through the library checkout and its development environment.
-Library changes require `uv sync --locked --reinstall-package alpaca-dashboard` and a dashboard
-restart. The source setting is not carried into built wheel dependency metadata.
-CI and the README pin the dashboard checkout to a tested commit; `uv.lock` records a local directory
-and does not validate its Git revision. Updating that revision requires updating both CI checkouts
-and the setup instructions, refreshing the lockfile if dependency metadata changes, and reinstalling
-the dashboard package.
+`[tool.uv.sources]` as an editable dependency. Python code and assets are read directly from the
+checkout. Source changes require only a dashboard restart; dependency metadata changes require
+`uv lock` and `uv sync --locked`. The source setting is not carried into built wheel metadata.
+CI and the README pin the dashboard checkout to a tested commit; `uv.lock` records an editable local
+directory and does not validate its Git revision. Updating the tested revision requires updating
+both CI checkouts and the setup instructions.
+The cron validator exempts the checkout's top-level `.venv` directory from traversal only when
+Hatch's `_editable_impl_alpaca_dashboard.pth` targets that exact sibling checkout. This directory
+is not a Python import package; a symlink in its place is still rejected. The checkout root and
+remaining tree must pass the ownership, permissions, and non-symlink checks. All other `.pth`
+directory targets and nested paths retain the full security scan. Changes to the runtime validator
+require refreshing the installed managed cron block as described in the README.
 Dash also depends on setuptools. The cron validator recognizes its exact stock
 `distutils-precedence.pth` directive after validating the installed import tree and the shim package;
 other executable directives remain subject to the existing restrictions. CI validates this boundary

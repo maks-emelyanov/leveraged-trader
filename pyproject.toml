@@ -32,8 +32,8 @@ leveraged-trader = "leveraged_trader.cli:main"
 package = true
 
 [tool.uv.sources]
-# A regular install keeps the sibling checkout's .pth import path out of scheduled runs.
-alpaca-dashboard = { path = "../alpaca-dashboard", editable = false }
+# Import the sibling checkout directly so dashboard code and assets stay current.
+alpaca-dashboard = { path = "../alpaca-dashboard", editable = true }
 
 [tool.setuptools.packages.find]
 include = ["leveraged_trader*"]

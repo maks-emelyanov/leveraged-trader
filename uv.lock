@@ -13,7 +13,7 @@ resolution-markers = [
 [[package]]
 name = "alpaca-dashboard"
 version = "0.1.0"
-source = { directory = "../alpaca-dashboard" }
+source = { editable = "../alpaca-dashboard" }
 dependencies = [
     { name = "dash" },
     { name = "dash-ag-grid" },
@@ -430,7 +430,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "alpaca-dashboard", directory = "../alpaca-dashboard" },
+    { name = "alpaca-dashboard", editable = "../alpaca-dashboard" },
     { name = "idna", specifier = ">=3.10" },
     { name = "lxml", specifier = ">=6.0.2" },
     { name = "numba", specifier = ">=0.62.0" },

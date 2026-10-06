@@ -119,10 +119,11 @@ uv sync --locked
 
 `uv` installs a compatible Python version when necessary and creates the local `.venv` environment.
 The virtual environment does not need to be activated when commands are run through `uv run`.
-This includes the dashboard from `../alpaca-dashboard`, installed as a regular local dependency so
-scheduled-run validation does not traverse a separate checkout's development environment.
-When adding the dashboard to an existing cron installation, rerun `./scripts/cron/install-crontab`
-after syncing to refresh the authenticated runtime helper used by the schedule.
+This includes the dashboard from `../alpaca-dashboard` as an editable dependency. Python code and
+assets are read directly from that checkout; source changes need no package reinstall.
+When adding the dashboard or switching an existing installation to editable mode, rerun
+`./scripts/cron/install-crontab` after syncing to refresh the authenticated runtime helper used by
+the schedule.
 
 ### 4. Configure API credentials
 
@@ -369,14 +370,16 @@ crontab affects only future launches.
 ### 7. Updating an existing installation
 
 After pulling any project changes, make sure the sibling dashboard checkout is available as
-described in [Setup](#1-get-the-project), then resynchronize the locked environment:
+described in [Setup](#1-get-the-project). If the documented dashboard revision changes, update the
+sibling checkout to that revision before resynchronizing the locked environment:
 
 ```bash
 uv sync --locked
 ```
 
-If the documented dashboard revision changes, update the sibling checkout to that revision and
-run `uv sync --locked --reinstall-package alpaca-dashboard`, then restart any running dashboard.
+Restart any running dashboard after updating its checkout. Source changes need no package
+reinstall. If you change the dashboard's dependency metadata locally, run `uv lock` followed by
+`uv sync --locked` to update the lockfile and environment.
 
 If you installed the managed cron schedule, always reinstall its managed block after every project
 update so its authenticated `scripts/cron/run-scheduled-clean-environment` launcher snapshot and
@@ -500,11 +503,15 @@ account. The cache and exported `alpaca-trades.csv`, `alpaca-positions.csv`, and
 contain private account data and are ignored by Git. Initial history loading can take time for large
 accounts; the status banner reports progress and broker errors.
 
-After changing the sibling library's Python code or assets, reinstall it and restart the dashboard:
+The editable installation reads Python code and assets directly from the sibling library. After
+changing them, restart the dashboard to load the changes; no reinstall is required. This does not
+pull Git updates automatically or reload an already running Python process. Changes to dependency
+metadata still require `uv lock` followed by `uv sync --locked`.
 
-```bash
-uv sync --locked --reinstall-package alpaca-dashboard
-```
+Scheduled runs validate the sibling checkout because its root is on Python's import path. Keep
+the checkout and its files owned by a trusted user and not group- or world-writable. The validator
+skips only its top-level `.venv` directory; a symlink at that path, symlinks elsewhere in the
+checkout, and unsafe nested environments still fail validation.
 
 The sibling path is a `uv` source setting, not part of built distribution metadata. Installing this
 project's wheel elsewhere also requires supplying the dashboard checkout or its wheel to the installer.
