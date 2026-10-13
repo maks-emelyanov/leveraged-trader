@@ -1,0 +1,19 @@
+{
+  "protocol_sha256": "0548840504bb45ca55477cc212b23596897dbb85c72c76c22de59ed3f0699617",
+  "leader": "narrow_rsi35",
+  "production_grid": "current49",
+  "adopt_replacement": false,
+  "validation_gates": {
+    "adjusted_paired_lower_bound_positive": false,
+    "broad_improvement": false,
+    "no_direction_deterioration": true,
+    "stress_improvement_nonnegative": true,
+    "matched_holding_no_worse": false
+  },
+  "confirmation_noninferiority_gate": true,
+  "confirmation_activated_asset_periods": {
+    "current49": 0,
+    "narrow_rsi35": 0
+  },
+  "reason": "No replacement met all registered adoption gates; retain incumbent without claiming it optimal."
+}

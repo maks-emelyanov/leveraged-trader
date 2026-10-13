@@ -1,0 +1,19 @@
+{
+  "tests": {
+    "passed": 90,
+    "subtests_passed": 98,
+    "command": "NUMBA_NUM_THREADS=2 .venv/bin/python -m pytest -q tests/test_grid_resolution.py tests/test_grid_resolution_analysis.py tests/test_grid_resolution_runner.py tests/test_grid_research.py tests/test_research_selection.py tests/test_research_metrics.py tests/test_grid_research_inputs.py"
+  },
+  "ruff": "All six new source/test files pass",
+  "git_diff_check": "passed",
+  "production_parity": "Independent direct production v2 selection matches dense, r5_t5 and r40_t98 TQQQ pre-2022 parameters/status/score exactly",
+  "simulation_source_changes": "None; separate v2 research modules added; archived v1 research preserved",
+  "artifact_checks": {
+    "input_and_source_hashes": "passed",
+    "validation_records": 34020,
+    "confirmation_records": 3910,
+    "identical_eligible_cells_per_grid": "passed",
+    "selection_version": 2,
+    "frozen_confirmation_grid_list_and_validation_hash": "passed"
+  }
+}

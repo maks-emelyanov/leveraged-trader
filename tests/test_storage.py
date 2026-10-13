@@ -18,7 +18,7 @@ import pandas as pd
 import leveraged_trader.reports as reports_module
 import leveraged_trader.storage as storage_module
 from leveraged_trader.backtest import performance_summary
-from leveraged_trader.config import RISK_FREE_SYMBOL, BacktestConfig
+from leveraged_trader.config import RISK_FREE_SYMBOL
 from leveraged_trader.indicators import compute_rsi
 from leveraged_trader.optimized_backtest import run_grid_summary, run_single_equity_curve
 from leveraged_trader.storage import (
@@ -63,6 +63,7 @@ from leveraged_trader.storage import (
     update_alpaca_managed_buy_status_if_current,
     update_alpaca_managed_sell_status_if_current,
 )
+from tests.strategy_fixtures import LegacyBacktestConfig as BacktestConfig
 
 
 def sample_strategy_data(periods: int = 40) -> pd.DataFrame:

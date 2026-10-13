@@ -118,7 +118,7 @@ _MONOTONIC_CLOCK = time.monotonic
 _WALL_CLOCK = time.time
 LONG_WORKFLOW_LABEL = "Long"
 SHORT_WORKFLOW_LABEL = "Short"
-DEFAULT_SHORT_BUY_RSI_VALUES = list(range(50, 81))
+DEFAULT_SHORT_BUY_RSI_VALUES = list(range(50, 81, 5))
 _ACTIVE_OUTPUT_DIRECTORY: ContextVar[PrivateRuntimeDirectory | None] = ContextVar(
     "active_workflow_output_directory",
     default=None,
@@ -6783,7 +6783,7 @@ def _write_workflow_outputs(
             )
             reporter.optimization_summary(
                 side_output.optimization_summary.drop(columns="Workflow", errors="ignore"),
-                title=f"Best Sharpe Parameters By Asset — {side_output.label}",
+                title=f"Selected Parameters By Asset — {side_output.label}",
             )
     else:
         reporter.asset_run_summary([result.as_output_row() for result in asset_run_results])
@@ -6791,7 +6791,7 @@ def _write_workflow_outputs(
     reporter.signal_report(
         "Buy Signals For Next Open",
         buy_signals,
-        empty_message="No optimized assets with more than one trade and Sharpe >= 1.0 have a pending buy signal.",
+        empty_message="No eligible validated strategies with Sharpe >= 1.0 have a pending buy signal.",
     )
 
     output_path = Path(output_dir)

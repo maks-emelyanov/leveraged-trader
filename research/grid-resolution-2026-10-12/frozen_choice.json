@@ -1,0 +1,19 @@
+{
+  "evidence_qualified_candidate": null,
+  "exploratory_leader": "r4_t4",
+  "confirmation_grids": [
+    "current49",
+    "r1_t1",
+    "r3_t3",
+    "r3_t3_shift",
+    "r40_t98",
+    "r40_t98_shift",
+    "r4_t4",
+    "r4_t4_shift",
+    "r5_t5",
+    "r5_t5_shift"
+  ],
+  "protocol_sha256": "864b96791cadf405f5f4b750331dec4a9f9e4a340ef68415b9a06a2421e668e3",
+  "validation_rows_sha256": "24126e810772fcdfa683c4fde0682346e3da7382ad7627443207f5d9311286b4",
+  "reason": "Frozen before later-period results; exploratory leader alone cannot authorize promotion."
+}

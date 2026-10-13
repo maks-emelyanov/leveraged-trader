@@ -1,0 +1,72 @@
+{
+  "status": "passed",
+  "date": "2026-10-12",
+  "selection": "First, middle (floor(n/2)), and last unique eligible (asset,year) cells in sorted order.",
+  "cells": [
+    {
+      "asset": "AGQ",
+      "year": 2013,
+      "grid_count": 45,
+      "replay_seconds": 0.7372204730054364
+    },
+    {
+      "asset": "SMDD",
+      "year": 2013,
+      "grid_count": 45,
+      "replay_seconds": 0.3435327699990012
+    },
+    {
+      "asset": "ZSL",
+      "year": 2022,
+      "grid_count": 45,
+      "replay_seconds": 1.356251204997534
+    }
+  ],
+  "eligible_cell_count": 756,
+  "registered_grid_count": 45,
+  "replayed_rows": 135,
+  "compared_fields": 9045,
+  "numeric_comparisons": 5423,
+  "excluded_fields": [
+    "selection_seconds"
+  ],
+  "absolute_tolerance": 1e-12,
+  "maximum_numeric_error": 0.0,
+  "discrepancies_count": 0,
+  "discrepancies": [],
+  "original_provenance_sha256": "1d654f2f3fa9264ab63c76cd7723122aac11047e9f76523df18cbb2761e0556b",
+  "amended_provenance_sha256": "79cecbd0e461843f13cf6de80ef4f953e1b219857084573cbfbba686146e6c2d",
+  "original_simulation_source_hashes_unchanged": true,
+  "original_study_artifacts_sha256": {
+    "research/grid-resolution-2026-10-12/benchmark_rows.csv": "bdc06d09a44b7f742e32ef56e81a987f03bb08dc750ec6af112b1c39d19eddaa",
+    "research/grid-resolution-2026-10-12/comparison.csv": "126b6add8e09fdcf46ef42c61a0947e2a82d9ce820862649b0dbc185e55827cd",
+    "research/grid-resolution-2026-10-12/confirmation_rows.csv": "68464a0f07330c7f01123e6bf60986ceddb6576e9ab382cc105240b2a9e921fa",
+    "research/grid-resolution-2026-10-12/confirmation_run.json": "54f6a9f63535caf30bc76ba3ae0efecf7e5a40875f81f8578079a2f8d3e82de2",
+    "research/grid-resolution-2026-10-12/confirmation_summary.json": "a43e1ccb838eeb2c2ca165a21f79e8eefa83fa88cd3bf8585dec99fa148516d3",
+    "research/grid-resolution-2026-10-12/coverage.csv": "16167d34b2702086594d1b6645d35a29f3d4d4fdb9110c34f1df199050659b2a",
+    "research/grid-resolution-2026-10-12/decision.json": "22e038a45859bb9ddc8a7dced1c39733be69abce9a57f72396d14635b0518c9b",
+    "research/grid-resolution-2026-10-12/frozen_choice.json": "8c09a15893aab0b56a695c3d5a38f7ae3bf13d32d71e089f9bba03351cf89203",
+    "research/grid-resolution-2026-10-12/frozen_choice.sha256": "11fdf46ef20a4926a6ba66349854589ec21f4a3cc7dc89101b840c368edca501",
+    "research/grid-resolution-2026-10-12/inputs.json": "beca05787aa03cd3b5009db1f3e302e5c199d3925ac72b81b7f19dc2ef0ac257",
+    "research/grid-resolution-2026-10-12/inputs.npz": "6dd6245d9f4ea8ab467d669ded821d0072d37d8571aded7ba2f9ad174055e5e6",
+    "research/grid-resolution-2026-10-12/protocol.json": "864b96791cadf405f5f4b750331dec4a9f9e4a340ef68415b9a06a2421e668e3",
+    "research/grid-resolution-2026-10-12/replay_verification.json": "773a51654564f12e51e6122a7cd6d449fd0e106fe8aea0698beb2f4fb6b82a86",
+    "research/grid-resolution-2026-10-12/supplemental_benchmark_protocol.json": "81e0862857f4c1dc7621101ce78429219fca722fbe8002305ec79e13c26c7f96",
+    "research/grid-resolution-2026-10-12/supplemental_benchmark_rows.csv": "0ed492d73e4a7abd019796b59a5a573b1382877fa54a4dcdc94bcfd5fb95184d",
+    "research/grid-resolution-2026-10-12/validation_rows.csv": "24126e810772fcdfa683c4fde0682346e3da7382ad7627443207f5d9311286b4",
+    "research/grid-resolution-2026-10-12/validation_run.json": "bcf70de42d601e6bf1d19ce870ba40d5158cc70368b6271b66571a25df0d7e80",
+    "research/grid-resolution-2026-10-12/validation_summary.json": "1e5121c017d90242e22c41a710eb3b1bcf95a349ca7e6de117254a42d6b8b4d3",
+    "research/grid-resolution-2026-10-12/verification.json": "69328fa1a3ee26b69ac3ce47f8cd12d5e847c545ca598238169e1c60e89c39b4"
+  },
+  "original_study_artifacts_unchanged": true,
+  "frozen_inputs_and_choice_verified": true,
+  "new_dependency_hashes_verified": true,
+  "full_study_rerun": false,
+  "guard_regression_tests": {
+    "command": "NUMBA_NUM_THREADS=2 .venv/bin/python -m pytest -q tests/test_grid_resolution_runner.py tests/test_grid_resolution.py tests/test_grid_resolution_analysis.py",
+    "passed": 35,
+    "subtests_passed": 58,
+    "coverage": "Preparation pins both transitive dependencies; loading rejects independent modifications to pricing.py and backtest.py."
+  },
+  "ruff": "Passed for scripts/research-resolution.py and tests/test_grid_resolution_runner.py"
+}

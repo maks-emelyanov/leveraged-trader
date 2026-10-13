@@ -1,0 +1,50 @@
+{
+  "protocol_sha256": "0548840504bb45ca55477cc212b23596897dbb85c72c76c22de59ed3f0699617",
+  "leader": "narrow_rsi35",
+  "incumbent": "current49",
+  "ranking": [
+    "narrow_rsi35",
+    "dense_rsi217",
+    "coarse_rsi28",
+    "medium_targets42",
+    "current49",
+    "fast_targets56",
+    "expanded_rsi63",
+    "legacy1240"
+  ],
+  "validation_gates": {
+    "adjusted_paired_lower_bound_positive": false,
+    "broad_improvement": false,
+    "no_direction_deterioration": true,
+    "stress_improvement_nonnegative": true,
+    "matched_holding_no_worse": false
+  },
+  "validation_adoption_eligible": false,
+  "comparison": {
+    "grid": "narrow_rsi35",
+    "baseline": "current49",
+    "direction": "all",
+    "signal_groups": 33,
+    "bootstrap_seed": 20261012,
+    "comparison_count": 7,
+    "matched_exposed_asset_years": 0,
+    "matched_exposed_signal_groups": 0,
+    "matched_exposed_delta_mean_holding_sessions": null,
+    "matched_exposed_delta_max_holding_sessions": null,
+    "delta_utility": 0.001972059564699497,
+    "lower_95_utility": 0.0,
+    "upper_95_utility": 0.005916178694098492,
+    "familywise_lower_95_utility": 0.0,
+    "familywise_upper_95_utility": 0.009585618098414302,
+    "discordant_groups_utility": 1,
+    "improvement_share_utility": 1.0,
+    "delta_stress_utility": 0.0018562529738688181,
+    "lower_95_stress_utility": 0.0,
+    "upper_95_stress_utility": 0.005568758921606454,
+    "familywise_lower_95_stress_utility": 0.0,
+    "familywise_upper_95_stress_utility": 0.009022715347983755,
+    "discordant_groups_stress_utility": 1,
+    "improvement_share_stress_utility": 1.0
+  },
+  "confirmation_status": "pending; frozen before confirmation evaluation"
+}

@@ -1,0 +1,135 @@
+{
+  "status": "no_supported_optimum",
+  "registered_ladder_completed": true,
+  "validation_grid_designs": 45,
+  "validation_asset_years": 756,
+  "validation_grid_selections": 34020,
+  "confirmation_grid_designs": 10,
+  "confirmation_asset_years": 391,
+  "confirmation_grid_selections": 3910,
+  "finest_pairs_per_direction": 4059,
+  "terminal_pairs_per_direction": 4,
+  "statistically_supported_degradation_boundary": false,
+  "optimal_grid": null,
+  "retain_incumbent": "current49",
+  "exploratory_candidate": "r4_t4",
+  "candidate_definition": {
+    "name": "r4_t4",
+    "long_rsi": [
+      10,
+      14,
+      18,
+      22,
+      26,
+      30,
+      34,
+      38,
+      42,
+      46,
+      50
+    ],
+    "short_rsi": [
+      50,
+      54,
+      58,
+      62,
+      66,
+      70,
+      74,
+      78,
+      82,
+      86,
+      90
+    ],
+    "targets": [
+      1.02,
+      1.06,
+      1.1,
+      1.14,
+      1.18,
+      1.22,
+      1.26,
+      1.3,
+      1.34,
+      1.38,
+      1.42,
+      1.46,
+      1.5,
+      1.54,
+      1.58,
+      1.62,
+      1.66,
+      1.7,
+      1.74,
+      1.78,
+      1.82,
+      1.86,
+      1.9,
+      1.94,
+      1.98,
+      2.0
+    ]
+  },
+  "candidate_promoted": false,
+  "candidate_measured_speedup": 4.931591436034977,
+  "candidate_pair_reduction_fraction": 0.929539295392954,
+  "observed_joint_activity_counts": [
+    {
+      "grid": "r1_t1",
+      "exposed_periods": 10
+    },
+    {
+      "grid": "r2_t2",
+      "exposed_periods": 8
+    },
+    {
+      "grid": "r3_t3",
+      "exposed_periods": 6
+    },
+    {
+      "grid": "r4_t4",
+      "exposed_periods": 4
+    },
+    {
+      "grid": "r5_t5",
+      "exposed_periods": 1
+    },
+    {
+      "grid": "r8_t8",
+      "exposed_periods": 0
+    },
+    {
+      "grid": "r10_t10",
+      "exposed_periods": 0
+    },
+    {
+      "grid": "r15_t15",
+      "exposed_periods": 0
+    },
+    {
+      "grid": "r20_t20",
+      "exposed_periods": 0
+    },
+    {
+      "grid": "r30_t30",
+      "exposed_periods": 0
+    },
+    {
+      "grid": "r40_t49",
+      "exposed_periods": 0
+    },
+    {
+      "grid": "r40_t98",
+      "exposed_periods": 0
+    }
+  ],
+  "reasons": [
+    "Fine baseline has only five exposed proxy groups and 34 completed validation trades; required ten groups and 50 trades.",
+    "The apparent validation leader trades only TQQQ in four years and its shifted-grid control reverses sign.",
+    "One LTL loss dominates the apparent leader versus fine comparison; symmetric trimming materially shrinks the advantage.",
+    "The frozen leader loses its positive utility in later confirmation, where the original 79-asset cohort stays cash.",
+    "Coarsening reaches endpoint-only grids without a supported degradation boundary; cash equality cannot identify an optimum."
+  ],
+  "production_defaults_changed": false,
+  "trading_state_written": false
+}

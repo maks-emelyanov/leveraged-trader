@@ -3,6 +3,8 @@ include .python-version
 include main.py
 include uv.lock
 recursive-include docs *.md
+recursive-include tests *.py
+include scripts/*.py
 include scripts/cron/install-crontab
 include scripts/cron/run-leveraged-trader
 include scripts/cron/run-scheduled

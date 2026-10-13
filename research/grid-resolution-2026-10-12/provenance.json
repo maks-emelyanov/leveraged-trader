@@ -1,0 +1,27 @@
+{
+  "source_database": "/home/maks/code/strategies/tqqq/strategy_state.sqlite",
+  "source_access": "mode=ro; single transaction",
+  "protocol_sha256": "864b96791cadf405f5f4b750331dec4a9f9e4a340ef68415b9a06a2421e668e3",
+  "inputs_sha256": "6dd6245d9f4ea8ab467d669ded821d0072d37d8571aded7ba2f9ad174055e5e6",
+  "inputs_metadata_sha256": "beca05787aa03cd3b5009db1f3e302e5c199d3925ac72b81b7f19dc2ef0ac257",
+  "source_sha256": {
+    "scripts/research-resolution.py": "755c91dc70aa821904e87d0c6611fbecfedaf2da9a2a97d66f634dbcb406d854",
+    "leveraged_trader/grid_resolution.py": "94871850b0427157185f96fca33eb5eaa36ed3075ce7f45e5c8909c05ab00e2a",
+    "leveraged_trader/grid_resolution_analysis.py": "36a3bdf1fddbc7d37162d0556ac3322b84f3f49b3de2ae41ee3f4f88a9c9177f",
+    "leveraged_trader/research_selection.py": "647d11b40c1556a05cb76f8245afa0e45eaa20b9d6ce77ceccb853b7e62d8713",
+    "leveraged_trader/research_metrics.py": "bbdcb3eb6f2825c82c35955bcbf95cee0d880e86ec47a0c04fb5dccc0b12f9a9",
+    "leveraged_trader/optimized_backtest.py": "b28b4644d71ded9c11adc6e7d19bea53d94189aa6be3d87ff2cee4eacb5dbce2",
+    "leveraged_trader/indicators.py": "245758275b8caa5c6c5fce1d72676aab5dce123feb94884b0c136be0791e564f",
+    "leveraged_trader/storage.py": "4bb956d9f3faa93c4753265e8de7cf9778393515f0960c61268b9efba14dd05a",
+    "leveraged_trader/grid_research.py": "b2e6609eab7f9e819809840a1a3c9e30b5970d4c9f8d7c465086c63e1084b03e",
+    "leveraged_trader/pricing.py": "3cd09a557598224a8f4a01aec23904dcf0d7671b525f970054abf52540acaa67",
+    "leveraged_trader/backtest.py": "c32909aef61e9a7cfd0771584f12f9ee98dda0d996f2237bb98506510758932d"
+  },
+  "numpy_version": "2.4.3",
+  "pandas_version": "3.0.1",
+  "numba_threads": "4",
+  "correction": {
+    "record": "provenance_correction.json",
+    "original_provenance_sha256": "1d654f2f3fa9264ab63c76cd7723122aac11047e9f76523df18cbb2761e0556b"
+  }
+}

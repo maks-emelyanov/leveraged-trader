@@ -44,6 +44,33 @@ _StrategyReportCacheKey = tuple[str, str, str]
 _StrategyReportCacheValue = tuple[dict[str, object], pd.DataFrame, dict[str, object], str]
 _StrategyReportCache = dict[_StrategyReportCacheKey, _StrategyReportCacheValue]
 
+_SELECTION_REPORT_FIELDS = {
+    "status": "Validation Status",
+    "selection_score": "Selection Score",
+    "candidate_count": "Candidates Tested",
+    "development_sessions": "Development Sessions",
+    "holdout_sessions": "Holdout Sessions",
+    "development_completed_trades": "Development Completed Trades",
+    "development_min_annual_trades": "Development Min Annual Trades",
+    "trade_activity_bonus": "Trade Activity Bonus",
+    "development_sharpe_median": "Development Median Sharpe",
+    "development_sharpe_std": "Development Sharpe Std",
+    "mean_holding_sessions": "Development Mean Hold Sessions",
+    "max_holding_sessions": "Development Max Hold Sessions",
+    "holdout_sharpe": "Holdout Sharpe",
+    "holdout_total_return": "Holdout Total Return",
+    "holdout_completed_trades": "Holdout Completed Trades",
+    "holdout_mean_holding_sessions": "Holdout Mean Hold Sessions",
+    "holdout_max_holding_sessions": "Holdout Max Hold Sessions",
+}
+
+
+def _selection_report_fields(best_row: dict[str, object]) -> dict[str, object]:
+    selection = best_row.get("selection")
+    if not isinstance(selection, dict):
+        return {}
+    return {label: selection.get(key) for key, label in _SELECTION_REPORT_FIELDS.items()}
+
 
 def _alpaca_broker_timestamp_is_canonical(value: object) -> bool:
     """Return whether a report input is one canonical persisted broker time."""
@@ -264,6 +291,10 @@ def _summarize_saved_results_snapshot(
             )
         if best_row is None:
             continue
+        if base_cfg is not None and base_cfg.selection_method == "robust":
+            selection = best_row.get("selection")
+            if not isinstance(selection, dict) or selection.get("method") != "robust":
+                continue
 
         curve_kwargs: dict[str, object] = {}
         if strategy_report_cache is not None:
@@ -364,6 +395,7 @@ def _summarize_saved_results_snapshot(
                 "Kelly Fraction": best_row["kelly_fraction"],
                 "Max Drawdown": best_row["max_drawdown"],
                 "Hit Rate": best_row["hit_rate"],
+                **_selection_report_fields(best_row),
             }
         )
         best_curves.append(best_equity.rename(f"{asset_symbol}_RSI_Strategy"))
@@ -371,7 +403,8 @@ def _summarize_saved_results_snapshot(
     optimization_summary = pd.DataFrame(summary_rows)
     if not optimization_summary.empty:
         optimization_summary = optimization_summary.sort_values(
-            by=["Sharpe", "Total Return", "CAGR"],
+            by=(["Selection Score"] if "Selection Score" in optimization_summary else [])
+            + ["Sharpe", "Total Return", "CAGR"],
             ascending=False,
             na_position="last",
         )
@@ -1176,6 +1209,9 @@ def _build_pending_action_report_snapshot(
         "In Position",
         "Pending Action",
     ]
+    include_selection_fields = base_cfg is not None and base_cfg.selection_method == "robust"
+    if include_selection_fields:
+        columns.extend(_SELECTION_REPORT_FIELDS.values())
     if optimization_summary.empty:
         return pd.DataFrame(columns=columns)
 
@@ -1202,6 +1238,15 @@ def _build_pending_action_report_snapshot(
                 continue
         else:
             persisted_summary = cached_report[0]
+        if pending_action_filter == "buy":
+            selection = persisted_summary.get("selection")
+            requires_validation = base_cfg is not None and base_cfg.selection_method == "robust"
+            if (requires_validation or selection is not None) and (
+                not isinstance(selection, dict)
+                or selection.get("method") != "robust"
+                or selection.get("status") != "passed"
+            ):
+                continue
         try:
             requested_buy_rsi = float(summary_row["Buy RSI"])
             requested_profit_target = float(summary_row["Sell Return Multiple"])
@@ -1354,7 +1399,10 @@ def _build_pending_action_report_snapshot(
                     # action in simulator state. Classify that latest execution
                     # as a sell here so the sell report represents real events.
                     "Pending Action": pending_action_filter if latest_sell_executed else pending_action,
+                    **_selection_report_fields(persisted_summary),
                 }
             )
 
+    if not include_selection_fields and any("Validation Status" in row for row in rows):
+        columns.extend(_SELECTION_REPORT_FIELDS.values())
     return pd.DataFrame(rows, columns=columns)

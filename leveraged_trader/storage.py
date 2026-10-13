@@ -60,6 +60,7 @@ from .pricing import (
 from .pricing import (
     target_sell_price as _target_sell_price,
 )
+from .research_selection import SELECTION_VERSION
 from .runtime_files import (
     prepare_private_runtime_file,
     revalidate_active_sqlite_runtime_file,
@@ -292,7 +293,7 @@ _ALPACA_STATE_REVISION_TRIGGER_SQL = f"""
     END
 """
 
-STRATEGY_STATE_SCHEMA_VERSION = 15
+STRATEGY_STATE_SCHEMA_VERSION = 16
 # Strategy fingerprints intentionally have a lifecycle independent from the
 # SQLite migration version.  Broker-only tables may evolve without forcing a
 # replay of every strategy grid.  Keep the serialized payload key below as
@@ -1556,6 +1557,16 @@ _STATE_DB_TABLE_SCHEMA = """
         PRIMARY KEY (asset_symbol, signal_symbol)
     );
 
+    CREATE TABLE IF NOT EXISTS strategy_selection (
+        asset_symbol TEXT NOT NULL,
+        signal_symbol TEXT NOT NULL,
+        config_fingerprint TEXT NOT NULL,
+        end_date TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        integrity_digest TEXT NOT NULL,
+        PRIMARY KEY (asset_symbol, signal_symbol)
+    );
+
     CREATE TABLE IF NOT EXISTS strategy_state_generation (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         generation INTEGER NOT NULL
@@ -1704,6 +1715,10 @@ _EXPLICIT_ADDITIVE_LEGACY_COLUMNS = {
 }
 
 _STORAGE_IDENTITY_TYPE_CONTRACTS: dict[str, tuple[tuple[str, str, bool], ...]] = {
+    "strategy_selection": (
+        ("asset_symbol", "text", False),
+        ("signal_symbol", "text", False),
+    ),
     "strategy_config": (
         ("asset_symbol", "text", False),
         ("signal_symbol", "text", False),
@@ -2202,6 +2217,7 @@ def _ensure_strategy_equity_columns(conn: sqlite3.Connection) -> None:
 
 
 _STRATEGY_IDENTITY_COLUMNS = {
+    "strategy_selection": ("asset_symbol", "signal_symbol"),
     "strategy_config": ("asset_symbol", "signal_symbol"),
     "strategy_state": ("asset_symbol", "signal_symbol", "buy_rsi", "profit_target_multiple"),
     "strategy_summary": ("asset_symbol", "signal_symbol", "buy_rsi", "profit_target_multiple"),
@@ -2215,6 +2231,7 @@ _STRATEGY_IDENTITY_COLUMNS = {
 }
 
 _STRATEGY_IDENTITY_TYPES = {
+    "strategy_selection": ("text", "text"),
     "strategy_config": ("text", "text"),
     "strategy_state": ("text", "text", "real", "real"),
     "strategy_summary": ("text", "text", "real", "real"),
@@ -4746,6 +4763,8 @@ def _normalized_backtest_fingerprint_payload(base_cfg: BacktestConfig) -> dict[s
         "fee_bps": _canonical_fingerprint_float(base_cfg.fee_bps),
         "slippage_bps": _canonical_fingerprint_float(base_cfg.slippage_bps),
         "auto_adjust": base_cfg.auto_adjust,
+        "selection_method": base_cfg.selection_method,
+        "selection_version": SELECTION_VERSION if base_cfg.selection_method == "robust" else None,
     }
 
 
@@ -5777,6 +5796,11 @@ def strategy_state_matches_config(
     )
     if not strategy_config_matches_fingerprint(conn, asset_symbol, signal_symbol, fingerprint):
         return False
+
+    if base_cfg.selection_method == "robust":
+        best_summary = load_best_strategy_summary(conn, asset_symbol, signal_symbol, rsi_entry_rule)
+        if best_summary is None or best_summary.get("selection", {}).get("method") != "robust":
+            return False
 
     return _strategy_rows_match_config(
         conn,
@@ -15595,6 +15619,7 @@ def clear_asset_state(conn: sqlite3.Connection, asset_symbol: str, signal_symbol
     conn.execute("DELETE FROM strategy_equity WHERE asset_symbol = ? AND signal_symbol = ?", params)
     conn.execute("DELETE FROM strategy_summary WHERE asset_symbol = ? AND signal_symbol = ?", params)
     conn.execute("DELETE FROM strategy_config WHERE asset_symbol = ? AND signal_symbol = ?", params)
+    conn.execute("DELETE FROM strategy_selection WHERE asset_symbol = ? AND signal_symbol = ?", params)
 
 
 def clear_signal_state(conn: sqlite3.Connection, signal_symbol: str) -> None:
@@ -15656,6 +15681,7 @@ def clear_all_strategy_state(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM strategy_equity")
     conn.execute("DELETE FROM strategy_summary")
     conn.execute("DELETE FROM strategy_config")
+    conn.execute("DELETE FROM strategy_selection")
     _bump_strategy_state_generation(conn)
 
 
@@ -16626,6 +16652,291 @@ def _equity_records_from_arrays(
     ]
 
 
+def _strategy_selection_digest(values: tuple[str, ...]) -> str:
+    encoded = json.dumps(values, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _selection_grid_digest(summary_rows: list[tuple]) -> str:
+    """Bind research selection to every authenticated candidate, not just its winner."""
+    identities = sorted((float(row[2]), float(row[3]), str(row[-1])) for row in summary_rows)
+    encoded = json.dumps(identities, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _strategy_selection_is_semantically_valid(payload: dict[str, object], summary_rows: list[tuple]) -> bool:
+    """Recompute acceptance gates so editing a status cannot grant buy eligibility."""
+    from .research_selection import (
+        DEVELOPMENT_BLOCKS,
+        MIN_BLOCK_SESSIONS,
+        MIN_DEVELOPMENT_TRADES,
+        MIN_HOLDOUT_TRADES,
+        development_trade_activity,
+    )
+
+    def finite(value: object) -> bool:
+        return type(value) in {int, float} and math.isfinite(value)
+
+    def count(value: object) -> bool:
+        return type(value) is int and value >= 0
+
+    trading_days = {row[6] for row in summary_rows}
+    if len(trading_days) != 1:
+        return False
+    sessions = next(iter(trading_days))
+    development_sessions = payload.get("development_sessions")
+    holdout_sessions = payload.get("holdout_sessions")
+    if (
+        not count(payload.get("candidate_count"))
+        or payload["candidate_count"] != len(summary_rows)
+        or not count(development_sessions)
+        or not count(holdout_sessions)
+        or development_sessions != sessions * 4 // 5
+        or holdout_sessions != sessions - development_sessions
+    ):
+        return False
+    enough_history = (
+        sessions >= 5 * MIN_BLOCK_SESSIONS
+        and development_sessions // DEVELOPMENT_BLOCKS >= MIN_BLOCK_SESSIONS
+        and holdout_sessions >= MIN_BLOCK_SESSIONS
+    )
+    status = payload.get("status")
+    if status in {"insufficient_history", "insufficient_evidence"}:
+        return bool(
+            enough_history == (status == "insufficient_evidence")
+            and payload.get("selection_score") is None
+            and payload.get("holdout_sharpe") is None
+            and payload.get("holdout_total_return") is None
+            and count(payload.get("development_completed_trades"))
+            and payload.get("development_completed_trades") == 0
+            and payload.get("development_min_annual_trades") is None
+            and payload.get("trade_activity_bonus") is None
+            and count(payload.get("holdout_completed_trades"))
+            and payload.get("holdout_completed_trades") == 0
+        )
+    if status not in {"passed", "failed_holdout"} or not enough_history:
+        return False
+    block_trades = payload.get("development_block_completed_trades")
+    block_sharpes = payload.get("development_block_sharpes")
+    block_returns = payload.get("development_block_returns")
+    if any(type(values) is not list or len(values) != DEVELOPMENT_BLOCKS
+           for values in (block_trades, block_sharpes, block_returns)):
+        return False
+    block_sessions = np.diff(np.linspace(0, development_sessions, DEVELOPMENT_BLOCKS + 1, dtype=int))
+    if (
+        any(not count(value) or value < MIN_DEVELOPMENT_TRADES for value in block_trades)
+        or any(trades >= sessions for trades, sessions in zip(block_trades, block_sessions, strict=True))
+        or any(not finite(value) or value <= 0.0 for value in block_sharpes)
+        or any(not finite(value) or value <= 0.0 for value in block_returns)
+        or not count(payload.get("development_completed_trades"))
+        or payload["development_completed_trades"] != sum(block_trades)
+        or not finite(payload.get("selection_score"))
+        or payload["selection_score"] <= 0.0
+        or not finite(payload.get("development_sharpe_median"))
+        or payload["development_sharpe_median"] != float(np.median(block_sharpes))
+        or not finite(payload.get("development_sharpe_std"))
+        or payload["development_sharpe_std"] != float(np.std(block_sharpes))
+    ):
+        return False
+    mean_hold = payload.get("mean_holding_sessions")
+    max_hold = payload.get("max_holding_sessions")
+    if not finite(mean_hold) or not count(max_hold) or not 1.0 <= mean_hold <= max_hold <= max(block_sessions):
+        return False
+    raw_score = (
+        payload["development_sharpe_median"] - payload["development_sharpe_std"]
+        - 0.5 * np.log1p(mean_hold / 21.0) - 0.25 * np.log1p(max_hold / 63.0)
+    )
+    minimum_rate, activity_bonus = development_trade_activity(np.asarray(block_trades)[:, None], block_sessions)
+    if (
+        raw_score <= 0.0
+        or not finite(payload.get("development_min_annual_trades"))
+        or payload["development_min_annual_trades"] != float(minimum_rate[0])
+        or not finite(payload.get("trade_activity_bonus"))
+        or payload["trade_activity_bonus"] != float(activity_bonus[0])
+        or payload["selection_score"] > raw_score + activity_bonus[0]
+    ):
+        return False
+    holdout_trades = payload.get("holdout_completed_trades")
+    holdout_sharpe = payload.get("holdout_sharpe")
+    holdout_return = payload.get("holdout_total_return")
+    holdout_mean = payload.get("holdout_mean_holding_sessions")
+    holdout_max = payload.get("holdout_max_holding_sessions")
+    if (
+        not count(holdout_trades)
+        or holdout_trades >= holdout_sessions
+        or not count(holdout_max)
+        or holdout_max > holdout_sessions
+        or holdout_mean is not None and (
+            not finite(holdout_mean) or not 1.0 <= holdout_mean <= holdout_max
+        )
+        or holdout_sharpe is not None and not finite(holdout_sharpe)
+        or holdout_return is not None and not finite(holdout_return)
+        or holdout_trades > 0 and (holdout_mean is None or holdout_max == 0)
+    ):
+        return False
+    passed = bool(
+        finite(holdout_sharpe) and holdout_sharpe > 0.0
+        and finite(holdout_return) and holdout_return > 0.0
+        and holdout_trades >= MIN_HOLDOUT_TRADES
+    )
+    return (status == "passed") == passed
+
+
+def _load_strategy_selection(
+    conn: sqlite3.Connection,
+    asset_symbol: str,
+    signal_symbol: str,
+    rsi_entry_rule: str,
+    summary_rows: list[tuple],
+) -> tuple[bool, dict[str, object] | None]:
+    """Distinguish absent legacy metadata from present but untrustworthy selection."""
+    records = conn.execute(
+        """
+        SELECT asset_symbol, signal_symbol, config_fingerprint, end_date,
+               payload_json, integrity_digest
+        FROM strategy_selection WHERE asset_symbol = ? AND signal_symbol = ?
+        """,
+        (asset_symbol, signal_symbol),
+    ).fetchall()
+    if not records:
+        return False, None
+    if len(records) != 1 or any(type(value) is not str for value in records[0]):
+        return True, None
+    record = records[0]
+    if record[-1] != _strategy_selection_digest(record[:-1]):
+        return True, None
+    if not strategy_config_matches_fingerprint(conn, asset_symbol, signal_symbol, record[2]):
+        return True, None
+    if not summary_rows or {str(row[5]) for row in summary_rows} != {record[3]}:
+        return True, None
+    try:
+        payload = json.loads(record[4])
+        if not isinstance(payload, dict):
+            return True, None
+        canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        if canonical_payload != record[4]:
+            return True, None
+        pair = (payload["buy_rsi"], payload["profit_target_multiple"])
+        if (
+            payload.get("method") != "robust"
+            or type(payload.get("version")) is not int
+            or payload["version"] != SELECTION_VERSION
+            or payload.get("rsi_entry_rule") != rsi_entry_rule
+            or payload.get("status") not in {
+                "passed", "failed_holdout", "insufficient_history", "insufficient_evidence"
+            }
+            or payload.get("grid_digest") != _selection_grid_digest(summary_rows)
+            or not isinstance(payload.get("input_digest"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", payload["input_digest"]) is None
+            or payload.get("start_date") != min(str(row[4]) for row in summary_rows)
+            or payload.get("end_date") != record[3]
+            or any(type(value) not in {int, float} or not math.isfinite(value) for value in pair)
+            or pair not in {(row[2], row[3]) for row in summary_rows}
+            or not _strategy_selection_is_semantically_valid(payload, summary_rows)
+        ):
+            return True, None
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return True, None
+    return True, payload
+
+
+def _refresh_strategy_selection(
+    conn: sqlite3.Connection,
+    *,
+    base_cfg: BacktestConfig,
+    asset_symbol: str,
+    signal_symbol: str,
+    config_pairs: list[tuple[float, float]],
+    rsi_entry_rule: str,
+    strategy_fingerprint: str,
+    deadline_check: Callable[[], None] | None = None,
+) -> tuple[float, float] | None:
+    """Select against the canonical complete history even during a tail-only update."""
+    if base_cfg.selection_method != "robust":
+        conn.execute(
+            "DELETE FROM strategy_selection WHERE asset_symbol = ? AND signal_symbol = ?",
+            (asset_symbol, signal_symbol),
+        )
+        return None
+    rows = conn.execute(
+        f"""SELECT {_STRATEGY_SUMMARY_INTEGRITY_COLUMN_SQL}, integrity_digest
+            FROM strategy_summary WHERE asset_symbol = ? AND signal_symbol = ?""",
+        (asset_symbol, signal_symbol),
+    ).fetchall()
+    if not rows:
+        return None
+    if (
+        any(not _strategy_summary_integrity_row_is_valid(row) for row in rows)
+        or {(row[2], row[3]) for row in rows} != set(config_pairs)
+        or len(rows) != len(set(config_pairs))
+        or len({row[5] for row in rows}) != 1
+    ):
+        raise ValueError("Research selection requires one authenticated, complete strategy grid.")
+    save_strategy_config(conn, asset_symbol, signal_symbol, strategy_fingerprint)
+    _present, current = _load_strategy_selection(conn, asset_symbol, signal_symbol, rsi_entry_rule, rows)
+    if current is not None:
+        return float(current["buy_rsi"]), float(current["profit_target_multiple"])
+    if deadline_check is not None:
+        deadline_check()
+    signal_storage_symbol = _persisted_strategy_signal_symbol(conn, asset_symbol, signal_symbol)
+    full_data = _load_saved_strategy_market_data(conn, asset_symbol, signal_symbol, signal_storage_symbol)
+    start_date = min(str(row[4]) for row in rows)
+    end_date = str(rows[0][5])
+    full_data = full_data.loc[
+        [start_date <= _date_str(date) <= end_date for date in full_data.index]
+    ]
+    signal_close = load_saved_close_series(conn, signal_storage_symbol)
+    rsi = ensure_rsi_values(conn, signal_storage_symbol, base_cfg.rsi_period, signal_close, rebuild=False)
+    arrays = _market_arrays(full_data, rsi, asset_symbol)
+    pairs = sorted(set(config_pairs))
+    from .research_selection import select_strategy
+
+    result = select_strategy(
+        *arrays,
+        np.asarray([pair[0] for pair in pairs], dtype=np.float64),
+        np.asarray([pair[1] for pair in pairs], dtype=np.float64),
+        base_cfg.initial_capital,
+        _trading_cost_rate(base_cfg),
+        rsi_entry_rule=rsi_entry_rule_code(rsi_entry_rule),
+        deadline_check=deadline_check,
+    )
+    selected = (result.get("buy_rsi"), result.get("profit_target_multiple"))
+    if selected == (None, None):
+        selected = min(pairs, key=lambda pair: (-pair[0] if rsi_entry_rule == "upper" else pair[0], pair[1]))
+    if selected not in set(pairs):
+        raise ValueError("Research selection returned a configuration outside the authenticated grid.")
+    # Store the exact consumed arrays' digest for reproducible research provenance.
+    input_digest = hashlib.sha256()
+    input_digest.update(json.dumps([_date_str(date) for date in full_data.index]).encode("utf-8"))
+    for values in arrays:
+        input_digest.update(np.asarray(values, dtype="<f8").tobytes())
+    payload = {
+        **result,
+        "buy_rsi": float(selected[0]),
+        "profit_target_multiple": float(selected[1]),
+        "method": "robust",
+        "version": SELECTION_VERSION,
+        "rsi_entry_rule": rsi_entry_rule,
+        "grid_digest": _selection_grid_digest(rows),
+        "input_digest": input_digest.hexdigest(),
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+    if not _strategy_selection_is_semantically_valid(payload, rows):
+        raise ValueError("Research selection produced inconsistent evidence or acceptance metrics.")
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    record = (asset_symbol, signal_symbol, strategy_fingerprint, end_date, encoded)
+    conn.execute(
+        """INSERT OR REPLACE INTO strategy_selection
+           (asset_symbol, signal_symbol, config_fingerprint, end_date, payload_json, integrity_digest)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (*record, _strategy_selection_digest(record)),
+    )
+    if deadline_check is not None:
+        deadline_check()
+    return float(selected[0]), float(selected[1])
+
+
 def load_best_strategy_summary(
     conn: sqlite3.Connection,
     asset_symbol: str,
@@ -16638,7 +16949,11 @@ def load_best_strategy_summary(
     if type(strategy_state_preverified) is not bool:
         raise ValueError("strategy_state_preverified must be a boolean.")
     order_by = best_strategy_order_by_clause(rsi_entry_rule)
-    row_limit = "LIMIT 1" if strategy_state_preverified else ""
+    selection_exists = conn.execute(
+        "SELECT 1 FROM strategy_selection WHERE asset_symbol = ? AND signal_symbol = ?",
+        (asset_symbol, signal_symbol),
+    ).fetchone() is not None
+    row_limit = "LIMIT 1" if strategy_state_preverified and not selection_exists else ""
     rows = conn.execute(
         f"""
         SELECT {_STRATEGY_SUMMARY_INTEGRITY_COLUMN_SQL}, integrity_digest
@@ -16658,7 +16973,19 @@ def load_best_strategy_summary(
     identities = [(row[2], row[3]) for row in rows]
     if len(set(identities)) != len(identities):
         return None
-    return dict(zip(_STRATEGY_SUMMARY_INTEGRITY_COLUMNS, rows[0][:-1], strict=True))
+    present, selection = _load_strategy_selection(conn, asset_symbol, signal_symbol, rsi_entry_rule, rows)
+    if present and selection is None:
+        return None
+    best = rows[0]
+    if selection is not None:
+        best = next(
+            row for row in rows
+            if (row[2], row[3]) == (selection["buy_rsi"], selection["profit_target_multiple"])
+        )
+    result = dict(zip(_STRATEGY_SUMMARY_INTEGRITY_COLUMNS, best[:-1], strict=True))
+    if selection is not None:
+        result["selection"] = selection
+    return result
 
 
 def _best_summary_config(
@@ -17910,6 +18237,7 @@ def _ensure_complete_best_equity_curve(
             best_buy_rsi,
             best_profit_target_multiple,
             rsi_entry_rule,
+            save_summary=base_cfg.selection_method != "robust",
         )
     raise RuntimeError("Best-strategy equity curve reconstruction exceeded the grid size.")
 
@@ -18577,6 +18905,20 @@ def _process_asset_grid(
                 data = data.loc[[_date_str(date) > checkpoint_date for date in data.index]]
 
     if data.empty:
+        _refresh_strategy_selection(
+            conn,
+            base_cfg=base_cfg,
+            asset_symbol=asset_symbol,
+            signal_symbol=signal_symbol,
+            config_pairs=[
+                (float(buy_rsi), float(profit_target_multiple))
+                for buy_rsi in buy_rsi_values
+                for profit_target_multiple in profit_target_values
+            ],
+            rsi_entry_rule=rsi_entry_rule,
+            strategy_fingerprint=strategy_fingerprint,
+            deadline_check=deadline_check,
+        )
         if not strategy_state_preverified:
             _ensure_complete_best_equity_curve(
                 conn,
@@ -18924,8 +19266,18 @@ def _process_asset_grid(
     save_strategy_states(conn, strategy_state_rows)
     save_strategy_summaries(conn, strategy_summary_rows)
 
+    selected_config = _refresh_strategy_selection(
+        conn,
+        base_cfg=base_cfg,
+        asset_symbol=asset_symbol,
+        signal_symbol=signal_symbol,
+        config_pairs=config_pairs,
+        rsi_entry_rule=rsi_entry_rule,
+        strategy_fingerprint=strategy_fingerprint,
+        deadline_check=deadline_check,
+    )
     if strategy_summary_rows:
-        best_config = _best_summary_config_from_validated_rows(
+        best_config = selected_config or _best_summary_config_from_validated_rows(
             strategy_summary_rows,
             rsi_entry_rule,
         )

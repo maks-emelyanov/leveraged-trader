@@ -30,6 +30,33 @@ from leveraged_trader.config import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_strategy_selection_defaults_to_robust_validation(self) -> None:
+        cfg = BacktestConfig()
+
+        self.assertEqual(cfg.selection_method, "robust")
+        validate_backtest_configuration(cfg)
+
+    def test_strategy_selection_requires_an_explicit_supported_method(self) -> None:
+        validate_backtest_configuration(BacktestConfig(selection_method="legacy_sharpe"))
+        for invalid in (None, True, "", "sharpe", "ROBUST", []):
+            with self.subTest(selection_method=invalid), self.assertRaisesRegex(ValueError, "selection_method"):
+                validate_backtest_configuration(BacktestConfig(selection_method=invalid))
+
+    def test_cli_uses_coarse_shorter_target_grid_with_robust_selection(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(sys, "argv", ["leveraged-trader"]),
+            patch("leveraged_trader.cli.load_dotenv"),
+            patch("leveraged_trader.cli.run_resumable_optimizations") as run,
+        ):
+            main()
+
+        configuration = run.call_args.kwargs
+        self.assertEqual(configuration["base_cfg"].selection_method, "robust")
+        self.assertEqual(configuration["buy_rsi_values"], [20, 25, 30, 35, 40, 45, 50])
+        self.assertEqual(configuration["short_buy_rsi_values"], [50, 55, 60, 65, 70, 75, 80])
+        self.assertEqual(configuration["profit_target_values"], [1.02, 1.05, 1.10, 1.20, 1.30, 1.50, 2.00])
+
     def test_load_dotenv_ignores_missing_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             load_dotenv(str(Path(tmp) / ".env"))

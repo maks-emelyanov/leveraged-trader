@@ -46,9 +46,9 @@ options:
 | --- | --- |
 | Starting capital | `$100,000` of simulated cash per parameter combination |
 | RSI | 14-session SMA-seeded Wilder RSI |
-| Long-product entry grid | RSI thresholds `20` through `50`, inclusive, in increments of `1`; enter when RSI is at or below the threshold |
-| Inverse-product entry grid | RSI thresholds `50` through `80`, inclusive, in increments of `1`; enter when the underlying proxy RSI is at or above the threshold |
-| Profit-target grid | Return multiples `1.10` through `5.00`, inclusive, in increments of `0.10` |
+| Long-product entry grid | RSI thresholds `20` through `50`, inclusive, in increments of `5`; enter when RSI is at or below the threshold |
+| Inverse-product entry grid | RSI thresholds `50` through `80`, inclusive, in increments of `5`; enter when the underlying proxy RSI is at or above the threshold |
+| Profit-target grid | Return multiples `1.02`, `1.05`, `1.10`, `1.20`, `1.30`, `1.50`, `2.00` |
 | Simulated trading costs | `1` basis point of fee plus `2` basis points of slippage on each buy and sell notional |
 | Position sizing | Commit all available simulated cash, including fractional shares; this differs from whole-share Alpaca paper-order sizing |
 | Risk-free series | Yahoo Finance `^IRX`, interpreted as an annual percentage yield and converted to a 252-session daily return |
@@ -62,9 +62,72 @@ the live paper-order budget, whole-share sizing, quote checks, and fill behavior
 
 Metrics use the asset's settled-session calendar and 252-session annualization. The `^IRX` daily
 risk-free return is `(1 + annual_yield / 100) ** (1 / 252) - 1` and is forward-filled onto that
-calendar. Each asset's winning grid row is selected by non-null Sharpe, then total return, then CAGR.
-Ties prefer the more selective RSI threshold (lower for the Long workflow and higher for the Short
-workflow), followed by the smaller profit target.
+calendar. Default selection evaluates 49 combinations per asset, balancing Sharpe, completed-trade
+frequency, and holding duration under chronological acceptance rules. These fixed preferences are
+not themselves optimized against the history:
+
+1. Require at least 630 settled asset sessions. Reserve the final 20% as a holdout, and split the
+   earlier 80% into three consecutive development blocks. Each block starts in cash without a pending
+   order; RSI uses causal earlier observations for warmup. Positions do not cross block boundaries.
+2. Require each development block to have at least three completed round trips, positive return,
+   positive Sharpe, and complete risk-free coverage. Fees and slippage apply in every block.
+3. Require a positive base score: `median(block Sharpe) - std(block Sharpe)
+   - 0.5 * log(1 + mean hold / 21) - 0.25 * log(1 + max hold / 63)`.
+   Mean hold is the equally weighted mean of the three block averages. Holding duration counts
+   trading sessions inclusively: entry and exit on the same day count as one session. An unfinished
+   position contributes its age to the mean and maximum, and its value remains marked to market.
+   Add a completed-trade bonus of `0.5 * R / (R + 12)`, where `R` is the minimum of
+   `252 * completed round trips / block sessions` across the three development blocks. Using the
+   least active block rewards sustained activity; an unfinished trade earns no bonus. The bonus
+   approaches a cap of 0.5 and equals 0.25 at 12 completed round trips per year. These constants
+   express an arbitrary fixed preference, not an empirically optimized trade frequency. Trade
+   activity cannot rescue a nonpositive base score or a failed development gate.
+4. Cap each full score at the median score of existing immediate RSI/target neighbors; an ineligible
+   neighbor contributes zero. This discounts isolated parameter peaks. Select the highest positive
+   score, then higher minimum annual completed-trade rate, then shorter mean/max holds, then more
+   selective RSI and smaller target.
+5. Test only that selected pair on the holdout. It needs at least two completed round trips,
+   positive return, positive Sharpe, and complete risk-free coverage. Failure blocks buy signals;
+   the optimizer does not try another pair against the same holdout.
+
+Reports expose development and holdout metrics separately, including the minimum annual
+completed-trade rate across development blocks and its trade-activity bonus. Full-history performance
+and the retained equity curve describe the selected fixed pair retrospectively; they are not an
+out-of-sample equity curve. The full-history `Trades Executed` column counts individual buy/sell
+fills; development and holdout completed-trade metrics count round trips. Insufficient
+history/evidence produces a deterministic research-only row (most selective RSI and smallest
+target), with no buy recommendation. The existing full-history Sharpe
+threshold of 1.0 and order guards also still apply to validated buy recommendations.
+
+This objective favors more completed trades and shorter historical holds; it does not impose a
+maximum holding period or change existing managed exits. The holdout is relative to each run and
+moves as history grows.
+Repeated inspection, correlated candidates, and the current-product universe can still introduce
+selection bias. A passing result is a screening result, not a statistical guarantee: see
+[Bailey et al., The Probability of Backtest Overfitting](https://www.davidhbailey.com/dhbpapers/backtest-prob.pdf).
+The Python configuration supports explicit `selection_method="legacy_sharpe"` for historical research
+comparisons; the CLI and `BacktestConfig()` default to `"robust"`. Selection method and version are
+fingerprinted, so the first update under robust selection version 2 rebuilds incompatible research
+state to apply the trade-activity preference.
+
+The [historical grid comparison](docs/grid-search-evidence.md) is pinned to selection version 1,
+before the trade-activity bonus, and evaluates eight fixed grid designs
+on 76 cached funds across 455 annual tests in 2017–2022, followed by a continuous 2023–2026 check.
+It does not establish an optimal grid: the leading 35-point alternative gains from only one
+TQQQ/year case, and both it and the current grid remain cash in the later period. Defaults remain
+at 49 combinations because no replacement meets the preregistered evidence requirements.
+
+The newer [grid resolution study](docs/grid-resolution-evidence.md) uses selection version 2
+and tests 45 designs from the requested 4,059-pair grid down to four endpoint pairs. It completes
+34,020 validation and 3,910 later confirmation selections. RSI step 4 and target step 0.04 are
+about 4.9 times faster, but their apparent advantage is concentrated, sensitive to grid alignment,
+and unconfirmed later. The full spacing ladder does not establish a supported optimum or
+performance degradation boundary, so this study also leaves defaults unchanged.
+
+The [research utilities guide](docs/research-utilities.md) documents the version 1/version 2
+trade-activity comparison and the historical signal-cleaning script. The comparison changes no
+selected parameters or acceptance outcomes in its 76-fund sample. Signal cleaning is a separate
+descriptive export process; its retained trades do not determine production grids or buy signals.
 
 ## Setup
 
@@ -562,11 +625,13 @@ CSV reports are written to `outputs/` by default:
 
 - `best_equity_curves.csv`: the complete retained equity curve for each asset's winning grid row,
   with Long/Short-prefixed curve names.
-- `optimization_summary.csv`: one winning strategy row per successfully processed asset, including
-  its parameters and performance metrics. It is not a dump of every grid combination.
+- `optimization_summary.csv`: one selected strategy row per successfully processed asset, including
+  parameters, validation status, selection score, candidates tested, development/holdout trade counts,
+  the minimum annual development trade rate, its trade-activity bonus, and mean/maximum holding
+  sessions. It is not a dump of every grid combination.
 - `buy_signals.csv`: winning strategies that are flat with a buy pending for the next open, have more
   than one executed simulated trade, have Sharpe of at least `1.0`, and have a sufficiently fresh RSI
-  observation.
+  observation. Default robust selection additionally requires a passing chronological holdout.
 - `eligible_buy_signals.csv`: `buy_signals.csv` after excluding symbols already represented by an
   active persisted managed position. “Eligible” is a local pre-broker classification: live holdings,
   open orders, quotes, cash, market-clock checks, and concurrent state can still make Alpaca skip a
@@ -695,8 +760,11 @@ long and short ETF/ETN workflow results reported separately before combined buy 
 Each asset run summary is identified by its Long or Short table title and therefore omits a redundant
 `Workflow` column. Signal tables always show the separate RSI observation date, including in narrow
 layouts, so a weekend or 24/7 proxy observation is not mistaken for the asset session date.
-The terminal Best Sharpe table shows only strategies with at least two executed trades and Sharpe of
-1.0 or greater; `optimization_summary.csv` retains the full per-asset summary. CSV files retain full
+The terminal Selected Parameters table includes failed and insufficient-evidence robust results,
+with validation status, minimum development trades per year (`Dev trades/yr`), and holding durations;
+`optimization_summary.csv` retains the full per-asset summary. Explicit legacy research still filters
+the terminal table to at least two fills and Sharpe
+of 1.0 or greater. CSV files retain full
 order IDs and detail, include a `Workflow` column where side attribution applies, and
 `best_equity_curves.csv` uses side-prefixed curve names. Terminal Alpaca
 tables show chronological display IDs that preserve closed-position gaps, plus the most useful fields

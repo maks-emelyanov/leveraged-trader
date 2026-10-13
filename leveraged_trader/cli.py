@@ -499,9 +499,9 @@ def main() -> None:
         require_workflow_source_success=args.require_workflow_source_success,
     )
     tradier_cfg = _tradier_config_from_args(args)
-    buy_rsi_values = list(range(20, 51))
-    short_buy_rsi_values = list(range(50, 81))
-    profit_target_values = [round(x, 2) for x in np.arange(1.1, 5.05, 0.1)]
+    buy_rsi_values = list(range(20, 51, 5))
+    short_buy_rsi_values = list(range(50, 81, 5))
+    profit_target_values = [1.02, 1.05, 1.10, 1.20, 1.30, 1.50, 2.00]
 
     run_resumable_optimizations(
         mode=mode,

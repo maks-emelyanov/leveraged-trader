@@ -641,8 +641,9 @@ class WorkflowReporter:
             empty_message="No asset workflows were run.",
         )
 
-    def optimization_summary(self, df: pd.DataFrame, *, title: str = "Best Sharpe Parameters By Asset") -> None:
+    def optimization_summary(self, df: pd.DataFrame, *, title: str = "Selected Parameters By Asset") -> None:
         display_df = df.drop(columns=["End Date", "Annualized Vol", "Hit Rate"], errors="ignore")
+        has_validation = "Validation Status" in display_df.columns
         if "Trades Executed" in display_df.columns:
             trades = pd.to_numeric(display_df["Trades Executed"], errors="coerce").fillna(0)
             no_trades = trades.le(0)
@@ -650,8 +651,9 @@ class WorkflowReporter:
                 if metric_column in display_df.columns:
                     display_df[metric_column] = display_df[metric_column].astype("object")
                     display_df.loc[no_trades, metric_column] = pd.NA
-            display_df = display_df[trades.ge(2)]
-        if "Sharpe" in display_df.columns:
+            if not has_validation:
+                display_df = display_df[trades.ge(2)]
+        if not has_validation and "Sharpe" in display_df.columns:
             display_df = display_df[pd.to_numeric(display_df["Sharpe"], errors="coerce").ge(1.0)]
         self.dataframe(
             title,
@@ -659,6 +661,14 @@ class WorkflowReporter:
             [
                 TableColumn("Asset", no_wrap=True),
                 TableColumn("RSI Symbol", "RSI", no_wrap=True),
+                TableColumn("Validation Status", "Validation", no_wrap=True),
+                TableColumn("Selection Score", "Score", formatter=format_optional_decimal_4, justify="right"),
+                TableColumn(
+                    "Development Min Annual Trades", "Dev trades/yr", formatter=format_decimal_2, justify="right",
+                ),
+                TableColumn("Development Mean Hold Sessions", "Dev hold", formatter=format_decimal_2, justify="right"),
+                TableColumn("Holdout Mean Hold Sessions", "Test hold", formatter=format_decimal_2, justify="right"),
+                TableColumn("Holdout Sharpe", "Test Sharpe", formatter=format_optional_decimal_4, justify="right"),
                 TableColumn("Start Date", no_wrap=True),
                 TableColumn("Trading Days", justify="right", formatter=format_int, no_wrap=True),
                 TableColumn("Buy RSI", justify="right", formatter=format_decimal_2, no_wrap=True),
@@ -682,7 +692,10 @@ class WorkflowReporter:
                 ),
                 TableColumn("Max Drawdown", "Max DD", justify="right", formatter=format_decimal_4, no_wrap=True),
             ],
-            empty_message="No strategies with at least 2 trades and Sharpe >= 1.0.",
+            empty_message=(
+                "No evaluated strategies." if has_validation
+                else "No strategies with at least 2 trades and Sharpe >= 1.0."
+            ),
         )
 
     def signal_report(self, title: str, df: pd.DataFrame, *, empty_message: str) -> None:

@@ -79,6 +79,11 @@ jobs:
               "scripts/cron/run-scheduled",
               "scripts/cron/run-scheduled-clean-environment",
               "scripts/cron/runtime-security",
+              "scripts/normalize-historical-signals.py",
+              "scripts/research-grid.py",
+              "scripts/research-resolution.py",
+              "tests/__init__.py",
+              "tests/strategy_fixtures.py",
               "uv.lock",
           }
           executable_scripts = {

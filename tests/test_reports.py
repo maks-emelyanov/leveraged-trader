@@ -11,7 +11,6 @@ import numpy as np
 import pandas as pd
 
 import leveraged_trader.reports as reports_module
-from leveraged_trader.config import BacktestConfig
 from leveraged_trader.reports import (
     build_alpaca_realized_pnl_summary,
 )
@@ -31,6 +30,7 @@ from leveraged_trader.storage import (
     save_strategy_state,
     save_strategy_summary,
 )
+from tests.strategy_fixtures import LegacyBacktestConfig as BacktestConfig
 
 
 def build_buy_signal_report(

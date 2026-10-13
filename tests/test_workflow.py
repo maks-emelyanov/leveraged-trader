@@ -30,7 +30,6 @@ from leveraged_trader.alpaca import AlpacaBuyBatchError, AlpacaReconciliationErr
 from leveraged_trader.benchmark import WorkflowPhaseTimings, WorkflowTimer
 from leveraged_trader.config import (
     AlpacaOrderConfig,
-    BacktestConfig,
     TradierMarketDataConfig,
     UniverseConfig,
 )
@@ -102,6 +101,7 @@ from leveraged_trader.workflow import (
     run_resumable_optimizations_async,
     validate_alpaca_snapshot,
 )
+from tests.strategy_fixtures import LegacyBacktestConfig as BacktestConfig
 
 
 class WorkflowAsyncTests(unittest.TestCase):

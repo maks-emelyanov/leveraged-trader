@@ -1,0 +1,38 @@
+{
+  "status": "passed",
+  "selection": "First, middle (floor(n/2)), and last unique eligible (asset,year) cells in sorted order.",
+  "cells": [
+    {
+      "asset": "AGQ",
+      "year": 2013,
+      "grid_count": 45,
+      "replay_seconds": 0.8076018449974072
+    },
+    {
+      "asset": "SMDD",
+      "year": 2013,
+      "grid_count": 45,
+      "replay_seconds": 0.3055043599997589
+    },
+    {
+      "asset": "ZSL",
+      "year": 2022,
+      "grid_count": 45,
+      "replay_seconds": 1.0602816190003068
+    }
+  ],
+  "eligible_cell_count": 756,
+  "registered_grid_count": 45,
+  "replayed_rows": 135,
+  "compared_fields": 9045,
+  "numeric_comparisons": 5693,
+  "excluded_fields": [
+    "selection_seconds"
+  ],
+  "absolute_tolerance": 1e-12,
+  "maximum_numeric_error": 0.0,
+  "original_rows_sha256": "24126e810772fcdfa683c4fde0682346e3da7382ad7627443207f5d9311286b4",
+  "original_rows_unchanged": true,
+  "discrepancies_count": 0,
+  "discrepancies": []
+}

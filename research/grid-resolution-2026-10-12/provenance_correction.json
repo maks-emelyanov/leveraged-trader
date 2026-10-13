@@ -1,0 +1,24 @@
+{
+  "date": "2026-10-12",
+  "reason": "Review identified omitted transitive simulator dependencies in the source hash guard.",
+  "registration_note": "These dependency hashes were added during review after the study completed; they were not hash-pinned at original registration.",
+  "original_provenance": {
+    "path": "provenance.original.json",
+    "sha256": "1d654f2f3fa9264ab63c76cd7723122aac11047e9f76523df18cbb2761e0556b",
+    "preserved_byte_for_byte": true
+  },
+  "revised_existing_source_hashes": {
+    "scripts/research-resolution.py": {
+      "original_sha256": "f789a92028a4324e5a7d48e98a73ac02c77d87df59100669431a1866e12ec479",
+      "revised_sha256": "755c91dc70aa821904e87d0c6611fbecfedaf2da9a2a97d66f634dbcb406d854",
+      "change": "Added pricing.py and backtest.py to the preparation source manifest; evaluation behavior is unchanged."
+    }
+  },
+  "added_source_sha256": {
+    "leveraged_trader/pricing.py": "3cd09a557598224a8f4a01aec23904dcf0d7671b525f970054abf52540acaa67",
+    "leveraged_trader/backtest.py": "c32909aef61e9a7cfd0771584f12f9ee98dda0d996f2237bb98506510758932d"
+  },
+  "preserved_artifacts": "Protocol, simulation sources, frozen input arrays, choices, trial rows, summaries, decisions and original verification records are unchanged.",
+  "verification_record": "provenance_correction_verification.json",
+  "replay_scope": "Repeat the original predetermined first/middle/last eligible asset-year cells across all 45 grids; this is a focused replay, not a rerun of the full study."
+}

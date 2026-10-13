@@ -1,0 +1,10 @@
+{
+  "assets": [
+    "TQQQ",
+    "SQQQ"
+  ],
+  "cutoff": "2022-12-31",
+  "repeats": 3,
+  "seed": 20261013,
+  "reason": "Supplement original history-length sample, which contains four inverse products and one long product, with this repository\u2019s named pair. Does not affect grid selection or inference."
+}

@@ -1,0 +1,548 @@
+asset,signal,direction,source,included,reason,sessions,first_date,last_date,signal_storage,input_sha256,input_index
+AALG,AAL,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+AAOG,AAOI,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+AAOX,AAOI,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+AAOZ,AAOI,inverse,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+AAPB,AAPL,long,Nasdaq ETF definitions,True,,1045.0,2022-08-10,2026-10-08,AAPL,82f24ea8a312a545b2cf1e23b7f2831cda634416eebd937d7662ea85148cd137,0.0
+AAPE,AAPL,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+AAPU,AAPL,long,Nasdaq ETF definitions,True,,1046.0,2022-08-09,2026-10-08,AAPL,d6f7178dc045969ab7c55a2c999bf54580e0d3b5bac9338c75d1ba5f79c53cad,1.0
+AAPX,AAPL,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+ADBG,ADBE,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+ADIU,ADI,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+AEHG,AEHR,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+AFRU,AFRM,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+AGQ,SLV,long,ProShares issuer table,True,,4488.0,2008-12-04,2026-10-08,SLV,6dd7fdf8ef241775a5101982aa83d3115721ca0ada44758d5e5f7510a2b7e167,2.0
+AIQD,AIQ,inverse,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+AIQU,AIQ,long,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+AKAL,AKAM,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+ALBG,ALB,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+AMA,AMAT,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+AMAU,AMAT,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+AMDG,AMD,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+AMDL,AMD,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+AMKL,AMKR,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+AMPU,AMPX,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+AMUU,AMD,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+AMZG,AMZN,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+AMZO,AMZN,inverse,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+AMZU,AMZN,long,Nasdaq ETF definitions,True,,1026.0,2022-09-07,2026-10-08,AMZN,9763ceb0953ad10965342b610c471940fc8457065b56b4f9e34ad6bfc215492b,3.0
+AMZZ,AMZN,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+ANEL,ANET,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+APHG,APH,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+APHU,APH,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+APLX,APLD,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+APLZ,APLD,inverse,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+APPX,APP,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+ARCX,ACHR,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+ARMG,ARM,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+ASMG,ASML,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+ASMU,ASML,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+ASSX,ASST,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+ASTG,ASTS,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+ASTN,ASTS,inverse,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+ASTX,ASTS,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+ASTY,ASTS,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+ASUP,ASTS,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+AVAZ,AVAX-USD,long,Volatility Shares issuer table,False,fewer_than_756_price_sessions,,,,,,
+AVGG,AVGO,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+AVGU,AVGO,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+AVGX,AVGO,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+AVL,AVGO,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+AVXX,AVAV,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+AXTL,AXTI,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+AXTQ,AXTI,inverse,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+AXTU,AXTI,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+AXTX,AXTI,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+BABU,BABA,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+BABX,BABA,long,Nasdaq ETF definitions,True,,958.0,2022-12-13,2026-10-08,BABA,2bf5fc97b28b7eaef6a5a44042e2563dd7d79128478628f0da98b748b1bd4cba,4.0
+BAIG,BBAI,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+BBUL,BB,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+BDCX,BIZD,long,UBS ETRACS ETN issuer table,True,,1590.0,2020-06-11,2026-10-08,BIZD,4a8c6e5018c28c46db279ba79b2a558f0b9fe55cf024fbbe8e7fa10d8637ba7f,5.0
+BEG,BE,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+BEGS,BEGS,long,Tuttle Capital issuer table,False,fewer_than_756_price_sessions,,,,,,
+BERZ,FNGS,inverse,MicroSectors ETN issuer table,True,,1291.0,2021-08-18,2026-10-08,FNGS,3c8478ee1b72f2f498a4126fa3df20240aa28d55eae55283137a59d754fe9dec,6.0
+BEX,BE,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+BEZ,BE,inverse,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+BIB,IBB,long,Nasdaq ETF definitions,True,,4151.0,2010-04-09,2026-10-08,IBB,9ab5d4a55fdc31d7dd6d39c43f438905e160337e5b30584ce04f569c4c751de9,7.0
+BIDG,BIDU,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+BIS,IBB,inverse,Nasdaq ETF definitions,True,,4151.0,2010-04-09,2026-10-08,IBB,e5767eda63c61d26b7ad0786f3a03dea728d8cc531e11f2c05473bdc3bba02c7,8.0
+BITU,BTC-USD,long,ProShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+BITX,BTC-USD,long,Volatility Shares issuer table,True,,825.0,2023-06-27,2026-10-08,BTC-USD,dbd07a8ad5fcaf9e15d49c92debbc94d354f284282fdf7c9f500ce0ee697485d,9.0
+BLSG,BLSH,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+BMNG,BMNR,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+BMNU,BMNR,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+BMNZ,BMNR,inverse,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+BNKD,KBWB,inverse,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+BNKU,KBWB,long,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+BOEG,BA,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+BOEU,BA,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+BOIL,UNG,long,ProShares issuer table,True,,3773.0,2011-10-06,2026-10-08,UNG,ab3be5ec9b12d069a1e77e2cbafb8ac5982ca1e42520a5c6e62e64008edea12d,10.0
+BRKU,BRK-B,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+BRZD,EWZ,inverse,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+BRZL,EWZ,long,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+BTCL,BTC-USD,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+BTCZ,BTC-USD,inverse,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+BTDL,BTDR,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+BULG,BULL,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+BULZ,FNGS,long,MicroSectors ETN issuer table,True,,1291.0,2021-08-18,2026-10-08,FNGS,1ceab869176b27700796ebfef0adeef07f9be332e504e799fb9ba52e17e8227d,11.0
+BZQ,EWZ,inverse,ProShares issuer table,True,,4353.0,2009-06-19,2026-10-08,EWZ,9a9b2e3b75ab76f15d2111b49d466a4419076269af1cb8791bc3a6436480fc8b,12.0
+CATG,CAT,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+CBRG,CBRS,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+CBRX,CBRS,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+CBRZ,CBRS,inverse,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+CCUP,CRCL,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+CDNG,CDNS,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+CEFD,CEFS,long,UBS ETRACS ETN issuer table,True,,1596.0,2020-06-03,2026-10-08,CEFS,77e1e952b2b21f26cfe7e1cc6401d8610d1a1e65ea71613cf2fa432195ac4b67,13.0
+CEGX,CEG,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+CHNU,LINK-USD,long,Volatility Shares issuer table,False,fewer_than_756_price_sessions,,,,,,
+CIEG,CIEN,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+CIEX,CIEN,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+CIFG,CIFR,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+CIFU,CIFR,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+CLSX,CLSK,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+COHH,COHR,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+COHQ,COHR,inverse,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+COHX,COHR,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+COIA,COIN,long,ProShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+COIG,COIN,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+CONI,COIN,inverse,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+CONL,COIN,long,Nasdaq ETF definitions,True,,1045.0,2022-08-10,2026-10-08,COIN,27de14dacf523356aa1f4e8d23bb2f5fce5b633171d929522992cfc7dcb7f651,14.0
+CONX,COIN,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+COPZ,COPX,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+CORD,CRWV,inverse,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+COTG,COST,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+COZX,CORZ,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+CPNX,CPNG,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+CRCA,CRCL,long,ProShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+CRCD,CRCL,inverse,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+CRCG,CRCL,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+CRDU,CRDO,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+CRDX,ADA-USD,long,Volatility Shares issuer table,False,fewer_than_756_price_sessions,,,,,,
+CRMG,CRM,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+CRMU,CRML,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+CRMX,CRML,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+CRWG,CRWV,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+CRWL,CRWD,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+CRWU,CRWV,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+CSCL,CSCO,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+CSEX,CLS,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+CWVX,CRWV,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+DAMD,AMD,inverse,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+DDM,DIA,long,ProShares issuer table,True,,5107.0,2006-06-21,2026-10-08,DIA,cd536a1d0677ac87a843a15b1cf8d521f382fd9aafce0003fac0f732e87b76d5,15.0
+DIG,XLE,long,ProShares issuer table,True,,4953.0,2007-02-01,2026-10-08,XLE,c34423522b2e4f29e13f5790f9371535c8e76d37b66e57c9e4bf4342029269d5,16.0
+DJTU,DJT,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+DLLL,DELL,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+DRAL,DRAM,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+DUG,XLE,inverse,ProShares issuer table,True,,4953.0,2007-02-01,2026-10-08,XLE,00eef6516655136918ea3f26ec746f08fb77324fa1897b4b70da5a5e7d669037,17.0
+DULL,GLD,inverse,MicroSectors ETN issuer table,True,,911.0,2023-02-22,2026-10-08,GLD,fd7d01f019a4576e80563d78d7698b13477c71d024d90d103c147bfae8a60573,18.0
+DUOG,DUOL,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+DXD,DIA,inverse,ProShares issuer table,True,,5092.0,2006-07-13,2026-10-08,DIA,56cee62075d692d782ae0819cda077d896e5ca0313dfc13302b53ccd37945d33,19.0
+ECHX,ECHO,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+EET,EEM,long,ProShares issuer table,True,,4364.0,2009-06-04,2026-10-08,EEM,3f6734766ad516fafe19bc327305579e1ee94d743dacfb2d8fde58174d14324b,20.0
+EEV,EEM,inverse,ProShares issuer table,True,,4763.0,2007-11-01,2026-10-08,EEM,ac5aef6087d9784f3662dc4dbb67dcdbdd8ebcfcc80e948195706b8766a35168,21.0
+EFO,EFA,long,ProShares issuer table,True,,4364.0,2009-06-04,2026-10-08,EFA,e6523347111a445707c7ea9e03905cd9b8e3b987d8533d724dbc1f46cd6ab9db,22.0
+EFU,EFA,inverse,ProShares issuer table,True,,4768.0,2007-10-25,2026-10-08,EFA,c2ee2e85b2838cf795b5e009c80b631336dc7d9982d6d0612bbc9edb05a20714,23.0
+ELIL,LLY,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+ELOL,ELOL,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+ENTL,ENTG,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+EOSU,EOSE,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+EPV,VGK,inverse,ProShares issuer table,True,,4353.0,2009-06-19,2026-10-08,VGK,24e7cdc8e924a6d789d5fe841c0433c5b9eda5456ae4b1c4170043cc83128cbd,24.0
+EQQQ,QQQ,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+ETHD,ETH-USD,inverse,ProShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+ETHT,ETH-USD,long,ProShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+ETHU,ETH-USD,long,Volatility Shares issuer table,False,fewer_than_756_price_sessions,,,,,,
+ETNG,ETN,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+ETU,ETH-USD,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+EUO,FXE,inverse,ProShares issuer table,True,,4494.0,2008-11-25,2026-10-08,FXE,d4beab6363e508829a960d0414e96b2c0b656e5ba0d68ed22981a381e50d3c40,25.0
+EWV,EWJ,inverse,ProShares issuer table,True,,4758.0,2007-11-08,2026-10-08,EWJ,50498df3b17b6abfbb4c09cae523f7f4137de325f4ab0287d8072e08c8c4a68b,26.0
+EZJ,EWJ,long,ProShares issuer table,True,,4363.0,2009-06-05,2026-10-08,EWJ,ac5e9e3cd32b5fcdd5c41c7977ceed2b51c34a191952ca295302407c3224926c,27.0
+FBL,META,long,Nasdaq ETF definitions,True,,958.0,2022-12-13,2026-10-08,META,2a6d654fba5772c5cbc4a7943ebf13efb002d819e80b97bbca0d5c545e137fb9,28.0
+FCXG,FCX,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+FDRX,FDRS,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+FGRU,FIGR,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+FIGG,FIG,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+FIXX,FIX,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+FLEL,FLEX,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+FLYD,PEJ,inverse,MicroSectors ETN issuer table,True,,1079.0,2022-06-22,2026-10-08,PEJ,f8fe093e28b57f16f1eeb52be842cd70a09c34cec0304cd96984ae40bfd6b410,29.0
+FLYT,FLY,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+FLYU,PEJ,long,MicroSectors ETN issuer table,True,,1079.0,2022-06-22,2026-10-08,PEJ,0884bbc5bd622f5b33e4268c07e0f916830afbe704e8c3f5430700fee750da62,30.0
+FNG,FN,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+FNGD,FNGS,inverse,MicroSectors ETN issuer table,True,,1720.0,2019-12-04,2026-10-08,FNGS,b217da42da77ecf391ad1c0dc5d3a9ae69a059a91855d60a93078e10cf45d4fe,31.0
+FNGO,FNGS,long,MicroSectors ETN issuer table,True,,1720.0,2019-12-04,2026-10-08,FNGS,0e48d065c9ef1c9489db74b7ae1ef236bde522bb811be70d418d3e1eaaeea92d,32.0
+FNGU,FNGS,long,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+FOMG,FORM,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+FPSX,FPS,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+FUTG,FUTU,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+FXP,FXI,inverse,ProShares issuer table,True,,4758.0,2007-11-08,2026-10-08,FXI,d689c49366dc7f4e7e2df481810b60cf76592d6d55146c9b47cfdf44eac48350,33.0
+GDXD,GDX,inverse,MicroSectors ETN issuer table,True,,1468.0,2020-12-03,2026-10-08,GDX,8f1b8cd3201a95b6bdf4b7dd932c50c4c008da24d488c247902d1fd3f47cbbb8,34.0
+GDXU,GDX,long,MicroSectors ETN issuer table,True,,1468.0,2020-12-03,2026-10-08,GDX,a6dc6c8b895a3d88b827563c0136405ab9fd75316209cd9a48b404ecd44c2c6a,35.0
+GEMG,GEMI,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+GEVG,GEV,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+GEVX,GEV,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+GFSG,GFS,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+GGLL,GOOGL,long,Nasdaq ETF definitions,True,,1026.0,2022-09-07,2026-10-08,GOOGL,efcafe7eff2eeea7ae496b56b3550eb37f679a8950f7595ed5c2f381b3d5dc5e,36.0
+GLGG,GLXY,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+GLL,GLD,inverse,ProShares issuer table,True,,4489.0,2008-12-03,2026-10-08,GLD,34f8e630401dcf96540bae5ab76617e7c03ddc652455a098e5cf943bbcad3c8f,37.0
+GLWG,GLW,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+GLXU,GLXY,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+GMEU,GME,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+GOOL,GOOGL,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+GOOX,GOOG,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+GOU,GOOGL,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+GRAG,GRAB,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+HDLB,SPHD,long,UBS ETRACS ETN issuer table,True,,1744.0,2019-10-30,2026-10-08,SPHD,9776a1931816701d14aff23c5ec7d5c15d3557d037a5c824206041c607850905,38.0
+HIMZ,HIMS,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+HODU,HOOD,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+HONG,HON,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+HOOG,HOOD,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+HOOX,HOOD,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+HPEL,HPE,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+HUTG,HUT,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+HYGD,HYG,inverse,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+HYGU,HYG,long,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+HYNX,SKHY,long,Tuttle Capital issuer table,False,fewer_than_756_price_sessions,,,,,,
+IBX,IBM,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+INFH,INFQ,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+INTW,INTC,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+IONL,IONQ,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+IONX,IONQ,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+IONZ,IONQ,inverse,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+IRE,IREN,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+IREG,IREN,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+IREX,IREN,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+IREZ,IREN,inverse,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+ISUL,ISRG,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+JBLG,JBL,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+JOBX,JOBY,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+JPND,EWJ,inverse,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+JPNU,EWJ,long,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+KATT,PURR,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+KBAB,BABA,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+KBDU,BIDU,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+KEEX,KEEL,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+KEYG,KEYS,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+KJD,JD,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+KLAG,KLAC,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+KMLI,MELI,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+KOLD,UNG,inverse,ProShares issuer table,True,,3773.0,2011-10-06,2026-10-08,UNG,3d444a9444d59dffe443fbd6319f6dd1d6ff419c6e2137cefdc1e1bec9b23d56,39.0
+KPDD,PDD,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+KTUP,KTOS,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+LABX,ALAB,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+LEUX,LEU,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+LINT,INTC,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+LITG,LITE,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+LITU,LITE,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+LITX,LITE,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+LITZ,LITE,inverse,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+LLYX,LLY,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+LMTL,LMT,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+LNOK,NOK,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+LQDD,LQD,inverse,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+LQDU,LQD,long,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+LRCU,LRCX,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+LTL,XLC,long,ProShares issuer table,True,,2074.0,2018-07-10,2026-10-08,XLC,e207f81b4bed96c531596d6fed83b80de8a7e419ca2459e57e3aaf24c8797588,40.0
+LULG,LULU,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+LUNL,LUNR,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+LWLX,LWLG,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+MAGX,MAGS,long,Roundhill issuer table,False,fewer_than_756_price_sessions,,,,,,
+MCHG,MCHP,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+MCHU,MCHP,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+METG,META,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+METQ,META,inverse,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+METU,META,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+MLPR,AMLP,long,UBS ETRACS ETN issuer table,True,,1596.0,2020-06-03,2026-10-08,AMLP,45156565a76799127fc1456d9eba9a154bc494bbfbe66164c2b5078aaa506a69,41.0
+MNGU,MNGU,long,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+MPG,MP,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+MPWX,MPWR,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+MQQQ,QQQ,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+MRAL,MARA,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+MRAX,MRAM,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+MRNX,MRNA,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+MRVU,MRVL,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+MSFL,MSFT,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+MSFU,MSFT,long,Nasdaq ETF definitions,True,,1026.0,2022-09-07,2026-10-08,MSFT,5b9c32c06ad2d64812dcb870949d1477aa99892a6869abd78a623f2bf0943444,42.0
+MSFX,MSFT,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+MSOX,MSOS,long,AdvisorShares issuer table,True,,1035.0,2022-08-24,2026-10-08,MSOS,dd28e04364105fadd7f6d9a016b40ad2e6cfe6907670c5e26acf3386d2301f7d,43.0
+MST,MSTR,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+MSTP,MSTR,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+MSTU,MSTR,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+MSTX,MSTR,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+MSTZ,MSTR,inverse,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+MTSG,MTSI,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+MUG,MU,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+MULL,MU,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+MUU,MU,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+MUZ,MU,inverse,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+MVLL,MRVL,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+MVRL,REM,long,UBS ETRACS ETN issuer table,True,,1593.0,2020-06-08,2026-10-08,REM,9851995570e52b7c2e4c7961aaf0d3c2f8cf655f07bc2348770cb643f2031661,44.0
+MVV,MDY,long,ProShares issuer table,True,,5107.0,2006-06-21,2026-10-08,MDY,6bea39278c157dcb9b1474d3b1ce09b85eb02b03adcff83440685e1108cba26d,45.0
+MXLL,MXL,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+MZZ,MDY,inverse,ProShares issuer table,True,,5092.0,2006-07-13,2026-10-08,MDY,c44e8e620fc3ae4ec289e9a9606a7ce3d00b29ff917a7b5e3af4fe4cc2a40965,46.0
+NBIG,NBIS,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+NBIL,NBIS,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+NBIZ,NBIS,inverse,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+NEBX,NBIS,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+NEMG,NEM,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+NETG,NET,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+NFLU,NFLX,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+NFXL,NFLX,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+NIOG,NIO,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+NOWL,NOW,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+NRGD,XLE,inverse,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+NRGU,XLE,long,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+NTAL,NTAP,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+NUG,NU,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+NVD,NVDA,inverse,Nasdaq ETF definitions,True,,786.0,2023-08-22,2026-10-08,NVDA,ad8a8938d3a1ffebec1706ed9691158b3bca10aa450ddefbe524d948a8af670e,47.0
+NVDB,NVDA,long,ProShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+NVDG,NVDA,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+NVDL,NVDA,long,Nasdaq ETF definitions,True,,958.0,2022-12-13,2026-10-08,NVDA,57ee472cecd5906a4fe5194a8a5a5cefae47082b3706c933ccf2e1a96bff6568,48.0
+NVDQ,NVDA,inverse,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+NVDS,NVDA,inverse,Nasdaq ETF definitions,True,,1064.0,2022-07-14,2026-10-08,NVDA,24175d09278c604bdc5c89a30c43dfc965f892da51758b032c24155b38feb890,49.0
+NVDU,NVDA,long,Nasdaq ETF definitions,True,,771.0,2023-09-13,2026-10-08,NVDA,4e5b34bd80a1785de9aafb393c0bd601aa7b072164eb2f5decf3dde200674846,50.0
+NVDX,NVDA,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+NVOX,NVO,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+NVTX,NVTS,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+NXPG,NXPI,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+NXPX,NXPI,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+OCNL,DOCN,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+OILD,XOP,inverse,MicroSectors ETN issuer table,True,,1233.0,2021-11-09,2026-10-08,XOP,eab4539249057b05fdbf0f2dc535abe526dddc2b8a6776d51757bc28e29c5bfe,51.0
+OILU,XOP,long,MicroSectors ETN issuer table,True,,1233.0,2021-11-09,2026-10-08,XOP,dd3ec27a5a72975c1a91e60fd509de4a7bc9bf7bcbc9f047fb1d13707ea598ab,52.0
+OKLL,OKLO,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+OKTG,OKTA,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+ONDG,ONDS,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+ONDL,ONDS,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+ONDU,ONDS,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+ONG,ON,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+ONX,ON,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+OPEG,OPEN,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+OPEX,OPEN,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+ORCU,ORCL,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+ORCX,ORCL,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+ORCZ,ORCL,inverse,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+OSCX,OSCR,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+OSSL,OSS,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+OUSL,OUST,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+PALU,PANW,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+PANG,PANW,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+PATX,PATH,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+PBRG,PBR,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+PDDL,PDD,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+PENU,PENG,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+PFFL,PFF,long,UBS ETRACS ETN issuer table,True,,2019.0,2018-09-26,2026-10-08,PFF,c0db140517567321ae0238618c751422dd5dfbb282a2b9a559f62c4c8c26f44d,53.0
+PLTA,PLTR,long,ProShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+PLTG,PLTR,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+PLTU,PLTR,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+PLTZ,PLTR,inverse,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+PLU,PL,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+PLUL,PLUG,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+POEL,POET,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+PONX,PONY,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+PST,IEF,inverse,ProShares issuer table,True,,4624.0,2008-05-22,2026-10-08,IEF,d6993e54108241fa9d6b03040edf10e8d20f774a81c26476e2b19c10cae0f300,54.0
+PTIR,PLTR,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+PUL,P,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+PUR,PURR,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+PYPG,PYPL,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+QBTX,QBTS,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+QBTZ,QBTS,inverse,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+QCML,QCOM,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+QCMU,QCOM,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+QID,QQQ,inverse,ProShares issuer table,True,,5092.0,2006-07-13,2026-10-08,QQQ,7027f21093c714bcfa3445af8b48dc09660358b92488a89208b107b07e8e120f,55.0
+QLD,QQQ,long,ProShares issuer table,True,,5107.0,2006-06-21,2026-10-08,QQQ,846d43ac5b5757ed7b66bafa7274e5cfaf0dee1281d9157d6169c65c13eedccc,56.0
+QNTU,QNT,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+QPUX,QTUM,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+QQDN,QQQ,inverse,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+QQQP,QQQ,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+QQUP,QQQ,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+QQXL,QQQ,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+QSU,QS,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+QUBX,QUBT,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+RAM,DRAM,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+RAML,DRAM,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+RAMZ,DRAM,inverse,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+RBLU,RBLX,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+RCAX,RCAT,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+RDTL,RDDT,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+RDWU,RDW,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+REW,XLK,inverse,ProShares issuer table,True,,4952.0,2007-02-02,2026-10-08,XLK,e9e756bdb39350a202ebaa3931859ebcfdad0597d3166fdb9f600b177e98da75,57.0
+RGTU,RGTI,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+RGTX,RGTI,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+RGTZ,RGTI,inverse,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+RIOX,RIOT,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+RKLX,RKLB,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+RKLZ,RKLB,inverse,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+RMBX,RMBS,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+ROBN,HOOD,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+ROM,XLK,long,ProShares issuer table,True,,4953.0,2007-02-01,2026-10-08,XLK,cc09e1fdd56b902e6527844930a889b6f70ce8d1ac98df8c70cbf96e2dbf84cd,58.0
+RTXG,RTX,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+RVNL,RIVN,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+RXD,XLV,inverse,ProShares issuer table,True,,4953.0,2007-02-01,2026-10-08,XLV,decfcd72d40a7d912a108c540151d0760957d7b7d16d8800a7e23055c255816b,59.0
+RXL,XLV,long,ProShares issuer table,True,,4953.0,2007-02-01,2026-10-08,XLV,3954723a2653287570d95770f8d270d6ebb90e8768b711602debcc71259066ee,60.0
+SAA,IJR,long,ProShares issuer table,True,,4958.0,2007-01-25,2026-10-08,IJR,03d319b685ad994f0cdf8f64e11474ece9ff42c392fda0f125ee0fd0c0efdaa5,61.0
+SBIT,BTC-USD,inverse,ProShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+SBTU,SBET,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+SCC,XLY,inverse,ProShares issuer table,True,,4952.0,2007-02-02,2026-10-08,XLY,fe6452910dc912b151ed39632cbc3a9b179c3d88106f72b33df7d4679ef64136,62.0
+SCO,USO,inverse,ProShares issuer table,True,,4494.0,2008-11-25,2026-10-08,USO,911182ea9cfcf39a92066b9379d9d1406a0ed8e337cd27c32cfe80dd6ad402b0,63.0
+SDD,IJR,inverse,ProShares issuer table,True,,4958.0,2007-01-25,2026-10-08,IJR,27d389d4345b6d01690ca49f82d16dfd6644cd7c757086865a9c85bd29c72425,64.0
+SDOW,DIA,inverse,ProShares issuer table,True,,4190.0,2010-02-11,2026-10-08,DIA,d8e47aef9ebcef52ea31a9696d30966a0be940a69406dce8464de039bf0be2ab,65.0
+SDP,XLU,inverse,ProShares issuer table,True,,4925.0,2007-03-14,2026-10-08,XLU,e7c9174be18eb1bd748b89d04e63abda77d68c26075343c67431c57f7583c41e,66.0
+SDS,SPY,inverse,ProShares issuer table,True,,5092.0,2006-07-13,2026-10-08,SPY,92e6fff7286fb0d1d2983da1be9b4dafadfc19b41d3e94a95a1136c12b95447e,67.0
+SHNY,GLD,long,MicroSectors ETN issuer table,True,,911.0,2023-02-22,2026-10-08,GLD,0252b19596002a65d944c6fb098fc5c71a14f23fa23f9925ffe072a269704fb9,68.0
+SHPU,SHOP,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+SIJ,XLI,inverse,ProShares issuer table,True,,4953.0,2007-02-01,2026-10-08,XLI,ee5b2930099f00f6c4873fc13db27745c5121fea290a3e8b7633266cfc3565c8,69.0
+SITX,SITM,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+SKDD,SKHY,inverse,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+SKF,XLF,inverse,ProShares issuer table,True,,4953.0,2007-02-01,2026-10-08,XLF,a5c8fa463ad5dfc4d5872ccaca7b721e73657dfa3e2a14731119cfca5c840348,70.0
+SKHA,SKHY,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+SKHN,SKHY,inverse,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+SKHQ,SKHY,inverse,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+SKHU,SKHY,long,ProShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+SKHX,SKHY,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+SKRE,KRE,inverse,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+SKUU,SKHY,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+SKYU,SKYY,long,Nasdaq ETF definitions,True,,1436.0,2021-01-21,2026-10-08,SKYY,8e343583deb2b284590d7fff1f5d77995d4d4f3a86705f5f0028aa4297bb810d,71.0
+SLON,SOL-USD,long,ProShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+SMCL,SMCI,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+SMCX,SMCI,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+SMCZ,SMCI,inverse,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+SMDD,MDY,inverse,ProShares issuer table,True,,4190.0,2010-02-11,2026-10-08,MDY,f99a64c5c9c66e2a3e19107793d2a29ead66d533a55a553e8cebce4840d56395,72.0
+SMHB,DES,long,UBS ETRACS ETN issuer table,True,,1987.0,2018-11-09,2026-10-08,DES,4988212751fbc2f153b94609b6340967c24c4673a06623a3110564fc22834ab6,73.0
+SMHD,SMH,inverse,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+SMHU,SMH,long,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+SMN,XLB,inverse,ProShares issuer table,True,,4952.0,2007-02-02,2026-10-08,XLB,e7968a8718cd088e27819c3ea339cf30d0b5a0a213a8584a6e64bb8e87c16b01,74.0
+SMST,MSTR,inverse,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+SMTG,SMTC,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+SMU,SMR,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+SMUP,SMR,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+SMZ,SMR,inverse,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+SNAG,SNAP,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+SNDG,SNDK,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+SNDQ,SNDK,inverse,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+SNDU,SNDK,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+SNK,SPCX,inverse,GraniteShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+SNOU,SNOW,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+SNXX,SNDK,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+SOFA,SOFI,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+SOFX,SOFI,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+SOLT,SOL-USD,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+SOUX,SOUN,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+SPAL,SPCX,long,GraniteShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+SPAX,SPCX,long,Tuttle Capital issuer table,False,fewer_than_756_price_sessions,,,,,,
+SPCF,SPCX,long,ProShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+SPCG,SPCX,inverse,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+SPCH,SPCX,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+SPCL,UFO,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+SPCM,SPCX,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+SPCQ,SPCX,inverse,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+SPCU,SPCX,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+SPOG,SPOT,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+SPXU,SPY,inverse,ProShares issuer table,True,,4349.0,2009-06-25,2026-10-08,SPY,62251eddf505e34b9c7f24eab8e0db50713488513ec29de7d125bda4f0ab2d0a,75.0
+SPYQ,SPY,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+SQQQ,QQQ,inverse,Nasdaq ETF definitions,True,,4190.0,2010-02-11,2026-10-08,QQQ,53670827fc46d874713a0c4676ae8f2946ae34d0eb78d71b122467d04e8ed102,76.0
+SRS,IYR,inverse,ProShares issuer table,True,,4953.0,2007-02-01,2026-10-08,IYR,9d2abe527479f76e30d0cc3421845e2b343bc43e2f3de21536b4f9b0e380a8d1,77.0
+SRTY,IWM,inverse,ProShares issuer table,True,,4190.0,2010-02-11,2026-10-08,IWM,13346b9c6d0629e4a2c29a880eb262100ea2e46902e854813c42235154987c9b,78.0
+SSG,SOXX,inverse,ProShares issuer table,True,,4953.0,2007-02-01,2026-10-08,SOXX,335892ff2d094d65186311a7395b2f8ed51f954d42f02623cb3d7a084fc03b64,79.0
+SSO,SPY,long,ProShares issuer table,True,,5107.0,2006-06-21,2026-10-08,SPY,a25f0d3c17198ad7d580a13cf21673a8a3df29f94258e8e55f6353104ecd571b,80.0
+SSPC,SPCX,inverse,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+STLL,STRL,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+STLU,XLM-USD,long,Volatility Shares issuer table,False,fewer_than_756_price_sessions,,,,,,
+STMX,STM,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+STSM,TSM,inverse,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+STXL,STX,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+STXU,STX,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+STXX,STX,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+SUIL,SUI20947-USD,long,Volatility Shares issuer table,False,fewer_than_756_price_sessions,,,,,,
+SZK,XLP,inverse,ProShares issuer table,True,,4953.0,2007-02-01,2026-10-08,XLP,7cb56dcacb5e2083884a647119865f9c1f3210fa00cdfe115be92542b2854e7e,81.0
+TARK,ARKK,long,Nasdaq ETF definitions,True,,1114.0,2022-05-02,2026-10-08,ARKK,c6ac60e54ff7d4383f83e02db3168ef874b70febc5047d0854775b88c18056f0,82.0
+TAWN,EWT,long,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+TBT,TLT,inverse,ProShares issuer table,True,,4624.0,2008-05-22,2026-10-08,TLT,d0feddfe6ef0e853c266aae39479482a5a48c0f23e99e40f58b96264b6241df3,83.0
+TDCL,TDC,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+TELG,TEL,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+TEMT,TEM,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+TERG,TER,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+TEUP,TE,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+TPEI,EWT,inverse,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+TQQQ,QQQ,long,Nasdaq ETF definitions,True,,4190.0,2010-02-11,2026-10-08,QQQ,70407f51955cb02b84aa8062589aa477b0beecedf1dfac65ef617d91ae035ed8,84.0
+TSDD,TSLA,inverse,Nasdaq ETF definitions,True,,782.0,2023-08-28,2026-10-08,TSLA,42fee78c8f3931ccf5f27e4eb849b37db7610b269651c24d4eb310888e4ac40c,85.0
+TSEG,TSEM,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+TSEU,TSEM,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+TSL,TSLA,long,Nasdaq ETF definitions,True,,1046.0,2022-08-09,2026-10-08,TSLA,0be0746f3b732c82d2f2548058a4efcb4574655a2b84d74ffd0520aa5b7145e8,86.0
+TSLG,TSLA,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+TSLI,TSLA,long,ProShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+TSLL,TSLA,long,Nasdaq ETF definitions,True,,1046.0,2022-08-09,2026-10-08,TSLA,a333b227bd838ee20ae964df6816a5afd93d296b88fafd3cd0101b0dfe3ee7bf,87.0
+TSLQ,TSLA,inverse,Nasdaq ETF definitions,True,,1064.0,2022-07-14,2026-10-08,TSLA,62eced875d3925af19166030f883a5299a4717ce64e029495865d25bdd90f74c,88.0
+TSLR,TSLA,long,Nasdaq ETF definitions,True,,782.0,2023-08-28,2026-10-08,TSLA,a3f1fa166eaadd3ad05485ce0928b029fe8439bfd7613194099428c4b55dbb92,89.0
+TSLT,TSLA,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+TSLZ,TSLA,inverse,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+TSMG,TSM,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+TSMU,TSM,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+TSMX,TSM,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+TTDU,TTD,long,REX Shares Cboe listing,False,fewer_than_756_price_sessions,,,,,,
+TTMX,TTMI,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+TTT,TLT,inverse,ProShares issuer table,True,,3653.0,2012-03-29,2026-10-08,TLT,361c3d600702f04e87fe5c1d4320501f8f5124ffd047f6e31582f39bfd15ec71,90.0
+TWM,IWM,inverse,ProShares issuer table,True,,4958.0,2007-01-25,2026-10-08,IWM,7a16e44f9fae2dd9880fc5bb46eb5c1a036a79d4a340c4de529cd1907c18dfd2,91.0
+TXXD,DOGE-USD,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+TXXH,HYPE32196-USD,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+TXXS,SUI20947-USD,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+UBR,EWZ,long,ProShares issuer table,True,,4131.0,2010-05-07,2026-10-08,EWZ,9f65392d700500d300979942705e05c8539b281509afb41a6a0d61679c955ffb,92.0
+UBRL,UBER,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+UBT,TLT,long,ProShares issuer table,True,,4205.0,2010-01-21,2026-10-08,TLT,ca0e1ef3a4730a4f44018f220b312e743ff98310dbd0ada05f7bce1d9578a979,93.0
+UCC,XLY,long,ProShares issuer table,True,,4952.0,2007-02-02,2026-10-08,XLY,a31848ae5f39b8b1758726080c17cf6610cac4f5a3b2e303384b35ee39b68b64,94.0
+UCO,USO,long,ProShares issuer table,True,,4494.0,2008-11-25,2026-10-08,USO,5c0e6e7ab32a1a4054769ebc559ae97d5ac5f4ccf81e4e2c38d390489610d47e,95.0
+UCOP,CPER,long,ProShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+UCYB,CIBR,long,Nasdaq ETF definitions,True,,1436.0,2021-01-21,2026-10-08,CIBR,861046e61623e28aa2a0a5459ae583ae07ff0002e84d000ebaa644b23b35fda9,96.0
+UDOW,DIA,long,ProShares issuer table,True,,4190.0,2010-02-11,2026-10-08,DIA,1c8108ae7c21fcb4f5b53ea58dca0395d254ab64d39a41978a03b85170fb9275,97.0
+UECG,UEC,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+UGE,XLP,long,ProShares issuer table,True,,4953.0,2007-02-01,2026-10-08,XLP,b1fc8aa74c7102b6b027d1b6ce863fcbbcac53d71ab338bc0b026cb3caec1496,98.0
+UGL,GLD,long,ProShares issuer table,True,,4489.0,2008-12-03,2026-10-08,GLD,dcd6030430f3a6dd443ff742a49207db03c4fa436b505109d9cf02a15a3d3454,99.0
+UJB,HYG,long,ProShares issuer table,True,,3894.0,2011-04-14,2026-10-08,HYG,6008a72f31708633e6590fcf241765fe5fae263ff5146091dbdfd0ad9524cf01,100.0
+ULE,FXE,long,ProShares issuer table,True,,4494.0,2008-11-25,2026-10-08,FXE,e5eec05eb5f1c8a0b7e905bbe1dfa584d22f67c508909a57dd8eb5bc55c4ffa9,101.0
+UMAL,UMAC,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+UMCU,UMC,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+UMDD,MDY,long,ProShares issuer table,True,,4190.0,2010-02-11,2026-10-08,MDY,960d831f6e31d60ead982d52cfa66d3fe4d5df48fb65d2342468fb420a2b9b82,102.0
+UNHG,UNH,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+UNX,U,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+UPAL,PALL,long,ProShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+UPLT,PPLT,long,ProShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+UPRO,SPY,long,ProShares issuer table,True,,4349.0,2009-06-25,2026-10-08,SPY,2359de37c65bf34000bd8e1c2bf7a15addf6e2058b5e4782bf7bad819b9a471c,103.0
+UPSX,UPST,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+UPV,VGK,long,ProShares issuer table,True,,4131.0,2010-05-07,2026-10-08,VGK,623ccbc854d9a55f377869a1a2005ba11d7e8b70d291faa3c9cf6c728903ce1b,104.0
+UPW,XLU,long,ProShares issuer table,True,,4953.0,2007-02-01,2026-10-08,XLU,701769c377b756fe594660b99fe4bed1cafd541e3864281dd926542bcd9878ec,105.0
+URE,IYR,long,ProShares issuer table,True,,4952.0,2007-02-02,2026-10-08,IYR,1414056bf6f2f4b6534523177a470c4d2205d14fd45d427e86e82c4464021696,106.0
+URSP,RSP,long,ProShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+URTY,IWM,long,ProShares issuer table,True,,4190.0,2010-02-11,2026-10-08,IWM,f9403aefe54be56e29f99c0c04f92b5d67f9b4d2c07d8c570c10bd6b8b3257c0,107.0
+USAX,USAR,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+USD,SOXX,long,ProShares issuer table,True,,4953.0,2007-02-01,2026-10-08,SOXX,54a85c2ea029fe28a537c68ea2b6820304d2c69f6df707eea4b95c2c287f2eb6,108.0
+USGG,USAR,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+UST,IEF,long,ProShares issuer table,True,,4197.0,2010-02-02,2026-10-08,IEF,d2b458a8991413f556e5feb783f72aca70ca2a2f970d74f553118e6ae28181ad,109.0
+UUUG,UUUU,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+UVIX,VIXY,long,Volatility Shares issuer table,True,,1136.0,2022-03-30,2026-10-08,VIXY,5e921116b90433d949f2a51ad7982d70d30a430af4524a783f6faf2b67743f1a,110.0
+UWM,IWM,long,ProShares issuer table,True,,4958.0,2007-01-25,2026-10-08,IWM,641ff7b619b4141fc62dbcad54c639d4b02c1c079ce5c56dce597e16aaf11d66,111.0
+UXI,XLI,long,ProShares issuer table,True,,4952.0,2007-02-02,2026-10-08,XLI,7c6e2ad3e15da0cab0e81c9567e70112b1b59b8737f72be5eb5a1883b90c8bf2,112.0
+UXRP,XRP-USD,long,ProShares issuer table,False,fewer_than_756_price_sessions,,,,,,
+UYG,XLF,long,ProShares issuer table,True,,4953.0,2007-02-01,2026-10-08,XLF,e64caaa47bb8d2087efeecf70134ed5bb705b7d284b41bcfdc5f7e27c1d14be0,113.0
+UYM,XLB,long,ProShares issuer table,True,,4953.0,2007-02-01,2026-10-08,XLB,b2ece9855b3edc1cbaacfaf82d96c1f0fafd04bd79d54515c0bc19d29f58472b,114.0
+VALG,VALE,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+VELL,VELO,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+VIAG,VIAV,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+VRTL,VRT,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+VSTL,VST,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+WDCX,WDC,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+WLDU,VT,long,Leverage Shares complete product inventory,False,fewer_than_756_price_sessions,,,,,,
+WTID,XLE,inverse,MicroSectors ETN issuer table,True,,915.0,2023-02-15,2026-10-08,XLE,99eddc9a697b852b8a0c2a6c3b32898743346a9ad6577a1473f8218541fd6f54,115.0
+WTIU,XLE,long,MicroSectors ETN issuer table,True,,915.0,2023-02-15,2026-10-08,XLE,5053e610c1da447bcf7b516afcd4775964c614bef99f8821822d2695318c2382,116.0
+WULX,WULF,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+WYFL,WYFI,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+XLCD,XLC,inverse,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+XLCU,XLC,long,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+XLPD,XLP,inverse,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+XLPU,XLP,long,MicroSectors ETN issuer table,False,fewer_than_756_price_sessions,,,,,,
+XNDX,XNDU,long,Tradr issuer table,False,fewer_than_756_price_sessions,,,,,,
+XOMX,XOM,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+XOVL,XOVR,long,Defiance issuer table,False,fewer_than_756_price_sessions,,,,,,
+XPEG,XPEV,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+XPP,FXI,long,ProShares issuer table,True,,4364.0,2009-06-04,2026-10-08,FXI,8fecd28fd871729d07377c14b6ed0bb0ce4c9afbfbc460f9e818d58f2ce06121,117.0
+XRPT,XRP-USD,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+XYZG,XYZ,long,Nasdaq ETF definitions,False,fewer_than_756_price_sessions,,,,,,
+YCL,FXY,long,ProShares issuer table,True,,4485.0,2008-12-09,2026-10-08,FXY,a97dc74f9957e895aac8e125a8abde5ba42d379442226ad281d63bcdf7f6d710,118.0
+YCS,FXY,inverse,ProShares issuer table,True,,4494.0,2008-11-25,2026-10-08,FXY,d8a08ace7e632f3bc24dd61059e218842a35f127dacd59ec9729f77542aa608c,119.0
+ZSL,SLV,inverse,ProShares issuer table,True,,4489.0,2008-12-03,2026-10-08,SLV,c232cd85728cc12addd2720230e0d59b9f1fb20756dc9f75ae62e94e0aa1a5fa,120.0

@@ -1,0 +1,147 @@
+{
+  "source_type": "cached simulated selected-strategy trade histories",
+  "method": "Within each workflow, compute linear Q1/Q3 on original rows. Exclude an entire row if any screened field lies strictly outside [Q1 - 1.5*IQR, Q3 + 1.5*IQR]. No recursive trimming or rescaling.",
+  "completed_trade_fields": [
+    "observed_signal_rsi",
+    "gross_price_multiple"
+  ],
+  "all_buy_fields": [
+    "observed_signal_rsi"
+  ],
+  "weighting": "Each trade has equal weight; funds/proxies are not equally weighted.",
+  "limitations": [
+    "Statistical tail observations may be valid large gains; exclusions do not establish data errors.",
+    "Completed trades omit unresolved positions and cannot establish whole-strategy returns.",
+    "This is descriptive cleaning of previously selected historical strategies, not parameter optimization.",
+    "Profit targets are discrete strategy settings; they are not independently screened."
+  ],
+  "source_sha256": {
+    "buys": "0e78ecf3803f54d854d8615f7e2a8587e3db363c08d25471eb54ba396485a27e",
+    "completed": "9fe62e1ee38d5ec61edfb651c9553390655597125504061d6d04dd49b21ad938"
+  },
+  "counts": {
+    "buys": 1852,
+    "completed": 1696,
+    "retained_completed": 1479,
+    "excluded_completed": 217,
+    "unresolved_buys": 156,
+    "rsi_flagged_buys": 0
+  },
+  "buy_rules": [
+    {
+      "workflow": "Long",
+      "field": "observed_signal_rsi",
+      "q1": 26.017334943448773,
+      "q3": 37.71261231309245,
+      "lower_fence": 8.474418888983259,
+      "upper_fence": 55.255528367557964,
+      "flagged": 0
+    },
+    {
+      "workflow": "Short",
+      "field": "observed_signal_rsi",
+      "q1": 63.5215392665584,
+      "q3": 79.63835179853798,
+      "lower_fence": 39.34632046858903,
+      "upper_fence": 103.81357059650736,
+      "flagged": 0
+    }
+  ],
+  "completed_trade_rules": [
+    {
+      "workflow": "Long",
+      "field": "observed_signal_rsi",
+      "q1": 26.16684208858595,
+      "q3": 37.65494708302904,
+      "lower_fence": 8.934684596921304,
+      "upper_fence": 54.88710457469369,
+      "flagged": 0
+    },
+    {
+      "workflow": "Long",
+      "field": "gross_price_multiple",
+      "q1": 1.100726003103092,
+      "q3": 1.5054103604953433,
+      "lower_fence": 0.49369946701471534,
+      "upper_fence": 2.11243689658372,
+      "flagged": 181
+    },
+    {
+      "workflow": "Short",
+      "field": "observed_signal_rsi",
+      "q1": 63.49851577195605,
+      "q3": 79.38743276877854,
+      "lower_fence": 39.66514027672232,
+      "upper_fence": 103.22080826401228,
+      "flagged": 0
+    },
+    {
+      "workflow": "Short",
+      "field": "gross_price_multiple",
+      "q1": 1.1001416522847742,
+      "q3": 1.3112265428362238,
+      "lower_fence": 0.7835143164576,
+      "upper_fence": 1.627853878663398,
+      "flagged": 36
+    }
+  ],
+  "completed_trade_summary": [
+    {
+      "workflow": "Long",
+      "original_completed_trades": 1388,
+      "retained": 1207,
+      "excluded": 181,
+      "ranges": {
+        "observed_signal_rsi": {
+          "min": 12.844625606194427,
+          "median": 33.384570676065934,
+          "max": 49.86905079186768
+        },
+        "buy_rsi": {
+          "min": 20.0,
+          "median": 35.0,
+          "max": 50.0
+        },
+        "profit_target_multiple": {
+          "min": 1.1,
+          "median": 1.2,
+          "max": 2.1
+        },
+        "gross_price_multiple": {
+          "min": 1.0999999999999999,
+          "median": 1.2000711461737326,
+          "max": 2.102431906292202
+        }
+      }
+    },
+    {
+      "workflow": "Short",
+      "original_completed_trades": 308,
+      "retained": 272,
+      "excluded": 36,
+      "ranges": {
+        "observed_signal_rsi": {
+          "min": 51.54378398139079,
+          "median": 73.58743473555256,
+          "max": 82.64992987869482
+        },
+        "buy_rsi": {
+          "min": 51.0,
+          "median": 73.0,
+          "max": 80.0
+        },
+        "profit_target_multiple": {
+          "min": 1.1,
+          "median": 1.1,
+          "max": 1.6
+        },
+        "gross_price_multiple": {
+          "min": 1.0999999999999999,
+          "median": 1.1040740728051248,
+          "max": 1.6133636179490423
+        }
+      }
+    }
+  ],
+  "verification": "Original values preserved exactly; kept/excluded rows form a disjoint complete partition; retained rows satisfy every fence."
+}

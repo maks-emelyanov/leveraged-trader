@@ -1,0 +1,15 @@
+{
+  "summary_correction": "Before inspecting or ranking results, corrected summary implementation to match the already frozen protocol: seed20261012, two-sided Bonferroni quantiles for7 comparisons. Recomputed summaries from untouched validation rows. No candidate families, scores, periods or gates changed.",
+  "validation_asset_count": 76,
+  "validation_grid_period_count": 3640,
+  "verification": {
+    "focused_tests_passed": 120,
+    "subtests_passed": 170,
+    "ruff": "passed",
+    "git_diff_check": "passed",
+    "complete_study_reproduced": true,
+    "reproduced_artifacts": "all rows, coverage, summaries, frozen choice, and final decision",
+    "numeric_comparison_tolerance": 1e-12,
+    "source_database_access": "read-only in both original study and reproduction"
+  }
+}

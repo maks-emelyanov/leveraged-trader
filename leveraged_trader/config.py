@@ -36,6 +36,7 @@ class BacktestConfig:
     fee_bps: float = 1.0  # commission-like cost per trade notional
     slippage_bps: float = 2.0  # slippage per trade notional
     auto_adjust: bool = True
+    selection_method: str = "robust"
 
 
 @dataclass
@@ -215,6 +216,8 @@ def _validate_backtest_configuration_fields(
 ) -> None:
     if not isinstance(base_cfg, BacktestConfig):
         raise ValueError("base_cfg must be a BacktestConfig instance.")
+    if type(base_cfg.selection_method) is not str or base_cfg.selection_method not in {"robust", "legacy_sharpe"}:
+        raise ValueError("selection_method must be 'robust' or 'legacy_sharpe'.")
     initial_capital = _require_bounded_number(
         "initial_capital",
         base_cfg.initial_capital,
